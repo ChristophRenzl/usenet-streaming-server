@@ -1,0 +1,7 @@
+target
+data
+.git
+.github
+tests/fixtures
+*.db
+config.local.toml
