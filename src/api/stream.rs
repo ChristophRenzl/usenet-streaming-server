@@ -18,9 +18,9 @@ use uuid::Uuid;
 use crate::{
     db,
     error::{AppError, AppResult},
-    indexer::client::NewznabClient,
-    nzb::{health_check, main_content_segments, parse_nzb, select_main},
-    release::rank::RankedRelease,
+    indexer::{client::NewznabClient, RawRelease},
+    nzb::{health_check, main_content_segments, parse_nzb, select_main, MainContent, Nzb},
+    release::{parse::parse_release_name, rank::RankedRelease},
     state::AppState,
     stream::{
         ffmpeg::{self, SpawnOptions},
@@ -29,12 +29,13 @@ use crate::{
         MediaInfo,
     },
     tmdb::models::MediaType,
+    vfs::DiskFile,
 };
 
-use super::releases::{resolve_candidates, ReleaseTarget};
+use super::releases::{pick_candidates, resolve_candidates, ReleaseTarget};
 
 /// Maximum release candidates tried before giving up.
-const MAX_ATTEMPTS: usize = 5;
+pub(crate) const MAX_ATTEMPTS: usize = 5;
 /// Segments STATed per candidate during the pre-flight health check.
 const HEALTH_SAMPLE: usize = 10;
 
@@ -47,10 +48,10 @@ static SEGMENT_NAME: LazyLock<Regex> =
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateSessionRequest {
-    /// TMDB id of the movie or show.
-    pub tmdb_id: i64,
-    /// `movie` or `tv`.
-    pub media_type: MediaType,
+    /// TMDB id of the movie or show (required unless `download_id` is set).
+    pub tmdb_id: Option<i64>,
+    /// `movie` or `tv` (required unless `download_id` is set).
+    pub media_type: Option<MediaType>,
     /// Season number (required for `tv`).
     pub season: Option<u32>,
     /// Episode number (required for `tv`).
@@ -58,6 +59,11 @@ pub struct CreateSessionRequest {
     /// Pin a specific release by its indexer guid instead of automatic
     /// candidate selection.
     pub release_guid: Option<String>,
+    /// Play a specific finished download from disk.
+    pub download_id: Option<Uuid>,
+    /// Skip the completed-download shortcut and always stream from Usenet.
+    #[serde(default)]
+    pub force_nntp: bool,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -75,77 +81,80 @@ pub struct CreateSessionResponse {
     /// Container extension of the media file (`mkv`, `mp4`, ...).
     pub container: String,
     pub chosen_release: RankedRelease,
-    /// The full ranked candidate list the choice was made from.
+    /// The full ranked candidate list the choice was made from (empty for
+    /// disk playback of a finished download).
     pub candidates: Vec<RankedRelease>,
     /// Stored watch position to offer "resume from here", when any.
     pub resume_position_secs: Option<f64>,
+    /// Where the media bytes come from: `disk` (finished download) or `nntp`.
+    pub source: String,
 }
 
-/// Start a playback session: resolve releases, pick the first healthy
-/// streamable candidate, probe it and start the HLS remux.
+/// Start a playback session. Completed downloads are played straight from
+/// disk (unless `force_nntp`); otherwise releases are resolved and the
+/// first healthy streamable candidate is probed and remuxed.
 #[utoipa::path(post, path = "/stream/sessions", tag = "streaming",
     request_body = CreateSessionRequest,
     responses(
         (status = 200, body = CreateSessionResponse),
         (status = 400, description = "Bad parameters, missing indexers or TMDB key"),
-        (status = 404, description = "Unknown TMDB id or release_guid"),
+        (status = 404, description = "Unknown TMDB id, release_guid or download_id"),
         (status = 422, description = "No streamable release found; details list per-candidate reasons"),
     ))]
 pub async fn create_session(
     State(state): State<AppState>,
     Json(request): Json<CreateSessionRequest>,
 ) -> AppResult<Json<CreateSessionResponse>> {
+    // Direct playback of one specific finished download.
+    if let Some(download_id) = request.download_id {
+        let download = db::downloads::get(&state.db, &download_id.to_string())
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("download {download_id}")))?;
+        return start_disk_session(&state, &download).await.map(Json);
+    }
+
+    let (tmdb_id, media_type) = request.tmdb_id.zip(request.media_type).ok_or_else(|| {
+        AppError::BadRequest("tmdb_id and media_type are required (or pass download_id)".into())
+    })?;
     let target = ReleaseTarget {
-        tmdb_id: request.tmdb_id,
-        media_type: request.media_type,
+        tmdb_id,
+        media_type,
         season: request.season,
         episode: request.episode,
     }
     .validated()?;
 
-    let candidates = resolve_candidates(&state, &target).await?;
-
-    let to_try: Vec<RankedRelease> = match &request.release_guid {
-        Some(guid) => {
-            let chosen = candidates
-                .iter()
-                .find(|c| &c.raw.guid == guid)
-                .cloned()
-                .ok_or_else(|| AppError::NotFound(format!("release with guid '{guid}'")))?;
-            vec![chosen]
+    // A completed download of this exact item plays from disk — no indexer
+    // or NNTP provider needed.
+    if !request.force_nntp {
+        for download in db::downloads::completed_for_item(
+            &state.db,
+            target.tmdb_id,
+            target.media_type.as_str(),
+            target.season,
+            target.episode,
+        )
+        .await?
+        {
+            let Some(path) = download.file_path.as_deref() else {
+                continue;
+            };
+            if tokio::fs::try_exists(path).await.unwrap_or(false) {
+                return start_disk_session(&state, &download).await.map(Json);
+            }
         }
-        None => candidates
-            .iter()
-            .filter(|c| c.rejected.is_none())
-            .take(MAX_ATTEMPTS)
-            .cloned()
-            .collect(),
-    };
-    if to_try.is_empty() {
-        return Err(AppError::NoRelease(
-            "no accepted release candidates (all were rejected by preferences)".into(),
-        ));
     }
+
+    let candidates = resolve_candidates(&state, &target).await?;
+    let to_try = pick_candidates(&candidates, request.release_guid.as_deref(), MAX_ATTEMPTS)?;
 
     let mut failures: Vec<String> = Vec::new();
     for candidate in to_try {
         match start_session(&state, &target, &candidate).await {
             Ok(session) => {
-                let info = session.info();
-                return Ok(Json(CreateSessionResponse {
-                    session_id: session.id,
-                    hls_master_url: format!("/api/v1/stream/{}/master.m3u8", session.id),
-                    raw_url: format!("/api/v1/stream/{}/raw", session.id),
-                    duration_secs: info.duration_secs,
-                    video_codec: info.video_codec,
-                    audio_codec: info.audio_codec,
-                    audio_transcoded: info.audio_transcoded,
-                    container: session.container.clone(),
-                    chosen_release: candidate,
-                    candidates,
-                    resume_position_secs: (session.resume_position_secs > 0.0)
-                        .then_some(session.resume_position_secs),
-                }));
+                return Ok(Json(session_response(
+                    &session, candidate, candidates, "nntp",
+                )));
             }
             Err(error) => {
                 tracing::warn!(release = %candidate.raw.title, %error, "candidate failed, trying next");
@@ -156,14 +165,36 @@ pub async fn create_session(
     Err(AppError::NoRelease(failures.join("; ")))
 }
 
-/// Try to start a session from one candidate: NZB grab → parse → health
-/// check → virtual file → ffprobe → ffmpeg. On failure the partially
-/// registered session is torn down.
-async fn start_session(
+fn session_response(
+    session: &Arc<Session>,
+    chosen_release: RankedRelease,
+    candidates: Vec<RankedRelease>,
+    source: &str,
+) -> CreateSessionResponse {
+    let info = session.info();
+    CreateSessionResponse {
+        session_id: session.id,
+        hls_master_url: format!("/api/v1/stream/{}/master.m3u8", session.id),
+        raw_url: format!("/api/v1/stream/{}/raw", session.id),
+        duration_secs: info.duration_secs,
+        video_codec: info.video_codec,
+        audio_codec: info.audio_codec,
+        audio_transcoded: info.audio_transcoded,
+        container: session.container.clone(),
+        chosen_release,
+        candidates,
+        resume_position_secs: (session.resume_position_secs > 0.0)
+            .then_some(session.resume_position_secs),
+        source: source.to_string(),
+    }
+}
+
+/// Grab a candidate's NZB, parse it, pick the main content and run the
+/// pre-flight health check. Shared by session creation and download jobs.
+pub(crate) async fn fetch_healthy_release(
     state: &AppState,
-    target: &ReleaseTarget,
     candidate: &RankedRelease,
-) -> AppResult<Arc<Session>> {
+) -> AppResult<(Nzb, MainContent)> {
     let indexer = db::indexers::get(&state.db, candidate.raw.indexer_id)
         .await?
         .ok_or_else(|| {
@@ -186,6 +217,18 @@ async fn start_session(
             health.missing, health.checked
         )));
     }
+    Ok((nzb, main))
+}
+
+/// Try to start a session from one candidate: NZB grab → parse → health
+/// check → virtual file → ffprobe → ffmpeg. On failure the partially
+/// registered session is torn down.
+async fn start_session(
+    state: &AppState,
+    target: &ReleaseTarget,
+    candidate: &RankedRelease,
+) -> AppResult<Arc<Session>> {
+    let (nzb, main) = fetch_healthy_release(state, candidate).await?;
 
     let source = open_media_source(
         &nzb,
@@ -239,7 +282,7 @@ async fn start_session(
             season: target.season,
             episode: target.episode,
             release_title: &candidate.raw.title,
-            indexer_id: candidate.raw.indexer_id,
+            indexer_id: Some(candidate.raw.indexer_id),
             nzb_url: &candidate.raw.nzb_url,
             duration_secs: session.info().duration_secs,
         },
@@ -247,6 +290,122 @@ async fn start_session(
     .await?;
 
     Ok(session)
+}
+
+/// Play a finished download from disk: no indexers, no NNTP — a
+/// [`DiskFile`] over the stored path feeds the usual probe/HLS pipeline.
+async fn start_disk_session(
+    state: &AppState,
+    download: &db::downloads::Download,
+) -> AppResult<CreateSessionResponse> {
+    if download.status != "complete" {
+        return Err(AppError::BadRequest(format!(
+            "download {} is not playable (status: {})",
+            download.id, download.status
+        )));
+    }
+    let path = download.file_path.as_deref().ok_or_else(|| {
+        AppError::Internal(anyhow::anyhow!(
+            "complete download {} has no file path",
+            download.id
+        ))
+    })?;
+    if !tokio::fs::try_exists(path).await.unwrap_or(false) {
+        return Err(AppError::NotFound(format!(
+            "downloaded file for {} (it may have been deleted)",
+            download.id
+        )));
+    }
+
+    let media_type = match download.media_type.as_str() {
+        "tv" => MediaType::Tv,
+        _ => MediaType::Movie,
+    };
+    let season = download.season.map(|s| s as u32);
+    let episode = download.episode.map(|e| e as u32);
+
+    let media = DiskFile::open(path).await?;
+    let inner_file_name = FsPath::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| download.release_title.clone());
+
+    let resume_position_secs = db::watch_history::position_secs(
+        &state.db,
+        download.tmdb_id,
+        media_type.as_str(),
+        season,
+        episode,
+    )
+    .await?
+    .unwrap_or(0.0);
+
+    let session = Session::create(
+        NewSession {
+            media: Arc::new(media),
+            tmdb_id: download.tmdb_id,
+            media_type,
+            season,
+            episode,
+            release_title: download.release_title.clone(),
+            inner_file_name,
+            resume_position_secs,
+        },
+        state.config.storage.session_dir.as_deref(),
+    )
+    .await?;
+    state.sessions.insert(session.clone());
+
+    match probe_and_spawn(state, &session).await {
+        Ok(()) => {}
+        Err(error) => {
+            state.sessions.teardown(&session.id).await;
+            return Err(error);
+        }
+    }
+
+    db::watch_history::record_session_start(
+        &state.db,
+        &db::watch_history::SessionStart {
+            tmdb_id: download.tmdb_id,
+            media_type: media_type.as_str(),
+            season,
+            episode,
+            release_title: &download.release_title,
+            indexer_id: None,
+            nzb_url: &download.nzb_url,
+            duration_secs: session.info().duration_secs,
+        },
+    )
+    .await?;
+
+    Ok(session_response(
+        &session,
+        synthesized_release(download),
+        Vec::new(),
+        "disk",
+    ))
+}
+
+/// A `RankedRelease` stand-in for the session response when playing a
+/// finished download (there was no live indexer search).
+fn synthesized_release(download: &db::downloads::Download) -> RankedRelease {
+    let raw = RawRelease {
+        title: download.release_title.clone(),
+        guid: format!("download:{}", download.id),
+        nzb_url: download.nzb_url.clone(),
+        size_bytes: download.total_bytes,
+        posted_at: None,
+        indexer_id: 0,
+        indexer_name: "local download".into(),
+    };
+    let parsed = parse_release_name(&raw.title);
+    RankedRelease {
+        raw,
+        parsed,
+        score: 0,
+        rejected: None,
+    }
 }
 
 fn loopback_url(state: &AppState, session: &Session) -> String {

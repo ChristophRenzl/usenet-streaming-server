@@ -1,16 +1,72 @@
 //! Shared test support: deterministic payload generator, yEnc encoder, NZB
-//! XML builder, the in-process mock NNTP server and a real-socket app
-//! harness for streaming tests.
+//! XML builder, ffmpeg test-clip generation, the in-process mock NNTP
+//! server and a real-socket app harness for streaming tests.
 
 #![allow(dead_code)] // helpers are shared across many test modules
 
 pub mod mock_nntp;
 
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
 use usenet_streaming_server::{api, state::AppState};
 
 pub use mock_nntp::MockNntp;
+
+pub fn ffmpeg_available() -> bool {
+    let works = |bin: &str| {
+        std::process::Command::new(bin)
+            .arg("-version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    };
+    works("ffmpeg") && works("ffprobe")
+}
+
+/// Encode a deterministic test clip (testsrc2 + sine) into an MKV with 1s
+/// GOPs (so HLS can cut ~6s segments). Returns None when encoding fails
+/// (e.g. the audio encoder is unavailable).
+pub fn generate_media(dir: &Path, duration: u32, fps: u32, audio_args: &[&str]) -> Option<PathBuf> {
+    let out = dir.join(format!(
+        "source-{}.mkv",
+        audio_args.join("").replace(':', "-")
+    ));
+    let status = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("testsrc2=duration={duration}:size=320x180:rate={fps}"),
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("sine=frequency=440:duration={duration}"),
+            "-map",
+            "0:v",
+            "-map",
+            "1:a",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-g",
+            &fps.to_string(),
+            "-pix_fmt",
+            "yuv420p",
+        ])
+        .args(audio_args)
+        .arg(&out)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok()?;
+    (status.success() && out.exists()).then_some(out)
+}
 
 /// Serve the full app on an ephemeral loopback port (with connect-info, as
 /// `run()` does) and point the state's loopback base at it. Returns the base

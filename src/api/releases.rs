@@ -93,6 +93,38 @@ pub async fn resolve_candidates(
     Ok(rank(raw, &prefs))
 }
 
+/// Pick the candidates to actually try: the guid-pinned release when given,
+/// otherwise the top `max_attempts` accepted ones in rank order. Shared by
+/// session creation and download jobs.
+pub fn pick_candidates(
+    candidates: &[RankedRelease],
+    release_guid: Option<&str>,
+    max_attempts: usize,
+) -> AppResult<Vec<RankedRelease>> {
+    let to_try: Vec<RankedRelease> = match release_guid {
+        Some(guid) => {
+            let chosen = candidates
+                .iter()
+                .find(|c| c.raw.guid == guid)
+                .cloned()
+                .ok_or_else(|| AppError::NotFound(format!("release with guid '{guid}'")))?;
+            vec![chosen]
+        }
+        None => candidates
+            .iter()
+            .filter(|c| c.rejected.is_none())
+            .take(max_attempts)
+            .cloned()
+            .collect(),
+    };
+    if to_try.is_empty() {
+        return Err(AppError::NoRelease(
+            "no accepted release candidates (all were rejected by preferences)".into(),
+        ));
+    }
+    Ok(to_try)
+}
+
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct ReleasesParams {
     /// TMDB id of the movie or show.

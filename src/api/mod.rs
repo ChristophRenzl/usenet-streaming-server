@@ -1,4 +1,6 @@
 pub mod auth;
+pub mod downloads;
+pub mod history;
 pub mod internal;
 pub mod metadata;
 pub mod releases;
@@ -26,6 +28,8 @@ use crate::state::AppState;
         (name = "metadata", description = "TMDB search and details"),
         (name = "releases", description = "Indexer release search and ranking"),
         (name = "streaming", description = "Playback sessions, HLS delivery and raw byte-range access"),
+        (name = "downloads", description = "Server-side download jobs and disk playback"),
+        (name = "history", description = "Watch history and resume positions"),
         (name = "settings", description = "Preferences, indexers, providers, app settings"),
     )
 )]
@@ -39,6 +43,8 @@ pub fn router(state: AppState) -> Router {
         .merge(metadata::router())
         .merge(releases::router())
         .merge(stream::router())
+        .merge(downloads::router())
+        .merge(history::router())
         .merge(settings::router())
         .split_for_parts();
 

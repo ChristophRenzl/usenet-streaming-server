@@ -3,7 +3,8 @@ use std::{sync::Arc, time::Duration};
 use anyhow::Context;
 
 use crate::{
-    config::AppConfig, db, nntp::NntpPool, stream::SessionManager, tmdb, vfs::SegmentCache,
+    config::AppConfig, db, download::DownloadManager, nntp::NntpPool, stream::SessionManager, tmdb,
+    vfs::SegmentCache,
 };
 
 #[derive(Clone)]
@@ -21,6 +22,8 @@ pub struct AppState {
     pub segment_cache: SegmentCache,
     /// Live playback sessions.
     pub sessions: SessionManager,
+    /// Running download jobs.
+    pub downloads: DownloadManager,
     /// Base URL under which this server reaches itself over loopback
     /// (`http://127.0.0.1:{bound port}`); ffmpeg/ffprobe read the virtual
     /// files through it. Set in `run()` after the listener is bound.
@@ -40,6 +43,17 @@ impl AppState {
     }
 
     async fn build(config: AppConfig, db: sqlx::SqlitePool) -> anyhow::Result<Self> {
+        // Jobs interrupted by a previous shutdown can never finish.
+        let interrupted = db::downloads::recover_interrupted(&db)
+            .await
+            .context("recovering interrupted downloads")?;
+        if interrupted > 0 {
+            tracing::warn!(
+                count = interrupted,
+                "marked interrupted downloads as failed"
+            );
+        }
+
         let providers = db::providers::list(&db)
             .await
             .context("loading NNTP providers")?;
@@ -56,6 +70,7 @@ impl AppState {
             nntp_pool,
             segment_cache,
             sessions,
+            downloads: DownloadManager::new(),
             // Placeholder until the listener is bound; `run()` and the test
             // harness overwrite it with the real port.
             loopback_base: "http://127.0.0.1:0".into(),

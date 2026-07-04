@@ -3,8 +3,7 @@
 //! (with real ffmpeg/ffprobe), audio transcoding, seek restarts and the
 //! idle-session reaper.
 
-use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,7 +18,10 @@ use uuid::Uuid;
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use crate::support::{add_yenc_file, build_nzb_xml, spawn_app, xorshift_bytes, MockNntp};
+use crate::support::{
+    add_yenc_file, build_nzb_xml, ffmpeg_available, generate_media, spawn_app, xorshift_bytes,
+    MockNntp,
+};
 
 const API_KEY: &str = "test-api-key";
 
@@ -381,60 +383,6 @@ async fn idle_sessions_are_reaped() {
 }
 
 // ---- Full-stack HLS harness --------------------------------------------------------
-
-fn ffmpeg_available() -> bool {
-    let works = |bin: &str| {
-        std::process::Command::new(bin)
-            .arg("-version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
-    };
-    works("ffmpeg") && works("ffprobe")
-}
-
-/// Encode a deterministic test clip (testsrc2 + sine) into an MKV with 1s
-/// GOPs (so HLS can cut ~6s segments). Returns None when encoding fails
-/// (e.g. the audio encoder is unavailable).
-fn generate_media(dir: &Path, duration: u32, fps: u32, audio_args: &[&str]) -> Option<PathBuf> {
-    let out = dir.join(format!(
-        "source-{}.mkv",
-        audio_args.join("").replace(':', "-")
-    ));
-    let status = std::process::Command::new("ffmpeg")
-        .args([
-            "-y",
-            "-f",
-            "lavfi",
-            "-i",
-            &format!("testsrc2=duration={duration}:size=320x180:rate={fps}"),
-            "-f",
-            "lavfi",
-            "-i",
-            &format!("sine=frequency=440:duration={duration}"),
-            "-map",
-            "0:v",
-            "-map",
-            "1:a",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "ultrafast",
-            "-g",
-            &fps.to_string(),
-            "-pix_fmt",
-            "yuv420p",
-        ])
-        .args(audio_args)
-        .arg(&out)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .ok()?;
-    (status.success() && out.exists()).then_some(out)
-}
 
 fn rss_with_release(indexer_base: &str) -> String {
     format!(

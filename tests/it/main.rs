@@ -3,6 +3,8 @@
 
 mod support;
 
+mod downloads_api;
+mod history_api;
 mod nntp_client;
 mod provider_endpoint;
 mod rar_fixtures;
