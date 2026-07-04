@@ -182,6 +182,40 @@ pub async fn delete_provider(
     }
 }
 
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ProviderTestResult {
+    pub ok: bool,
+    /// Round-trip time for connect + auth + DATE, when successful.
+    pub latency_ms: Option<u64>,
+    pub error: Option<String>,
+}
+
+/// Test an NNTP provider: dial it, authenticate and issue `DATE`.
+#[utoipa::path(post, path = "/settings/providers/{id}/test", tag = "settings",
+    params(("id" = i64, Path, description = "Provider id")),
+    responses((status = 200, body = ProviderTestResult), (status = 404)))]
+pub async fn test_provider(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> AppResult<Json<ProviderTestResult>> {
+    let provider = db::providers::get(&state.db, id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("provider {id}")))?;
+    let result = match crate::nntp::test_provider(&provider).await {
+        Ok(latency) => ProviderTestResult {
+            ok: true,
+            latency_ms: Some(latency.as_millis() as u64),
+            error: None,
+        },
+        Err(e) => ProviderTestResult {
+            ok: false,
+            latency_ms: None,
+            error: Some(e),
+        },
+    };
+    Ok(Json(result))
+}
+
 // ---- App settings -----------------------------------------------------------
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -245,6 +279,7 @@ pub fn router() -> OpenApiRouter<AppState> {
         .routes(routes!(test_indexer))
         .routes(routes!(list_providers, create_provider))
         .routes(routes!(update_provider, delete_provider))
+        .routes(routes!(test_provider))
         .routes(routes!(get_app_settings, put_app_settings))
 }
 

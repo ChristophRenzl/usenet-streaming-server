@@ -61,6 +61,18 @@ pub async fn list(pool: &SqlitePool) -> AppResult<Vec<Provider>> {
     Ok(rows)
 }
 
+pub async fn get(pool: &SqlitePool, id: i64) -> AppResult<Option<Provider>> {
+    let row = sqlx::query_as(
+        "SELECT id, name, host, port, use_tls, username, password, max_connections, priority,
+                enabled
+         FROM nntp_providers WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
 pub async fn create(pool: &SqlitePool, input: &ProviderInput) -> AppResult<Provider> {
     let row = sqlx::query_as(
         "INSERT INTO nntp_providers

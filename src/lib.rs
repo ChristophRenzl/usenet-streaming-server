@@ -3,9 +3,13 @@ pub mod config;
 pub mod db;
 pub mod error;
 pub mod indexer;
+pub mod nntp;
+pub mod nzb;
+pub mod rar;
 pub mod release;
 pub mod state;
 pub mod tmdb;
+pub mod vfs;
 
 use anyhow::Context;
 use config::AppConfig;

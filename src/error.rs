@@ -26,6 +26,12 @@ pub enum AppError {
     #[error("release is a compressed RAR archive and cannot be streamed")]
     CompressedRarUnsupported,
 
+    #[error("release is an encrypted RAR archive and cannot be streamed")]
+    EncryptedRarUnsupported,
+
+    #[error("invalid RAR archive: {0}")]
+    InvalidRarArchive(String),
+
     #[error("article missing on provider: {0}")]
     MissingSegment(String),
 
@@ -43,7 +49,10 @@ impl AppError {
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Upstream(_) => StatusCode::BAD_GATEWAY,
-            Self::NoRelease(_) | Self::CompressedRarUnsupported => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::NoRelease(_)
+            | Self::CompressedRarUnsupported
+            | Self::EncryptedRarUnsupported
+            | Self::InvalidRarArchive(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::MissingSegment(_) => StatusCode::BAD_GATEWAY,
             Self::Database(_) | Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
