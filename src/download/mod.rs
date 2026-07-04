@@ -98,16 +98,17 @@ enum Outcome {
 
 async fn run(state: AppState, id: Uuid, job: DownloadJob, cancel: CancellationToken) {
     // `execute` records the partial path here as soon as it exists so the
-    // cancellation/failure paths below can always clean it up, even when
-    // the future is dropped mid-await by the select.
+    // cancellation/failure paths below can always clean it up.
     let partial_slot: Arc<Mutex<Option<PathBuf>>> = Arc::default();
 
-    let outcome = tokio::select! {
-        _ = cancel.cancelled() => Outcome::Cancelled,
-        result = execute(&state, &id, &job, &partial_slot) => match result {
-            Ok(()) => Outcome::Complete,
-            Err(error) => Outcome::Failed(error),
-        },
+    // Cancellation is cooperative inside `execute`: only network waits race
+    // against the token. Local file operations always run to completion —
+    // dropping a tokio::fs future mid-await would leave its spawn_blocking
+    // op running detached, e.g. creating the `.partial` *after* cleanup.
+    let outcome = match execute(&state, &id, &job, &partial_slot, &cancel).await {
+        Ok(false) => Outcome::Cancelled,
+        Ok(true) => Outcome::Complete,
+        Err(error) => Outcome::Failed(error),
     };
 
     let id_text = id.to_string();
@@ -144,22 +145,29 @@ async fn remove_partial(slot: &Mutex<Option<PathBuf>>) {
 }
 
 /// The happy path: open the virtual file, stream it into `.partial`,
-/// atomically rename and mark the row complete.
+/// atomically rename and mark the row complete. Returns `Ok(false)` when the
+/// cancellation token fired first. Only network-bound awaits are raced
+/// against the token; file-system operations run to completion so no path
+/// escapes the cleanup slot (see `run`).
 async fn execute(
     state: &AppState,
     id: &Uuid,
     job: &DownloadJob,
     partial_slot: &Mutex<Option<PathBuf>>,
-) -> AppResult<()> {
+    cancel: &CancellationToken,
+) -> AppResult<bool> {
     let id_text = id.to_string();
-    let source = open_media_source(
+    let open = open_media_source(
         &job.nzb,
         &job.main,
         &state.nntp_pool,
         &state.segment_cache,
         state.config.streaming.readahead_segments,
-    )
-    .await?;
+    );
+    let source = tokio::select! {
+        _ = cancel.cancelled() => return Ok(false),
+        source = open => source?,
+    };
     let total = source.file.len();
     db::downloads::mark_downloading(&state.db, &id_text, total as i64).await?;
 
@@ -177,7 +185,10 @@ async fn execute(
     let mut last_report = Instant::now();
     let mut last_reported: u64 = 0;
     while offset < total {
-        let chunk = source.file.read_at(offset, CHUNK_SIZE).await?;
+        let chunk = tokio::select! {
+            _ = cancel.cancelled() => return Ok(false),
+            chunk = source.file.read_at(offset, CHUNK_SIZE) => chunk?,
+        };
         if chunk.is_empty() {
             return Err(AppError::Internal(anyhow::anyhow!(
                 "unexpected end of media at byte {offset} of {total}"
@@ -207,5 +218,5 @@ async fn execute(
     *partial_slot.lock().expect("partial slot lock") = None;
 
     db::downloads::mark_complete(&state.db, &id_text, &final_path.to_string_lossy()).await?;
-    Ok(())
+    Ok(true)
 }
