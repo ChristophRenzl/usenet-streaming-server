@@ -2,7 +2,10 @@ pub mod api;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod indexer;
+pub mod release;
 pub mod state;
+pub mod tmdb;
 
 use anyhow::Context;
 use config::AppConfig;
