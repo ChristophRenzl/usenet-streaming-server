@@ -1,0 +1,7 @@
+/target
+*.db
+*.db-shm
+*.db-wal
+/data
+/config.local.toml
+.DS_Store

@@ -1,0 +1,13 @@
+services:
+  usenet-streamer:
+    image: ghcr.io/christophrenzl/usenet-streaming-server:latest
+    container_name: usenet-streamer
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config:/config
+      - ./data:/data
+    environment:
+      # Alternatively put api_key in config/config.toml
+      - APP_AUTH__API_KEY=change-me
+    restart: unless-stopped

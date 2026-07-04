@@ -1,0 +1,33 @@
+# Bootstrap configuration. Everything else (NNTP providers, indexers,
+# TMDB API key, preferences) is configured at runtime via the API and
+# stored in SQLite.
+#
+# Every value can be overridden via environment variables:
+#   APP_SERVER__PORT=9090, APP_AUTH__API_KEY=..., etc.
+
+[server]
+host = "0.0.0.0"
+port = 8080
+
+[auth]
+# Required. Clients send this in the X-Api-Key header (or ?apikey= query).
+api_key = ""
+
+[database]
+path = "data/usenet-streamer.db"
+
+[storage]
+# Server-side downloads land here.
+download_dir = "data/downloads"
+# Per-session HLS segments (defaults to OS temp dir).
+# session_dir = "/tmp/usenet-streamer-sessions"
+
+[cache]
+# In-memory decoded segment cache bound (bytes). Default 512 MiB.
+memory_bytes = 536870912
+
+[streaming]
+session_idle_timeout_secs = 120
+readahead_segments = 16
+ffmpeg_path = "ffmpeg"
+ffprobe_path = "ffprobe"

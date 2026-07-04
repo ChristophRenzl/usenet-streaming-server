@@ -1,0 +1,54 @@
+[package]
+name = "usenet-streaming-server"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Self-hosted backend that streams movies/TV on-the-fly from Usenet"
+repository = "https://github.com/ChristophRenzl/usenet-streaming-server"
+
+[dependencies]
+axum = "0.8"
+utoipa = { version = "5.5", features = ["axum_extras", "chrono", "uuid"] }
+utoipa-axum = "0.2"
+utoipa-swagger-ui = { version = "9.0", features = ["axum"] }
+tokio = { version = "1.52", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+tokio-rustls = "0.26"
+rustls = "0.23"
+webpki-roots = "1"
+sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "migrate", "chrono", "uuid"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "webpki-roots", "http2", "stream"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+quick-xml = { version = "0.41", features = ["serialize"] }
+figment = { version = "0.10", features = ["toml", "env"] }
+moka = { version = "0.12", features = ["future"] }
+memchr = "2.8"
+crc32fast = "1.5"
+regex = "1.12"
+bytes = "1.12"
+uuid = { version = "1.23", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tower = "0.5"
+tower-http = { version = "0.7", features = ["trace", "cors"] }
+futures = "0.3"
+async-trait = "0.1"
+dashmap = "6.2"
+tempfile = "3.27"
+clap = { version = "4.6", features = ["derive"] }
+rand = "0.9"
+
+[dev-dependencies]
+figment = { version = "0.10", features = ["toml", "env", "test"] }
+axum-test = "21"
+wiremock = "0.6"
+insta = "1.48"
+pretty_assertions = "1.4"
+
+[profile.release]
+lto = "thin"
+strip = true
