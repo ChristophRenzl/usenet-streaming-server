@@ -69,6 +69,10 @@ pub struct NntpConnection {
     stream: BufReader<Box<dyn AsyncStream>>,
     timeouts: NntpTimeouts,
     poisoned: bool,
+    /// True while a command is in flight. Command futures are not
+    /// cancellation-safe (a cancelled `BODY` leaves its response in the
+    /// socket), so a connection dropped mid-command must not be reused.
+    busy: bool,
 }
 
 impl std::fmt::Debug for NntpConnection {
@@ -143,6 +147,7 @@ impl NntpConnection {
             stream: BufReader::new(stream),
             timeouts,
             poisoned: false,
+            busy: false,
         };
 
         let greeting = conn.read_line().await?;
@@ -176,10 +181,11 @@ impl NntpConnection {
         }
     }
 
-    /// True once a protocol or I/O error occurred; the pool discards such
-    /// connections instead of reusing them.
+    /// True once a protocol or I/O error occurred, or when a command future
+    /// was cancelled mid-flight (leaving the stream desynchronized); the
+    /// pool discards such connections instead of reusing them.
     pub fn is_poisoned(&self) -> bool {
-        self.poisoned
+        self.poisoned || self.busy
     }
 
     pub fn mark_poisoned(&mut self) {
@@ -241,12 +247,19 @@ impl NntpConnection {
 
     /// `STAT <id>`: does the article exist on this server?
     pub async fn stat(&mut self, message_id: &str) -> Result<bool, NntpError> {
+        self.busy = true;
         let resp = self
             .command(&format!("STAT {}", angle(message_id)?))
             .await?;
         match response_code(&resp) {
-            Some(223) => Ok(true),
-            Some(430) | Some(423) => Ok(false),
+            Some(223) => {
+                self.busy = false;
+                Ok(true)
+            }
+            Some(430) | Some(423) => {
+                self.busy = false;
+                Ok(false)
+            }
             _ => {
                 self.poisoned = true;
                 Err(NntpError::UnexpectedResponse(format!("STAT: {resp}")))
@@ -258,12 +271,20 @@ impl NntpConnection {
     /// removed and the terminating `.` line stripped. CRLF line breaks are
     /// preserved for the yEnc decoder.
     pub async fn body(&mut self, message_id: &str) -> Result<Bytes, NntpError> {
+        self.busy = true;
         let resp = self
             .command(&format!("BODY {}", angle(message_id)?))
             .await?;
         match response_code(&resp) {
-            Some(222) => self.read_multiline().await,
-            Some(430) | Some(423) => Err(NntpError::ArticleNotFound),
+            Some(222) => {
+                let body = self.read_multiline().await?;
+                self.busy = false;
+                Ok(body)
+            }
+            Some(430) | Some(423) => {
+                self.busy = false;
+                Err(NntpError::ArticleNotFound)
+            }
             _ => {
                 self.poisoned = true;
                 Err(NntpError::UnexpectedResponse(format!("BODY: {resp}")))
@@ -308,9 +329,13 @@ impl NntpConnection {
 
     /// `DATE`: server time as `yyyymmddhhmmss`.
     pub async fn date(&mut self) -> Result<String, NntpError> {
+        self.busy = true;
         let resp = self.command("DATE").await?;
         match response_code(&resp) {
-            Some(111) => Ok(resp[3..].trim().to_string()),
+            Some(111) => {
+                self.busy = false;
+                Ok(resp[3..].trim().to_string())
+            }
             _ => {
                 self.poisoned = true;
                 Err(NntpError::UnexpectedResponse(format!("DATE: {resp}")))

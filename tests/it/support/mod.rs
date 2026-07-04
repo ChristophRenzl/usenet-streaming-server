@@ -1,11 +1,38 @@
 //! Shared test support: deterministic payload generator, yEnc encoder, NZB
-//! XML builder and the in-process mock NNTP server.
+//! XML builder, the in-process mock NNTP server and a real-socket app
+//! harness for streaming tests.
 
 #![allow(dead_code)] // helpers are shared across many test modules
 
 pub mod mock_nntp;
 
+use std::net::SocketAddr;
+
+use usenet_streaming_server::{api, state::AppState};
+
 pub use mock_nntp::MockNntp;
+
+/// Serve the full app on an ephemeral loopback port (with connect-info, as
+/// `run()` does) and point the state's loopback base at it. Returns the base
+/// URL, the final state (shared with the server) and the serve task handle.
+pub async fn spawn_app(state: AppState) -> (String, AppState, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind app listener");
+    let addr = listener.local_addr().expect("app addr");
+    let base = format!("http://{addr}");
+    let state = state.with_loopback_base(&base);
+    let router = api::router(state.clone());
+    let handle = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .expect("serve app");
+    });
+    (base, state, handle)
+}
 
 /// CRC32 of `payload_3mib()`; must match the value printed by
 /// `scripts/gen-rar-fixtures.sh` (the fixtures pack the same payload).

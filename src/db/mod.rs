@@ -36,3 +36,4 @@ pub mod indexers;
 pub mod preferences;
 pub mod providers;
 pub mod settings;
+pub mod watch_history;

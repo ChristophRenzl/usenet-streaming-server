@@ -133,6 +133,15 @@ pub async fn test_indexer(
 
 // ---- NNTP providers ---------------------------------------------------------
 
+/// Rebuild the NNTP pool from the current provider table so configuration
+/// changes take effect without a restart.
+async fn reload_pool(state: &AppState) -> AppResult<()> {
+    state
+        .nntp_pool
+        .reload(db::providers::list(&state.db).await?);
+    Ok(())
+}
+
 /// List all NNTP providers.
 #[utoipa::path(get, path = "/settings/providers", tag = "settings",
     responses((status = 200, body = [Provider])))]
@@ -148,7 +157,9 @@ pub async fn create_provider(
     State(state): State<AppState>,
     Json(input): Json<ProviderInput>,
 ) -> AppResult<Json<Provider>> {
-    Ok(Json(db::providers::create(&state.db, &input).await?))
+    let provider = db::providers::create(&state.db, &input).await?;
+    reload_pool(&state).await?;
+    Ok(Json(provider))
 }
 
 /// Update an NNTP provider.
@@ -161,10 +172,11 @@ pub async fn update_provider(
     Path(id): Path<i64>,
     Json(input): Json<ProviderInput>,
 ) -> AppResult<Json<Provider>> {
-    db::providers::update(&state.db, id, &input)
+    let provider = db::providers::update(&state.db, id, &input)
         .await?
-        .map(Json)
-        .ok_or_else(|| AppError::NotFound(format!("provider {id}")))
+        .ok_or_else(|| AppError::NotFound(format!("provider {id}")))?;
+    reload_pool(&state).await?;
+    Ok(Json(provider))
 }
 
 /// Remove an NNTP provider.
@@ -176,6 +188,7 @@ pub async fn delete_provider(
     Path(id): Path<i64>,
 ) -> AppResult<axum::http::StatusCode> {
     if db::providers::delete(&state.db, id).await? {
+        reload_pool(&state).await?;
         Ok(axum::http::StatusCode::NO_CONTENT)
     } else {
         Err(AppError::NotFound(format!("provider {id}")))

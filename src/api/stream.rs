@@ -1,0 +1,646 @@
+//! Playback sessions and HLS delivery: session creation (release resolution
+//! → NZB → virtual file → ffprobe → ffmpeg), playlists, fMP4 segments, raw
+//! byte-range access, seeking and teardown.
+
+use std::path::Path as FsPath;
+use std::sync::{Arc, LazyLock};
+
+use axum::extract::{Path, State};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::Json;
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
+use utoipa_axum::{router::OpenApiRouter, routes};
+use uuid::Uuid;
+
+use crate::{
+    db,
+    error::{AppError, AppResult},
+    indexer::client::NewznabClient,
+    nzb::{health_check, main_content_segments, parse_nzb, select_main},
+    release::rank::RankedRelease,
+    state::AppState,
+    stream::{
+        ffmpeg::{self, SpawnOptions},
+        ffprobe, open_media_source, range,
+        session::{NewSession, Session, SessionState},
+        MediaInfo,
+    },
+    tmdb::models::MediaType,
+};
+
+use super::releases::{resolve_candidates, ReleaseTarget};
+
+/// Maximum release candidates tried before giving up.
+const MAX_ATTEMPTS: usize = 5;
+/// Segments STATed per candidate during the pre-flight health check.
+const HEALTH_SAMPLE: usize = 10;
+
+const PLAYLIST_CONTENT_TYPE: &str = "application/vnd.apple.mpegurl";
+
+static SEGMENT_NAME: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(init\.mp4|seg_\d+\.m4s)$").expect("segment regex"));
+
+// ---- Session creation -------------------------------------------------------
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CreateSessionRequest {
+    /// TMDB id of the movie or show.
+    pub tmdb_id: i64,
+    /// `movie` or `tv`.
+    pub media_type: MediaType,
+    /// Season number (required for `tv`).
+    pub season: Option<u32>,
+    /// Episode number (required for `tv`).
+    pub episode: Option<u32>,
+    /// Pin a specific release by its indexer guid instead of automatic
+    /// candidate selection.
+    pub release_guid: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CreateSessionResponse {
+    pub session_id: Uuid,
+    /// HLS entry point (append `?apikey=` for header-less players).
+    pub hls_master_url: String,
+    /// Byte-range access to the untouched media file.
+    pub raw_url: String,
+    pub duration_secs: Option<f64>,
+    pub video_codec: Option<String>,
+    pub audio_codec: Option<String>,
+    /// True when the audio is transcoded to AAC for HLS.
+    pub audio_transcoded: bool,
+    /// Container extension of the media file (`mkv`, `mp4`, ...).
+    pub container: String,
+    pub chosen_release: RankedRelease,
+    /// The full ranked candidate list the choice was made from.
+    pub candidates: Vec<RankedRelease>,
+    /// Stored watch position to offer "resume from here", when any.
+    pub resume_position_secs: Option<f64>,
+}
+
+/// Start a playback session: resolve releases, pick the first healthy
+/// streamable candidate, probe it and start the HLS remux.
+#[utoipa::path(post, path = "/stream/sessions", tag = "streaming",
+    request_body = CreateSessionRequest,
+    responses(
+        (status = 200, body = CreateSessionResponse),
+        (status = 400, description = "Bad parameters, missing indexers or TMDB key"),
+        (status = 404, description = "Unknown TMDB id or release_guid"),
+        (status = 422, description = "No streamable release found; details list per-candidate reasons"),
+    ))]
+pub async fn create_session(
+    State(state): State<AppState>,
+    Json(request): Json<CreateSessionRequest>,
+) -> AppResult<Json<CreateSessionResponse>> {
+    let target = ReleaseTarget {
+        tmdb_id: request.tmdb_id,
+        media_type: request.media_type,
+        season: request.season,
+        episode: request.episode,
+    }
+    .validated()?;
+
+    let candidates = resolve_candidates(&state, &target).await?;
+
+    let to_try: Vec<RankedRelease> = match &request.release_guid {
+        Some(guid) => {
+            let chosen = candidates
+                .iter()
+                .find(|c| &c.raw.guid == guid)
+                .cloned()
+                .ok_or_else(|| AppError::NotFound(format!("release with guid '{guid}'")))?;
+            vec![chosen]
+        }
+        None => candidates
+            .iter()
+            .filter(|c| c.rejected.is_none())
+            .take(MAX_ATTEMPTS)
+            .cloned()
+            .collect(),
+    };
+    if to_try.is_empty() {
+        return Err(AppError::NoRelease(
+            "no accepted release candidates (all were rejected by preferences)".into(),
+        ));
+    }
+
+    let mut failures: Vec<String> = Vec::new();
+    for candidate in to_try {
+        match start_session(&state, &target, &candidate).await {
+            Ok(session) => {
+                let info = session.info();
+                return Ok(Json(CreateSessionResponse {
+                    session_id: session.id,
+                    hls_master_url: format!("/api/v1/stream/{}/master.m3u8", session.id),
+                    raw_url: format!("/api/v1/stream/{}/raw", session.id),
+                    duration_secs: info.duration_secs,
+                    video_codec: info.video_codec,
+                    audio_codec: info.audio_codec,
+                    audio_transcoded: info.audio_transcoded,
+                    container: session.container.clone(),
+                    chosen_release: candidate,
+                    candidates,
+                    resume_position_secs: (session.resume_position_secs > 0.0)
+                        .then_some(session.resume_position_secs),
+                }));
+            }
+            Err(error) => {
+                tracing::warn!(release = %candidate.raw.title, %error, "candidate failed, trying next");
+                failures.push(format!("{}: {error}", candidate.raw.title));
+            }
+        }
+    }
+    Err(AppError::NoRelease(failures.join("; ")))
+}
+
+/// Try to start a session from one candidate: NZB grab → parse → health
+/// check → virtual file → ffprobe → ffmpeg. On failure the partially
+/// registered session is torn down.
+async fn start_session(
+    state: &AppState,
+    target: &ReleaseTarget,
+    candidate: &RankedRelease,
+) -> AppResult<Arc<Session>> {
+    let indexer = db::indexers::get(&state.db, candidate.raw.indexer_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::Upstream(format!(
+                "indexer {} no longer configured",
+                candidate.raw.indexer_id
+            ))
+        })?;
+    let nzb_bytes = NewznabClient::new(state.http.clone(), indexer)
+        .grab(&candidate.raw.nzb_url)
+        .await?;
+    let nzb = parse_nzb(&String::from_utf8_lossy(&nzb_bytes))?;
+    let main = select_main(&nzb)?;
+
+    let segments = main_content_segments(&nzb, &main);
+    let health = health_check(&segments, &state.nntp_pool, HEALTH_SAMPLE).await?;
+    if !health.ok {
+        return Err(AppError::NoRelease(format!(
+            "health check failed ({}/{} sampled segments missing)",
+            health.missing, health.checked
+        )));
+    }
+
+    let source = open_media_source(
+        &nzb,
+        &main,
+        &state.nntp_pool,
+        &state.segment_cache,
+        state.config.streaming.readahead_segments,
+    )
+    .await?;
+
+    let resume_position_secs = db::watch_history::position_secs(
+        &state.db,
+        target.tmdb_id,
+        target.media_type.as_str(),
+        target.season,
+        target.episode,
+    )
+    .await?
+    .unwrap_or(0.0);
+
+    let session = Session::create(
+        NewSession {
+            media: source.file,
+            tmdb_id: target.tmdb_id,
+            media_type: target.media_type,
+            season: target.season,
+            episode: target.episode,
+            release_title: candidate.raw.title.clone(),
+            inner_file_name: source.inner_file_name,
+            resume_position_secs,
+        },
+        state.config.storage.session_dir.as_deref(),
+    )
+    .await?;
+    state.sessions.insert(session.clone());
+
+    // From here on, clean up the registered session on failure.
+    match probe_and_spawn(state, &session).await {
+        Ok(()) => {}
+        Err(error) => {
+            state.sessions.teardown(&session.id).await;
+            return Err(error);
+        }
+    }
+
+    db::watch_history::record_session_start(
+        &state.db,
+        &db::watch_history::SessionStart {
+            tmdb_id: target.tmdb_id,
+            media_type: target.media_type.as_str(),
+            season: target.season,
+            episode: target.episode,
+            release_title: &candidate.raw.title,
+            indexer_id: candidate.raw.indexer_id,
+            nzb_url: &candidate.raw.nzb_url,
+            duration_secs: session.info().duration_secs,
+        },
+    )
+    .await?;
+
+    Ok(session)
+}
+
+fn loopback_url(state: &AppState, session: &Session) -> String {
+    format!(
+        "{}/internal/vfs/{}?token={}",
+        state.loopback_base, session.id, session.token
+    )
+}
+
+async fn probe_and_spawn(state: &AppState, session: &Arc<Session>) -> AppResult<()> {
+    let url = loopback_url(state, session);
+    let probe = ffprobe::probe_url(&state.config.streaming.ffprobe_path, &url).await?;
+    let audio_transcoded = ffmpeg::should_transcode_audio(probe.audio_codec.as_deref());
+    session.set_info(MediaInfo {
+        duration_secs: probe.duration_secs,
+        video_codec: probe.video_codec,
+        audio_codec: probe.audio_codec,
+        audio_transcoded,
+    });
+    ffmpeg::spawn_hls(
+        session,
+        SpawnOptions {
+            ffmpeg_path: &state.config.streaming.ffmpeg_path,
+            input_url: &url,
+            start_secs: 0.0,
+            transcode_audio: audio_transcoded,
+        },
+    )
+    .await
+}
+
+// ---- Session status / teardown ----------------------------------------------
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SessionStatus {
+    pub session_id: Uuid,
+    /// `starting`, `ready`, `failed` or `ended`.
+    pub state: String,
+    /// ffmpeg stderr tail / failure reason when `state == "failed"`.
+    pub error: Option<String>,
+    pub duration_secs: Option<f64>,
+    pub video_codec: Option<String>,
+    pub audio_codec: Option<String>,
+    pub audio_transcoded: bool,
+    pub container: String,
+    pub release_title: String,
+    pub inner_file_name: String,
+    /// Number of finished HLS media segments on disk.
+    pub segments_ready: usize,
+    pub resume_position_secs: Option<f64>,
+}
+
+fn get_session(state: &AppState, id: &Uuid) -> AppResult<Arc<Session>> {
+    state
+        .sessions
+        .get(id)
+        .ok_or_else(|| AppError::NotFound(format!("session {id}")))
+}
+
+/// Current status of a playback session.
+#[utoipa::path(get, path = "/stream/{session_id}", tag = "streaming",
+    params(("session_id" = Uuid, Path, description = "Session id")),
+    responses((status = 200, body = SessionStatus), (status = 404)))]
+pub async fn session_status(
+    State(state): State<AppState>,
+    Path(session_id): Path<Uuid>,
+) -> AppResult<Json<SessionStatus>> {
+    let session = get_session(&state, &session_id)?;
+    let info = session.info();
+    let (state_label, error) = match session.state() {
+        SessionState::Failed(message) => ("failed".to_string(), Some(message)),
+        other => (other.label().to_string(), None),
+    };
+    Ok(Json(SessionStatus {
+        session_id,
+        state: state_label,
+        error,
+        duration_secs: info.duration_secs,
+        video_codec: info.video_codec,
+        audio_codec: info.audio_codec,
+        audio_transcoded: info.audio_transcoded,
+        container: session.container.clone(),
+        release_title: session.release_title.clone(),
+        inner_file_name: session.inner_file_name.clone(),
+        segments_ready: count_segments(&session.temp_dir).await,
+        resume_position_secs: (session.resume_position_secs > 0.0)
+            .then_some(session.resume_position_secs),
+    }))
+}
+
+async fn count_segments(dir: &FsPath) -> usize {
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+        return 0;
+    };
+    let mut count = 0;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with("seg_") && name.ends_with(".m4s") {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Tear a session down: stop ffmpeg, delete its temp files, free its
+/// Usenet connections.
+#[utoipa::path(delete, path = "/stream/{session_id}", tag = "streaming",
+    params(("session_id" = Uuid, Path, description = "Session id")),
+    responses((status = 204), (status = 404)))]
+pub async fn delete_session(
+    State(state): State<AppState>,
+    Path(session_id): Path<Uuid>,
+) -> AppResult<StatusCode> {
+    if state.sessions.teardown(&session_id).await {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(AppError::NotFound(format!("session {session_id}")))
+    }
+}
+
+// ---- HLS playlists and segments ----------------------------------------------
+
+/// HLS master playlist (single variant, points at `media.m3u8`).
+#[utoipa::path(get, path = "/stream/{session_id}/master.m3u8", tag = "streaming",
+    params(("session_id" = Uuid, Path, description = "Session id")),
+    responses(
+        (status = 200, description = "M3U8 master playlist", content_type = "application/vnd.apple.mpegurl"),
+        (status = 404),
+    ))]
+pub async fn master_playlist(
+    State(state): State<AppState>,
+    Path(session_id): Path<Uuid>,
+) -> AppResult<Response> {
+    let session = get_session(&state, &session_id)?;
+    session.touch();
+    let master = "#EXTM3U\n\
+                  #EXT-X-VERSION:7\n\
+                  #EXT-X-STREAM-INF:BANDWIDTH=20000000\n\
+                  media.m3u8\n";
+    Ok((
+        [(header::CONTENT_TYPE, PLAYLIST_CONTENT_TYPE)],
+        master.to_string(),
+    )
+        .into_response())
+}
+
+/// HLS media playlist written by ffmpeg. While the session is still
+/// starting this responds 503 with `Retry-After: 1`.
+#[utoipa::path(get, path = "/stream/{session_id}/media.m3u8", tag = "streaming",
+    params(("session_id" = Uuid, Path, description = "Session id")),
+    responses(
+        (status = 200, description = "M3U8 media playlist", content_type = "application/vnd.apple.mpegurl"),
+        (status = 404),
+        (status = 503, description = "Session still starting; retry shortly"),
+    ))]
+pub async fn media_playlist(
+    State(state): State<AppState>,
+    Path(session_id): Path<Uuid>,
+) -> AppResult<Response> {
+    let session = get_session(&state, &session_id)?;
+    session.touch();
+    match tokio::fs::read(session.playlist_path()).await {
+        Ok(bytes) => Ok(([(header::CONTENT_TYPE, PLAYLIST_CONTENT_TYPE)], bytes).into_response()),
+        Err(_) => match session.state() {
+            SessionState::Starting => Ok((
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::RETRY_AFTER, "1")],
+                "playlist not ready yet",
+            )
+                .into_response()),
+            SessionState::Failed(message) => Err(AppError::Upstream(format!(
+                "session failed before producing a playlist: {message}"
+            ))),
+            _ => Err(AppError::NotFound("media playlist".into())),
+        },
+    }
+}
+
+/// One fMP4 file from the session dir: `init.mp4` or `seg_NNNNN.m4s`.
+#[utoipa::path(get, path = "/stream/{session_id}/{segment}", tag = "streaming",
+    params(
+        ("session_id" = Uuid, Path, description = "Session id"),
+        ("segment" = String, Path, description = "`init.mp4` or `seg_NNNNN.m4s`"),
+    ),
+    responses(
+        (status = 200, description = "fMP4 init/media segment", content_type = "video/mp4"),
+        (status = 400, description = "Invalid segment name"),
+        (status = 404),
+    ))]
+pub async fn hls_segment(
+    State(state): State<AppState>,
+    Path((session_id, segment)): Path<(Uuid, String)>,
+) -> AppResult<Response> {
+    let session = get_session(&state, &session_id)?;
+    // Strict allowlist: the path parameter must never escape the temp dir.
+    if !SEGMENT_NAME.is_match(&segment) {
+        return Err(AppError::BadRequest(format!(
+            "invalid segment name '{segment}'"
+        )));
+    }
+    session.touch();
+    match tokio::fs::read(session.temp_dir.join(&segment)).await {
+        Ok(bytes) => Ok(([(header::CONTENT_TYPE, "video/mp4")], bytes).into_response()),
+        Err(_) => Err(AppError::NotFound(format!("segment {segment}"))),
+    }
+}
+
+// ---- Raw byte-range access ----------------------------------------------------
+
+/// The source media file with RFC 7233 single-range support, for players
+/// that handle the container directly.
+#[utoipa::path(get, path = "/stream/{session_id}/raw", tag = "streaming",
+    params(("session_id" = Uuid, Path, description = "Session id")),
+    responses(
+        (status = 200, description = "Whole file"),
+        (status = 206, description = "Requested byte range"),
+        (status = 404),
+        (status = 416, description = "Unsatisfiable range"),
+    ))]
+pub async fn raw_media(
+    State(state): State<AppState>,
+    Path(session_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> AppResult<Response> {
+    let session = get_session(&state, &session_id)?;
+    session.touch();
+    Ok(serve_session_file(&session, &headers))
+}
+
+/// Shared by `/stream/{id}/raw` and `/internal/vfs/{id}`: build the range
+/// response and wire mid-stream failures back into the session state.
+pub(crate) fn serve_session_file(session: &Arc<Session>, headers: &HeaderMap) -> Response {
+    let range_header = headers
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok());
+    let on_error = {
+        let session = session.clone();
+        move |error: &AppError| {
+            if matches!(error, AppError::MissingSegment(_)) {
+                session.mark_stream_failure(error.to_string());
+            }
+            tracing::warn!(session = %session.id, %error, "aborting media stream");
+        }
+    };
+    range::range_response(
+        session.media.clone(),
+        &session.inner_file_name,
+        range_header,
+        on_error,
+    )
+}
+
+// ---- Seeking -------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SeekRequest {
+    /// Absolute target position in seconds.
+    pub time_secs: f64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SeekResponse {
+    /// True when ffmpeg was restarted at the new offset and the playlist was
+    /// wiped (players must reload it); false when the target was already
+    /// covered by the produced playlist.
+    pub restarted: bool,
+}
+
+/// Seek. Targets inside the already-produced playlist are a no-op; anything
+/// else restarts ffmpeg at the target time.
+#[utoipa::path(post, path = "/stream/{session_id}/seek", tag = "streaming",
+    params(("session_id" = Uuid, Path, description = "Session id")),
+    request_body = SeekRequest,
+    responses((status = 200, body = SeekResponse), (status = 404)))]
+pub async fn seek_session(
+    State(state): State<AppState>,
+    Path(session_id): Path<Uuid>,
+    Json(request): Json<SeekRequest>,
+) -> AppResult<Json<SeekResponse>> {
+    let session = get_session(&state, &session_id)?;
+    session.touch();
+    let target = if request.time_secs.is_finite() {
+        request.time_secs.max(0.0)
+    } else {
+        return Err(AppError::BadRequest("time_secs must be finite".into()));
+    };
+
+    // Serialize with other seeks/teardown so kill+wipe+respawn is atomic.
+    let _control = session.control.lock().await;
+
+    let start = session.start_offset();
+    let produced = playlist_seconds(&session.playlist_path()).await;
+    if target >= start && target <= start + produced {
+        return Ok(Json(SeekResponse { restarted: false }));
+    }
+
+    tracing::info!(session = %session.id, target, "seek outside produced window; restarting ffmpeg");
+    session.kill_ffmpeg().await;
+    session.bump_generation();
+    wipe_dir(&session.temp_dir).await?;
+    session.set_start_offset(target);
+    session.set_state(SessionState::Starting);
+    session.clear_stderr();
+
+    let url = loopback_url(&state, &session);
+    ffmpeg::spawn_hls(
+        &session,
+        SpawnOptions {
+            ffmpeg_path: &state.config.streaming.ffmpeg_path,
+            input_url: &url,
+            start_secs: target,
+            transcode_audio: session.info().audio_transcoded,
+        },
+    )
+    .await?;
+
+    Ok(Json(SeekResponse { restarted: true }))
+}
+
+/// Sum of `#EXTINF` durations in the playlist; 0 when absent/unreadable.
+async fn playlist_seconds(playlist: &FsPath) -> f64 {
+    let Ok(text) = tokio::fs::read_to_string(playlist).await else {
+        return 0.0;
+    };
+    text.lines()
+        .filter_map(|line| line.strip_prefix("#EXTINF:"))
+        .filter_map(|rest| rest.split(',').next())
+        .filter_map(|value| value.trim().parse::<f64>().ok())
+        .sum()
+}
+
+/// Delete all files inside the session dir (playlist + segments), keeping
+/// the directory itself.
+async fn wipe_dir(dir: &FsPath) -> AppResult<()> {
+    let mut entries = tokio::fs::read_dir(dir)
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("reading session dir: {e}")))?;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if let Err(e) = tokio::fs::remove_file(entry.path()).await {
+            tracing::warn!(path = %entry.path().display(), error = %e, "failed to remove file");
+        }
+    }
+    Ok(())
+}
+
+pub fn router() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(create_session))
+        .routes(routes!(session_status, delete_session))
+        .routes(routes!(master_playlist))
+        .routes(routes!(media_playlist))
+        .routes(routes!(raw_media))
+        .routes(routes!(seek_session))
+        .routes(routes!(hls_segment))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn segment_names_are_strictly_validated() {
+        for good in ["init.mp4", "seg_00000.m4s", "seg_12345.m4s", "seg_1.m4s"] {
+            assert!(SEGMENT_NAME.is_match(good), "should accept {good}");
+        }
+        for bad in [
+            "../../etc/passwd",
+            "..%2F..%2Fetc%2Fpasswd",
+            "seg_.m4s",
+            "seg_00000.m4s.tmp",
+            "media.m3u8",
+            "init.mp4/..",
+            "seg_00000.mp4",
+            "SEG_00000.M4S",
+            "",
+            ".",
+            "..",
+        ] {
+            assert!(!SEGMENT_NAME.is_match(bad), "should reject {bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn playlist_seconds_sums_extinf() {
+        let dir = tempfile::tempdir().unwrap();
+        let playlist = dir.path().join("media.m3u8");
+        tokio::fs::write(
+            &playlist,
+            "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:6.000000,\nseg_00000.m4s\n#EXTINF:4.5,\nseg_00001.m4s\n",
+        )
+        .await
+        .unwrap();
+        assert!((playlist_seconds(&playlist).await - 10.5).abs() < 1e-9);
+        assert_eq!(playlist_seconds(&dir.path().join("missing")).await, 0.0);
+    }
+}

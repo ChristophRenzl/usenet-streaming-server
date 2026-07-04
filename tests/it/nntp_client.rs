@@ -303,3 +303,34 @@ async fn delayed_responses_hit_read_timeout() {
     }
     assert!(conn.is_poisoned(), "timed-out connection must be poisoned");
 }
+
+#[tokio::test]
+async fn cancelled_fetch_does_not_desync_the_pooled_connection() {
+    // Regression test: dropping an in-flight BODY future (e.g. a media
+    // client disconnecting or ffmpeg being killed mid-read) must not return
+    // a desynchronized connection to the idle list — the next command would
+    // otherwise read the *previous* command's response.
+    let server = MockNntp::start(None).await;
+    server.add_article("first@mock", b"payload-of-first-article\r\n".to_vec());
+    server.add_article("second@mock", b"payload-of-second-article\r\n".to_vec());
+
+    // One connection, so a dirty idle connection would definitely be reused.
+    let pool = NntpPool::with_options(vec![server.provider("p", 0, 1)], fast_options());
+
+    // Warm the connection cleanly first.
+    let body = pool.fetch_body("first@mock").await.expect("warm fetch");
+    assert_eq!(&body[..], b"payload-of-first-article\r\n");
+
+    // Cancel a fetch mid-command: the delayed response arrives after the
+    // future is dropped and would linger in the socket buffer.
+    server.set_delay(Some(Duration::from_millis(300)));
+    let cancelled =
+        tokio::time::timeout(Duration::from_millis(50), pool.fetch_body("first@mock")).await;
+    assert!(cancelled.is_err(), "fetch must still be in flight");
+    server.set_delay(None);
+
+    // The next fetch must return the *right* article, not first@mock's
+    // stale response.
+    let body = pool.fetch_body("second@mock").await.expect("clean fetch");
+    assert_eq!(&body[..], b"payload-of-second-article\r\n");
+}

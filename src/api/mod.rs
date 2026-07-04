@@ -1,7 +1,9 @@
 pub mod auth;
+pub mod internal;
 pub mod metadata;
 pub mod releases;
 pub mod settings;
+pub mod stream;
 pub mod system;
 
 use axum::{middleware, Router};
@@ -23,6 +25,7 @@ use crate::state::AppState;
         (name = "system", description = "Health and server info"),
         (name = "metadata", description = "TMDB search and details"),
         (name = "releases", description = "Indexer release search and ranking"),
+        (name = "streaming", description = "Playback sessions, HLS delivery and raw byte-range access"),
         (name = "settings", description = "Preferences, indexers, providers, app settings"),
     )
 )]
@@ -35,6 +38,7 @@ pub fn router(state: AppState) -> Router {
         .merge(system::router())
         .merge(metadata::router())
         .merge(releases::router())
+        .merge(stream::router())
         .merge(settings::router())
         .split_for_parts();
 
@@ -46,6 +50,12 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(SwaggerUi::new("/docs").url("/api-docs/openapi.json", api))
         .route("/health", axum::routing::get(system::health))
+        // Loopback-only virtual-file access for ffmpeg/ffprobe. Deliberately
+        // outside /api/v1 (its own token guard) and outside the OpenAPI doc.
+        .route(
+            "/internal/vfs/{session_id}",
+            axum::routing::get(internal::serve_vfs),
+        )
         .nest("/api/v1", api_router)
         .layer(TraceLayer::new_for_http())
         .with_state(state)

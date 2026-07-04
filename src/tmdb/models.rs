@@ -21,6 +21,16 @@ pub enum MediaType {
     Tv,
 }
 
+impl MediaType {
+    /// Stable lowercase name as stored in the database.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Movie => "movie",
+            Self::Tv => "tv",
+        }
+    }
+}
+
 // ---- Clean DTOs ------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
