@@ -100,7 +100,12 @@ pub async fn resolve_candidates(
 
     let raw = indexer::search_all(&state.http, indexers, &query).await;
     let prefs = db::preferences::get(&state.db).await?;
-    Ok(rank(raw, &prefs, max_resolution, original_language.as_deref()))
+    Ok(rank(
+        raw,
+        &prefs,
+        max_resolution,
+        original_language.as_deref(),
+    ))
 }
 
 /// Pick the candidates to actually try: the guid-pinned release when given,
