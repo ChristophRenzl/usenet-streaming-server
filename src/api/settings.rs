@@ -236,12 +236,21 @@ pub struct AppSettings {
     /// Masked TMDB API key (only the last 4 characters are shown), or `null`
     /// when not configured.
     pub tmdb_api_key: Option<String>,
+    /// Masked server API key currently in effect: the database override when
+    /// one is set, otherwise the bootstrap key from the config file.
+    pub api_key: String,
+    /// Whether a rotated API key (database override) is active. The bootstrap
+    /// config key stays valid alongside it as a recovery path.
+    pub api_key_override_active: bool,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct AppSettingsInput {
     /// New TMDB API key. Omit to leave unchanged; send `""` to clear.
     pub tmdb_api_key: Option<String>,
+    /// New server API key (at least 16 characters). Stored as an override;
+    /// the bootstrap key from the config file / environment remains valid.
+    pub api_key: Option<String>,
 }
 
 fn mask_secret(secret: &str) -> String {
@@ -255,11 +264,18 @@ fn mask_secret(secret: &str) -> String {
 }
 
 async fn current_app_settings(state: &AppState) -> AppResult<AppSettings> {
-    let key = db::settings::get(&state.db, db::settings::TMDB_API_KEY)
+    let tmdb_key = db::settings::get(&state.db, db::settings::TMDB_API_KEY)
         .await?
         .filter(|k| !k.is_empty());
+    let override_key = db::settings::get(&state.db, db::settings::API_KEY_OVERRIDE)
+        .await?
+        .filter(|k| !k.is_empty());
+    let api_key_override_active = override_key.is_some();
+    let active_key = override_key.unwrap_or_else(|| state.config.auth.api_key.clone());
     Ok(AppSettings {
-        tmdb_api_key: key.map(|k| mask_secret(&k)),
+        tmdb_api_key: tmdb_key.map(|k| mask_secret(&k)),
+        api_key: mask_secret(&active_key),
+        api_key_override_active,
     })
 }
 
@@ -270,14 +286,27 @@ pub async fn get_app_settings(State(state): State<AppState>) -> AppResult<Json<A
     Ok(Json(current_app_settings(&state).await?))
 }
 
-/// Update app-level settings.
+/// Update app-level settings. A new `api_key` (min. 16 characters) is stored
+/// as an override; the bootstrap config key stays valid for recovery.
 #[utoipa::path(put, path = "/settings/app", tag = "settings",
     request_body = AppSettingsInput,
-    responses((status = 200, body = AppSettings)))]
+    responses(
+        (status = 200, body = AppSettings),
+        (status = 400, description = "api_key shorter than 16 characters"),
+    ))]
 pub async fn put_app_settings(
     State(state): State<AppState>,
     Json(input): Json<AppSettingsInput>,
 ) -> AppResult<Json<AppSettings>> {
+    if let Some(key) = &input.api_key {
+        let key = key.trim();
+        if key.chars().count() < 16 {
+            return Err(AppError::BadRequest(
+                "api_key must be at least 16 characters".into(),
+            ));
+        }
+        db::settings::set(&state.db, db::settings::API_KEY_OVERRIDE, key).await?;
+    }
     if let Some(key) = input.tmdb_api_key {
         db::settings::set(&state.db, db::settings::TMDB_API_KEY, key.trim()).await?;
     }

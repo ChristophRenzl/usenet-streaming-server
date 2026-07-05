@@ -2,8 +2,8 @@
 
 Self-hosted backend that lets a client search movies/TV via TMDB and stream the
 content **on-the-fly directly from Usenet** — no full download required — with
-optional server-side downloads. Backend only: the JSON API is designed for
-future tvOS and web clients.
+optional server-side downloads. The JSON API is designed for tvOS and web
+clients; a built-in web admin UI at `/` handles all configuration.
 
 ## How it works
 
@@ -26,7 +26,14 @@ cp config.example.toml config/config.toml   # set auth.api_key!
 docker compose -f docker-compose.example.yml up -d
 ```
 
-Then open Swagger UI at `http://localhost:8080/docs` and configure via the API:
+Then open the **web admin UI at `http://localhost:8080/`**, sign in with your
+API key and configure everything in the browser: Usenet providers, indexers,
+the TMDB key, quality preferences, downloads and API-key rotation — no curl
+required.
+
+Prefer the command line? Swagger UI lives at `http://localhost:8080/docs`
+(click **Authorize** and paste the API key to use "Try it out"), or configure
+via the API directly:
 
 ```sh
 # NNTP provider
@@ -70,11 +77,25 @@ cp config.example.toml config.toml   # set auth.api_key
 
 Run tests with `cargo test`.
 
+## Web admin UI
+
+The server ships a built-in admin panel at `/` (no extra container, works
+offline on your LAN). It covers first-time setup (a dashboard checklist shows
+what is still missing) and all operational settings:
+
+- **Usenet Providers** — add/edit/test/delete NNTP servers
+- **Indexers** — add/edit/test/delete Newznab indexers
+- **TMDB** — set the metadata API key
+- **Preferences** — resolutions, codecs, language, size limit, blocked terms
+- **Downloads** — watch progress, cancel or delete jobs
+- **Security** — rotate the server API key
+
 ## API overview
 
 Full interactive documentation: Swagger UI at `/docs`
 (OpenAPI JSON at `/api-docs/openapi.json`). All endpoints are under `/api/v1`
-and require the `X-Api-Key` header (or `?apikey=` for media URLs).
+and require the `X-Api-Key` header (or `?apikey=` for media URLs); in Swagger
+UI, click **Authorize** to set the key for "Try it out".
 
 | Area | Endpoints |
 |---|---|
@@ -92,7 +113,28 @@ and require the `X-Api-Key` header (or `?apikey=` for media URLs).
 Bootstrap settings (port, API key, paths, cache size) live in
 [config.example.toml](config.example.toml) or `APP_*` environment variables.
 Everything operational — NNTP providers, indexers, TMDB key, release
-preferences — is managed through the API and stored in SQLite.
+preferences — is managed through the web UI / API and stored in SQLite.
+
+## Security
+
+A single API key (`auth.api_key` in the config file, or `APP_AUTH__API_KEY`)
+protects the whole `/api/v1` surface. Only `/health`, the web admin UI at `/`
+and the Swagger docs are unauthenticated — the UI asks for the key before it
+can do anything.
+
+The key can be **rotated from the browser** (Security page) or via
+`PUT /api/v1/settings/app` with `{"api_key": "..."}` (minimum 16 characters).
+The rotated key is stored in the database; from then on **two keys are valid
+at the same time**:
+
+1. the rotated key — hand this one to your clients (Apple TV app, …)
+2. the bootstrap key from the config file / environment — kept valid on
+   purpose as a recovery path: if you lose the rotated key, sign in with the
+   config key (visible in your Docker/NAS environment settings) and rotate
+   again.
+
+`GET /api/v1/settings/app` reports the active key masked (last 4 characters)
+plus whether a rotated key is in effect.
 
 ## MVP limitations
 
@@ -102,7 +144,8 @@ preferences — is managed through the API and stored in SQLite.
   segment missing mid-stream aborts with an error.
 - Remux only — no video transcoding. Audio is transcoded to AAC when needed
   (e.g. DTS); video is always stream-copied.
-- Single user, single API key (data model is multi-user-ready).
+- Single user, single API key (plus the recovery key described under
+  Security; the data model is multi-user-ready).
 - No automation (monitoring, auto-grab, renaming) — on-demand only.
 
 ## License

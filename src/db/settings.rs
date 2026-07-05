@@ -7,6 +7,11 @@ use crate::error::AppResult;
 /// Key under which the TMDB API key is stored.
 pub const TMDB_API_KEY: &str = "tmdb_api_key";
 
+/// Key under which a rotated server API key is stored. When set, requests may
+/// authenticate with either this value or the bootstrap key from the config
+/// file / environment (the latter stays valid as a recovery path).
+pub const API_KEY_OVERRIDE: &str = "api_key_override";
+
 pub async fn get(pool: &SqlitePool, key: &str) -> AppResult<Option<String>> {
     let value: Option<(String,)> = sqlx::query_as("SELECT value FROM app_settings WHERE key = ?")
         .bind(key)

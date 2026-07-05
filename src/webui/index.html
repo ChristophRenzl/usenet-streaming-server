@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Usenet Streaming Server — Admin</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%237b61ff'/%3E%3Cpath d='M10 22V10l12 6z' fill='%2307080e'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+
+<!-- Login screen -->
+<div id="login" class="login hidden">
+  <form id="login-form" class="card login-card">
+    <div class="login-logo" aria-hidden="true">
+      <svg viewBox="0 0 32 32" width="44" height="44"><rect width="32" height="32" rx="8" fill="#7b61ff"/><path d="M10 22V10l12 6z" fill="#07080e"/></svg>
+    </div>
+    <h1>Usenet Streaming Server</h1>
+    <p class="muted">Enter the server API key to open the admin panel.<br>
+       It is the <code>auth.api_key</code> value from your <code>config.toml</code>
+       (or the <code>APP_AUTH__API_KEY</code> environment variable).</p>
+    <label for="login-key">API key</label>
+    <input id="login-key" type="password" autocomplete="current-password"
+           placeholder="Paste your API key" required>
+    <div id="login-error" class="form-error hidden"></div>
+    <button type="submit" class="btn primary" id="login-submit">Sign in</button>
+  </form>
+</div>
+
+<!-- Main app -->
+<div id="app" class="app hidden">
+  <aside class="sidebar">
+    <div class="brand">
+      <svg viewBox="0 0 32 32" width="28" height="28" aria-hidden="true"><rect width="32" height="32" rx="8" fill="#7b61ff"/><path d="M10 22V10l12 6z" fill="#07080e"/></svg>
+      <div>
+        <div class="brand-name">Usenet Streamer</div>
+        <div class="brand-sub" id="brand-version"></div>
+      </div>
+    </div>
+    <nav id="nav">
+      <a href="#/dashboard" data-page="dashboard"><span class="nav-ico">◈</span>Dashboard</a>
+      <a href="#/providers" data-page="providers"><span class="nav-ico">☷</span>Usenet Providers</a>
+      <a href="#/indexers" data-page="indexers"><span class="nav-ico">⌕</span>Indexers</a>
+      <a href="#/tmdb" data-page="tmdb"><span class="nav-ico">✦</span>TMDB</a>
+      <a href="#/preferences" data-page="preferences"><span class="nav-ico">✎</span>Preferences</a>
+      <a href="#/downloads" data-page="downloads"><span class="nav-ico">⇣</span>Downloads</a>
+      <a href="#/security" data-page="security"><span class="nav-ico">⚿</span>Security</a>
+    </nav>
+    <div class="sidebar-footer">
+      <a href="/docs" target="_blank" rel="noopener" class="docs-link">API docs ↗</a>
+      <button id="signout" class="btn ghost small">Sign out</button>
+    </div>
+  </aside>
+  <main id="main"></main>
+</div>
+
+<div id="modal-root"></div>
+<div id="toasts" aria-live="polite"></div>
+
+<script src="/assets/app.js"></script>
+</body>
+</html>

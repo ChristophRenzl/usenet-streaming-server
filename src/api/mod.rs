@@ -8,14 +8,40 @@ pub mod settings;
 pub mod stream;
 pub mod system;
 pub mod watchlist;
+pub mod webui;
 
 use axum::{middleware, Router};
 use tower_http::trace::TraceLayer;
-use utoipa::OpenApi;
+use utoipa::{
+    openapi::security::{ApiKey, ApiKeyValue, SecurityRequirement, SecurityScheme},
+    Modify, OpenApi,
+};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::state::AppState;
+
+/// Registers the `X-Api-Key` header scheme and requires it globally so the
+/// Swagger UI "Authorize" button unlocks "Try it out" for every endpoint.
+struct SecurityAddon;
+
+impl Modify for SecurityAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        let components = openapi.components.get_or_insert_with(Default::default);
+        components.add_security_scheme(
+            "api_key",
+            SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::with_description(
+                "X-Api-Key",
+                "Server API key: the bootstrap key from config.toml / APP_AUTH__API_KEY, \
+                 or the rotated key set via PUT /settings/app.",
+            ))),
+        );
+        openapi.security = Some(vec![SecurityRequirement::new(
+            "api_key",
+            Vec::<String>::new(),
+        )]);
+    }
+}
 
 #[derive(OpenApi)]
 #[openapi(
@@ -24,6 +50,7 @@ use crate::state::AppState;
         description = "Search movies/TV via TMDB and stream them on-the-fly from Usenet.",
         license(name = "MIT")
     ),
+    modifiers(&SecurityAddon),
     tags(
         (name = "system", description = "Health and server info"),
         (name = "metadata", description = "TMDB search, discovery lists and details"),
@@ -57,6 +84,9 @@ pub fn router(state: AppState) -> Router {
     ));
 
     Router::new()
+        // Embedded admin UI at the root; unauthenticated static files (the
+        // UI collects the API key itself and sends it on every request).
+        .merge(webui::router())
         .merge(SwaggerUi::new("/docs").url("/api-docs/openapi.json", api))
         .route("/health", axum::routing::get(system::health))
         // Loopback-only virtual-file access for ffmpeg/ffprobe. Deliberately

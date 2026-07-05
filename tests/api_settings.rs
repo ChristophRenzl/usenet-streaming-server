@@ -190,6 +190,86 @@ async fn providers_crud() {
 }
 
 #[tokio::test]
+async fn api_key_rotation_keeps_both_keys_valid() {
+    let server = server().await;
+
+    // No override yet: the masked config key is reported.
+    let response = server
+        .get("/api/v1/settings/app")
+        .add_header("x-api-key", API_KEY)
+        .await;
+    let settings: Value = response.json();
+    assert_eq!(settings["api_key_override_active"], json!(false));
+    assert_eq!(settings["api_key"], json!("****-key"));
+
+    // Rotate the key.
+    let new_key = "rotated-key-0123456789";
+    let response = server
+        .put("/api/v1/settings/app")
+        .add_header("x-api-key", API_KEY)
+        .json(&json!({ "api_key": new_key }))
+        .await;
+    assert_eq!(response.status_code(), 200);
+    let settings: Value = response.json();
+    assert_eq!(settings["api_key_override_active"], json!(true));
+    assert_eq!(settings["api_key"], json!("****6789"));
+    assert!(
+        !response.text().contains(new_key),
+        "full rotated key must never be echoed back"
+    );
+
+    // Both the bootstrap config key and the rotated key authenticate.
+    let response = server
+        .get("/api/v1/settings/preferences")
+        .add_header("x-api-key", API_KEY)
+        .await;
+    assert_eq!(response.status_code(), 200, "config key stays valid");
+    let response = server
+        .get("/api/v1/settings/preferences")
+        .add_header("x-api-key", new_key)
+        .await;
+    assert_eq!(response.status_code(), 200, "rotated key is accepted");
+
+    // The rotated key also works via the ?apikey= query parameter.
+    let response = server
+        .get(&format!("/api/v1/settings/preferences?apikey={new_key}"))
+        .await;
+    assert_eq!(response.status_code(), 200);
+
+    // Wrong keys are still rejected.
+    let response = server
+        .get("/api/v1/settings/preferences")
+        .add_header("x-api-key", "wrong-key-0123456789")
+        .await;
+    assert_eq!(response.status_code(), 401);
+}
+
+#[tokio::test]
+async fn api_key_rotation_rejects_short_keys() {
+    let server = server().await;
+
+    let response = server
+        .put("/api/v1/settings/app")
+        .add_header("x-api-key", API_KEY)
+        .json(&json!({ "api_key": "too-short" }))
+        .await;
+    assert_eq!(response.status_code(), 400);
+
+    // Nothing was stored: no override active, only the config key works.
+    let response = server
+        .get("/api/v1/settings/app")
+        .add_header("x-api-key", API_KEY)
+        .await;
+    let settings: Value = response.json();
+    assert_eq!(settings["api_key_override_active"], json!(false));
+    let response = server
+        .get("/api/v1/settings/preferences")
+        .add_header("x-api-key", "too-short")
+        .await;
+    assert_eq!(response.status_code(), 401);
+}
+
+#[tokio::test]
 async fn app_settings_mask_the_tmdb_key() {
     let server = server().await;
 
