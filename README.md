@@ -79,7 +79,9 @@ and require the `X-Api-Key` header (or `?apikey=` for media URLs).
 | Area | Endpoints |
 |---|---|
 | Search | `GET /search`, `GET /movies/{id}`, `GET /tv/{id}[/season/{n}[/episode/{e}]]` |
-| Releases | `GET /releases?tmdb_id=…` — ranked candidates for manual override |
+| Discovery | `GET /trending?media_type=all\|movie\|tv&window=day\|week`, `GET /movies/popular`, `GET /movies/top_rated`, `GET /tv/popular`, `GET /tv/top_rated` (all take `?page=`) |
+| Watchlist | `GET/POST /watchlist`, `GET /watchlist/status?tmdb_id=…&media_type=…`, `DELETE /watchlist/{tmdb_id}?media_type=…` |
+| Releases | `GET /releases?tmdb_id=…[&max_resolution=…]` — ranked candidates for manual override; `max_resolution` caps quality to what the device supports (also accepted in `POST /stream/sessions` and `POST /downloads` bodies) |
 | Streaming | `POST /stream/sessions`, `GET /stream/{id}/master.m3u8`, `GET /stream/{id}/raw` (byte ranges), `DELETE /stream/{id}` |
 | Downloads | `POST /downloads`, `GET /downloads[/{id}]`, `DELETE /downloads/{id}` |
 | History | `GET/POST /history`, `DELETE /history/{id}` |

@@ -13,7 +13,10 @@ use crate::{
     db,
     error::{AppError, AppResult},
     indexer::{self, SearchQuery},
-    release::rank::{rank, RankedRelease},
+    release::{
+        parse::Resolution,
+        rank::{rank, RankedRelease},
+    },
     state::AppState,
     tmdb::models::MediaType,
 };
@@ -42,11 +45,16 @@ impl ReleaseTarget {
 }
 
 /// Full resolution pipeline: TMDB details → indexer fan-out → parse + rank
-/// against the stored preferences. Used by `GET /releases` and by
-/// `POST /stream/sessions`.
+/// against the stored preferences. Used by `GET /releases`,
+/// `POST /stream/sessions` and `POST /downloads`.
+///
+/// `max_resolution` is the optional per-request device capability cap: the
+/// lower of it and the stored preference max wins (see
+/// [`crate::release::rank::rank`]).
 pub async fn resolve_candidates(
     state: &AppState,
     target: &ReleaseTarget,
+    max_resolution: Option<Resolution>,
 ) -> AppResult<Vec<RankedRelease>> {
     let indexers = db::indexers::list_enabled(&state.db).await?;
     if indexers.is_empty() {
@@ -90,7 +98,7 @@ pub async fn resolve_candidates(
 
     let raw = indexer::search_all(&state.http, indexers, &query).await;
     let prefs = db::preferences::get(&state.db).await?;
-    Ok(rank(raw, &prefs))
+    Ok(rank(raw, &prefs, max_resolution))
 }
 
 /// Pick the candidates to actually try: the guid-pinned release when given,
@@ -136,6 +144,10 @@ pub struct ReleasesParams {
     pub season: Option<u32>,
     /// Episode number (required for `tv`).
     pub episode: Option<u32>,
+    /// Device capability cap (`480p`, `720p`, `1080p`, `2160p`): releases
+    /// above the lower of this and the stored preference max are rejected,
+    /// and the best supported resolution ranks first.
+    pub max_resolution: Option<Resolution>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -163,7 +175,7 @@ pub async fn find_releases(
         episode: params.episode,
     }
     .validated()?;
-    let candidates = resolve_candidates(&state, &target).await?;
+    let candidates = resolve_candidates(&state, &target, params.max_resolution).await?;
     Ok(Json(ReleasesResponse { candidates }))
 }
 

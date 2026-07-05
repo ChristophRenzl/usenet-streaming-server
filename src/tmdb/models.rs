@@ -108,8 +108,16 @@ pub struct Episode {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct RawSearchResponse {
+    #[serde(default = "default_page")]
+    pub page: i64,
+    #[serde(default = "default_page")]
+    pub total_pages: i64,
     #[serde(default)]
     pub results: Vec<RawSearchItem>,
+}
+
+fn default_page() -> i64 {
+    1
 }
 
 #[derive(Debug, Deserialize)]

@@ -1,4 +1,5 @@
-//! TMDB-backed metadata endpoints: search, movie/TV/season/episode details.
+//! TMDB-backed metadata endpoints: search, discovery lists (trending,
+//! popular, top rated) and movie/TV/season/episode details.
 
 use axum::{
     extract::{Path, Query, State},
@@ -13,7 +14,7 @@ use crate::{
     error::{AppError, AppResult},
     state::AppState,
     tmdb::{
-        client::SearchType,
+        client::{ListKind, PagedSearchResults, SearchType, TrendingType, TrendingWindow},
         models::{Episode, Movie, SearchResult, Season, TvShow},
         TmdbClient,
     },
@@ -74,6 +75,147 @@ pub async fn search(
         .await?;
     Ok(Json(SearchResponse { results }))
 }
+
+// ---- Discovery lists --------------------------------------------------------
+
+/// One page of a discovery list (trending / popular / top rated).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DiscoverResponse {
+    pub results: Vec<SearchResult>,
+    /// 1-based page this response covers.
+    pub page: i64,
+    pub total_pages: i64,
+}
+
+impl From<PagedSearchResults> for DiscoverResponse {
+    fn from(paged: PagedSearchResults) -> Self {
+        Self {
+            results: paged.results,
+            page: paged.page,
+            total_pages: paged.total_pages,
+        }
+    }
+}
+
+/// Reject `page=0` early; TMDB pages are 1-based.
+fn validated_page(page: Option<u32>) -> AppResult<Option<u32>> {
+    match page {
+        Some(0) => Err(AppError::BadRequest("page must be >= 1".into())),
+        other => Ok(other),
+    }
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct TrendingParams {
+    /// Scope: `all` (default), `movie` or `tv`.
+    #[serde(default)]
+    pub media_type: TrendingType,
+    /// Time window: `day` or `week` (default).
+    #[serde(default)]
+    pub window: TrendingWindow,
+    /// 1-based page (defaults to 1).
+    pub page: Option<u32>,
+}
+
+/// Trending movies and TV shows (person results are dropped).
+#[utoipa::path(get, path = "/trending", tag = "metadata",
+    params(TrendingParams),
+    responses(
+        (status = 200, body = DiscoverResponse),
+        (status = 400, description = "Bad page or TMDB API key not configured"),
+        (status = 502, description = "TMDB upstream error"),
+    ))]
+pub async fn trending(
+    State(state): State<AppState>,
+    Query(params): Query<TrendingParams>,
+) -> AppResult<Json<DiscoverResponse>> {
+    let page = validated_page(params.page)?;
+    let client = tmdb_client(&state).await?;
+    let paged = client
+        .trending(params.media_type, params.window, page)
+        .await?;
+    Ok(Json(paged.into()))
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct PageParams {
+    /// 1-based page (defaults to 1).
+    pub page: Option<u32>,
+}
+
+/// Popular movies.
+#[utoipa::path(get, path = "/movies/popular", tag = "metadata",
+    params(PageParams),
+    responses(
+        (status = 200, body = DiscoverResponse),
+        (status = 400, description = "Bad page or TMDB API key not configured"),
+        (status = 502, description = "TMDB upstream error"),
+    ))]
+pub async fn popular_movies(
+    State(state): State<AppState>,
+    Query(params): Query<PageParams>,
+) -> AppResult<Json<DiscoverResponse>> {
+    let page = validated_page(params.page)?;
+    let client = tmdb_client(&state).await?;
+    Ok(Json(
+        client.movie_list(ListKind::Popular, page).await?.into(),
+    ))
+}
+
+/// Top-rated movies.
+#[utoipa::path(get, path = "/movies/top_rated", tag = "metadata",
+    params(PageParams),
+    responses(
+        (status = 200, body = DiscoverResponse),
+        (status = 400, description = "Bad page or TMDB API key not configured"),
+        (status = 502, description = "TMDB upstream error"),
+    ))]
+pub async fn top_rated_movies(
+    State(state): State<AppState>,
+    Query(params): Query<PageParams>,
+) -> AppResult<Json<DiscoverResponse>> {
+    let page = validated_page(params.page)?;
+    let client = tmdb_client(&state).await?;
+    Ok(Json(
+        client.movie_list(ListKind::TopRated, page).await?.into(),
+    ))
+}
+
+/// Popular TV shows.
+#[utoipa::path(get, path = "/tv/popular", tag = "metadata",
+    params(PageParams),
+    responses(
+        (status = 200, body = DiscoverResponse),
+        (status = 400, description = "Bad page or TMDB API key not configured"),
+        (status = 502, description = "TMDB upstream error"),
+    ))]
+pub async fn popular_tv(
+    State(state): State<AppState>,
+    Query(params): Query<PageParams>,
+) -> AppResult<Json<DiscoverResponse>> {
+    let page = validated_page(params.page)?;
+    let client = tmdb_client(&state).await?;
+    Ok(Json(client.tv_list(ListKind::Popular, page).await?.into()))
+}
+
+/// Top-rated TV shows.
+#[utoipa::path(get, path = "/tv/top_rated", tag = "metadata",
+    params(PageParams),
+    responses(
+        (status = 200, body = DiscoverResponse),
+        (status = 400, description = "Bad page or TMDB API key not configured"),
+        (status = 502, description = "TMDB upstream error"),
+    ))]
+pub async fn top_rated_tv(
+    State(state): State<AppState>,
+    Query(params): Query<PageParams>,
+) -> AppResult<Json<DiscoverResponse>> {
+    let page = validated_page(params.page)?;
+    let client = tmdb_client(&state).await?;
+    Ok(Json(client.tv_list(ListKind::TopRated, page).await?.into()))
+}
+
+// ---- Details ----------------------------------------------------------------
 
 /// Movie details (includes IMDb id).
 #[utoipa::path(get, path = "/movies/{tmdb_id}", tag = "metadata",
@@ -145,8 +287,15 @@ pub async fn episode_details(
 }
 
 pub fn router() -> OpenApiRouter<AppState> {
+    // Static segments (`/movies/popular`) win over captures
+    // (`/movies/{tmdb_id}`) in axum 0.8, so both can coexist.
     OpenApiRouter::new()
         .routes(routes!(search))
+        .routes(routes!(trending))
+        .routes(routes!(popular_movies))
+        .routes(routes!(top_rated_movies))
+        .routes(routes!(popular_tv))
+        .routes(routes!(top_rated_tv))
         .routes(routes!(movie_details))
         .routes(routes!(tv_details))
         .routes(routes!(season_details))

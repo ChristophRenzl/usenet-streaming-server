@@ -13,6 +13,7 @@ use crate::{
     db::{self, downloads::Download},
     download::DownloadJob,
     error::{AppError, AppResult},
+    release::parse::Resolution,
     state::AppState,
     tmdb::models::MediaType,
 };
@@ -33,6 +34,10 @@ pub struct CreateDownloadRequest {
     /// Pin a specific release by its indexer guid instead of automatic
     /// candidate selection.
     pub release_guid: Option<String>,
+    /// Device capability cap (`480p`, `720p`, `1080p`, `2160p`): releases
+    /// above the lower of this and the stored preference max are rejected,
+    /// and the best supported resolution ranks first.
+    pub max_resolution: Option<Resolution>,
 }
 
 /// A download row plus the computed completion percentage.
@@ -80,7 +85,7 @@ pub async fn create_download(
     }
     .validated()?;
 
-    let candidates = resolve_candidates(&state, &target).await?;
+    let candidates = resolve_candidates(&state, &target, request.max_resolution).await?;
     let to_try = pick_candidates(&candidates, request.release_guid.as_deref(), MAX_ATTEMPTS)?;
 
     let mut failures: Vec<String> = Vec::new();

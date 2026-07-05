@@ -26,6 +26,59 @@ pub enum SearchType {
     Multi,
 }
 
+/// Media-type scope for [`TmdbClient::trending`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum TrendingType {
+    #[default]
+    All,
+    Movie,
+    Tv,
+}
+
+/// Time window for [`TmdbClient::trending`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum TrendingWindow {
+    Day,
+    #[default]
+    Week,
+}
+
+impl TrendingWindow {
+    fn as_path(self) -> &'static str {
+        match self {
+            Self::Day => "day",
+            Self::Week => "week",
+        }
+    }
+}
+
+/// Curated TMDB list flavor for [`TmdbClient::movie_list`] / [`TmdbClient::tv_list`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListKind {
+    Popular,
+    TopRated,
+}
+
+impl ListKind {
+    fn as_path(self) -> &'static str {
+        match self {
+            Self::Popular => "popular",
+            Self::TopRated => "top_rated",
+        }
+    }
+}
+
+/// One page of a TMDB result list (trending / popular / top rated).
+#[derive(Debug, Clone)]
+pub struct PagedSearchResults {
+    pub results: Vec<SearchResult>,
+    /// 1-based page this response covers.
+    pub page: i64,
+    pub total_pages: i64,
+}
+
 pub struct TmdbClient {
     http: reqwest::Client,
     base_url: String,
@@ -102,6 +155,79 @@ impl TmdbClient {
             .into_iter()
             .filter_map(|item| item.into_result(forced))
             .collect())
+    }
+
+    /// One page of a TMDB list endpoint mapped to [`SearchResult`]s. `forced`
+    /// stamps the media type onto endpoints that omit `media_type` in their
+    /// payload; items that are neither movie nor TV (people) are dropped.
+    async fn paged_list(
+        &self,
+        path: &str,
+        forced: Option<MediaType>,
+        page: Option<u32>,
+    ) -> AppResult<PagedSearchResults> {
+        let mut params = Vec::new();
+        if let Some(page) = page {
+            params.push(("page", page.to_string()));
+        }
+        let raw: RawSearchResponse = self.get_json(path, &params).await?;
+        Ok(PagedSearchResults {
+            page: raw.page,
+            total_pages: raw.total_pages,
+            results: raw
+                .results
+                .into_iter()
+                .filter_map(|item| item.into_result(forced))
+                .collect(),
+        })
+    }
+
+    /// Trending movies/TV: `/trending/{all|movie|tv}/{day|week}`.
+    pub async fn trending(
+        &self,
+        scope: TrendingType,
+        window: TrendingWindow,
+        page: Option<u32>,
+    ) -> AppResult<PagedSearchResults> {
+        let (segment, forced) = match scope {
+            TrendingType::All => ("all", None),
+            TrendingType::Movie => ("movie", Some(MediaType::Movie)),
+            TrendingType::Tv => ("tv", Some(MediaType::Tv)),
+        };
+        self.paged_list(
+            &format!("/trending/{segment}/{}", window.as_path()),
+            forced,
+            page,
+        )
+        .await
+    }
+
+    /// Curated movie list: `/movie/popular` or `/movie/top_rated`.
+    pub async fn movie_list(
+        &self,
+        kind: ListKind,
+        page: Option<u32>,
+    ) -> AppResult<PagedSearchResults> {
+        self.paged_list(
+            &format!("/movie/{}", kind.as_path()),
+            Some(MediaType::Movie),
+            page,
+        )
+        .await
+    }
+
+    /// Curated TV list: `/tv/popular` or `/tv/top_rated`.
+    pub async fn tv_list(
+        &self,
+        kind: ListKind,
+        page: Option<u32>,
+    ) -> AppResult<PagedSearchResults> {
+        self.paged_list(
+            &format!("/tv/{}", kind.as_path()),
+            Some(MediaType::Tv),
+            page,
+        )
+        .await
     }
 
     /// Movie details including the IMDb id (via `append_to_response=external_ids`).

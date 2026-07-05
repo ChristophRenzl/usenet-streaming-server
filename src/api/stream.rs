@@ -20,7 +20,10 @@ use crate::{
     error::{AppError, AppResult},
     indexer::{client::NewznabClient, RawRelease},
     nzb::{health_check, main_content_segments, parse_nzb, select_main, MainContent, Nzb},
-    release::{parse::parse_release_name, rank::RankedRelease},
+    release::{
+        parse::{parse_release_name, Resolution},
+        rank::RankedRelease,
+    },
     state::AppState,
     stream::{
         ffmpeg::{self, SpawnOptions},
@@ -64,6 +67,10 @@ pub struct CreateSessionRequest {
     /// Skip the completed-download shortcut and always stream from Usenet.
     #[serde(default)]
     pub force_nntp: bool,
+    /// Device capability cap (`480p`, `720p`, `1080p`, `2160p`): releases
+    /// above the lower of this and the stored preference max are rejected,
+    /// and the best supported resolution ranks first.
+    pub max_resolution: Option<Resolution>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -145,7 +152,7 @@ pub async fn create_session(
         }
     }
 
-    let candidates = resolve_candidates(&state, &target).await?;
+    let candidates = resolve_candidates(&state, &target, request.max_resolution).await?;
     let to_try = pick_candidates(&candidates, request.release_guid.as_deref(), MAX_ATTEMPTS)?;
 
     let mut failures: Vec<String> = Vec::new();

@@ -7,6 +7,7 @@ pub mod releases;
 pub mod settings;
 pub mod stream;
 pub mod system;
+pub mod watchlist;
 
 use axum::{middleware, Router};
 use tower_http::trace::TraceLayer;
@@ -25,7 +26,8 @@ use crate::state::AppState;
     ),
     tags(
         (name = "system", description = "Health and server info"),
-        (name = "metadata", description = "TMDB search and details"),
+        (name = "metadata", description = "TMDB search, discovery lists and details"),
+        (name = "watchlist", description = "Saved movies/TV shows for later viewing"),
         (name = "releases", description = "Indexer release search and ranking"),
         (name = "streaming", description = "Playback sessions, HLS delivery and raw byte-range access"),
         (name = "downloads", description = "Server-side download jobs and disk playback"),
@@ -41,6 +43,7 @@ pub fn router(state: AppState) -> Router {
     let (api_router, api) = OpenApiRouter::with_openapi(ApiDoc::openapi())
         .merge(system::router())
         .merge(metadata::router())
+        .merge(watchlist::router())
         .merge(releases::router())
         .merge(stream::router())
         .merge(downloads::router())

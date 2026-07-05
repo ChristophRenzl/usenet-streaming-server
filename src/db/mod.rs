@@ -38,3 +38,4 @@ pub mod preferences;
 pub mod providers;
 pub mod settings;
 pub mod watch_history;
+pub mod watchlist;

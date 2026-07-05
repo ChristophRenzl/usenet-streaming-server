@@ -266,6 +266,35 @@ async fn season_details_map_episodes() {
 }
 
 #[tokio::test]
+async fn trending_defaults_page_fields_when_missing() {
+    use usenet_streaming_server::tmdb::client::{TrendingType, TrendingWindow};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/trending/tv/day"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "results": [{
+                "id": 1396,
+                "name": "Breaking Bad",
+                "media_type": "tv",
+                "first_air_date": "2008-01-20"
+            }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let paged = client(&server)
+        .trending(TrendingType::Tv, TrendingWindow::Day, None)
+        .await
+        .expect("trending must succeed");
+    assert_eq!(paged.page, 1, "missing page defaults to 1");
+    assert_eq!(paged.total_pages, 1, "missing total_pages defaults to 1");
+    assert_eq!(paged.results.len(), 1);
+    assert_eq!(paged.results[0].media_type, MediaType::Tv);
+}
+
+#[tokio::test]
 async fn tmdb_404_maps_to_not_found() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
