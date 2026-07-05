@@ -5,7 +5,7 @@
 use std::path::Path as FsPath;
 use std::sync::{Arc, LazyLock};
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -536,6 +536,65 @@ pub async fn delete_session(
 
 // ---- HLS playlists and segments ----------------------------------------------
 
+/// `?apikey=` propagation. Header-less players (AVPlayer) authenticate via
+/// the query parameter, but they resolve child playlist/segment URIs
+/// relative to the parent URL — which drops the query string (RFC 3986).
+/// Since every /api/v1 route requires the key, the playlists must re-embed
+/// the presented key into every URI they reference, or each follow-up
+/// request 401s and playback is a black screen.
+#[derive(Debug, Deserialize)]
+pub struct ApiKeyParam {
+    apikey: Option<String>,
+}
+
+impl ApiKeyParam {
+    /// `?apikey=<encoded>` when the request authenticated by query, else "".
+    /// Header-authenticated clients keep sending the header themselves.
+    fn uri_suffix(&self) -> String {
+        match &self.apikey {
+            Some(key) => format!("?apikey={}", percent_encode_component(key)),
+            None => String::new(),
+        }
+    }
+}
+
+/// RFC 3986 percent-encoding of a query component (unreserved kept as-is).
+fn percent_encode_component(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+static MAP_URI: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"URI="([^"]*)""#).unwrap());
+
+/// Append `suffix` to every URI in an HLS playlist: plain segment lines and
+/// `URI="..."` attributes (EXT-X-MAP).
+fn playlist_with_suffix(playlist: &str, suffix: &str) -> String {
+    if suffix.is_empty() {
+        return playlist.to_string();
+    }
+    let mut out = String::with_capacity(playlist.len() + 64);
+    for line in playlist.lines() {
+        if line.contains("URI=\"") {
+            out.push_str(&MAP_URI.replace_all(line, |caps: &regex::Captures| {
+                format!("URI=\"{}{}\"", &caps[1], suffix)
+            }));
+        } else if line.starts_with('#') || line.trim().is_empty() {
+            out.push_str(line);
+        } else {
+            out.push_str(line);
+            out.push_str(suffix);
+        }
+        out.push('\n');
+    }
+    out
+}
+
 /// HLS master playlist (single variant, points at `media.m3u8`).
 #[utoipa::path(get, path = "/stream/{session_id}/master.m3u8", tag = "streaming",
     params(("session_id" = Uuid, Path, description = "Session id")),
@@ -546,18 +605,18 @@ pub async fn delete_session(
 pub async fn master_playlist(
     State(state): State<AppState>,
     Path(session_id): Path<Uuid>,
+    Query(auth): Query<ApiKeyParam>,
 ) -> AppResult<Response> {
     let session = get_session(&state, &session_id)?;
     session.touch();
-    let master = "#EXTM3U\n\
-                  #EXT-X-VERSION:7\n\
-                  #EXT-X-STREAM-INF:BANDWIDTH=20000000\n\
-                  media.m3u8\n";
-    Ok((
-        [(header::CONTENT_TYPE, PLAYLIST_CONTENT_TYPE)],
-        master.to_string(),
-    )
-        .into_response())
+    let master = format!(
+        "#EXTM3U\n\
+         #EXT-X-VERSION:7\n\
+         #EXT-X-STREAM-INF:BANDWIDTH=20000000\n\
+         media.m3u8{}\n",
+        auth.uri_suffix()
+    );
+    Ok(([(header::CONTENT_TYPE, PLAYLIST_CONTENT_TYPE)], master).into_response())
 }
 
 /// HLS media playlist written by ffmpeg. While the session is still
@@ -572,11 +631,16 @@ pub async fn master_playlist(
 pub async fn media_playlist(
     State(state): State<AppState>,
     Path(session_id): Path<Uuid>,
+    Query(auth): Query<ApiKeyParam>,
 ) -> AppResult<Response> {
     let session = get_session(&state, &session_id)?;
     session.touch();
     match tokio::fs::read(session.playlist_path()).await {
-        Ok(bytes) => Ok(([(header::CONTENT_TYPE, PLAYLIST_CONTENT_TYPE)], bytes).into_response()),
+        Ok(bytes) => {
+            let playlist =
+                playlist_with_suffix(&String::from_utf8_lossy(&bytes), &auth.uri_suffix());
+            Ok(([(header::CONTENT_TYPE, PLAYLIST_CONTENT_TYPE)], playlist).into_response())
+        }
         Err(_) => match session.state() {
             SessionState::Starting => Ok((
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -794,6 +858,34 @@ mod tests {
         ] {
             assert!(!SEGMENT_NAME.is_match(bad), "should reject {bad}");
         }
+    }
+
+    #[test]
+    fn playlist_suffix_rewrites_all_uris() {
+        let playlist = "#EXTM3U\n\
+                        #EXT-X-VERSION:7\n\
+                        #EXT-X-MAP:URI=\"init.mp4\"\n\
+                        #EXTINF:6.000000,\n\
+                        seg_00000.m4s\n\
+                        #EXTINF:4.5,\n\
+                        seg_00001.m4s\n";
+        let out = playlist_with_suffix(playlist, "?apikey=se%2Fcret");
+        assert!(out.contains("#EXT-X-MAP:URI=\"init.mp4?apikey=se%2Fcret\""));
+        assert!(out.contains("\nseg_00000.m4s?apikey=se%2Fcret\n"));
+        assert!(out.contains("\nseg_00001.m4s?apikey=se%2Fcret\n"));
+        // comment/tag lines are untouched
+        assert!(out.contains("#EXTINF:6.000000,\n"));
+        // no suffix -> byte-identical playlist
+        assert_eq!(playlist_with_suffix(playlist, ""), playlist);
+    }
+
+    #[test]
+    fn apikey_suffix_is_percent_encoded() {
+        let auth = ApiKeyParam {
+            apikey: Some("k/e y+&=?".into()),
+        };
+        assert_eq!(auth.uri_suffix(), "?apikey=k%2Fe%20y%2B%26%3D%3F");
+        assert_eq!(ApiKeyParam { apikey: None }.uri_suffix(), "");
     }
 
     #[tokio::test]
