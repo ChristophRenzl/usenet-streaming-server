@@ -140,8 +140,12 @@ plus whether a rotated key is in effect.
 
 - Store-mode (uncompressed) RAR releases only; compressed archives are
   rejected for streaming with a clear error and the next candidate is tried.
-- No par2 repair: releases failing the segment health check are skipped; a
-  segment missing mid-stream aborts with an error.
+- par2 repair is a **download-only fallback**, not on-the-fly: a release too
+  damaged to stream but recoverable from its par2 recovery files is classified
+  `repairable`. Starting a session on such a release returns `202 repairing`
+  with a `download_id` — the server downloads everything, runs `par2 repair`,
+  and the finished file then plays from disk. A segment missing mid-stream
+  still aborts that stream with an error (streaming cannot repair live).
 - Remux only — no video transcoding. Audio is transcoded to AAC when needed
   (e.g. DTS); video is always stream-copied.
 - Single user, single API key (plus the recovery key described under

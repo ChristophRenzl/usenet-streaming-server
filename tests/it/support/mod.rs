@@ -212,6 +212,21 @@ pub fn add_yenc_file(
     part_size: usize,
     name: &str,
 ) -> Vec<(String, u64)> {
+    add_yenc_file_missing(server, prefix, payload, part_size, name, &[])
+}
+
+/// Like [`add_yenc_file`], but the 0-based part indices in `missing` are
+/// *not* registered on the server (they 430, as if the articles were lost).
+/// Their `(message_id, bytes)` still appear in the returned segment list, so
+/// the NZB references them — exactly the partially-available release scenario.
+pub fn add_yenc_file_missing(
+    server: &MockNntp,
+    prefix: &str,
+    payload: &[u8],
+    part_size: usize,
+    name: &str,
+    missing: &[usize],
+) -> Vec<(String, u64)> {
     let total = payload.len().div_ceil(part_size).max(1);
     let mut segments = Vec::with_capacity(total);
     for (i, chunk) in payload.chunks(part_size).enumerate() {
@@ -225,10 +240,95 @@ pub fn add_yenc_file(
         );
         let message_id = format!("{prefix}-{}@mock", i + 1);
         let bytes = article.len() as u64;
-        server.add_article(&message_id, article);
+        if !missing.contains(&i) {
+            server.add_article(&message_id, article);
+        }
         segments.push((message_id, bytes));
     }
     segments
+}
+
+/// True when a `par2` binary is on PATH (or PAR2 env var). Tests that need it
+/// skip with an eprintln when it is absent.
+pub fn par2_available() -> bool {
+    std::process::Command::new(par2_bin())
+        .arg("--help")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success() || status.code() == Some(1))
+        .unwrap_or(false)
+}
+
+/// The `par2` binary to use in tests: `$PAR2`, else the Homebrew path if it
+/// exists (macOS dev), else `par2` on PATH (CI).
+pub fn par2_bin() -> String {
+    if let Ok(p) = std::env::var("PAR2") {
+        return p;
+    }
+    if Path::new("/opt/homebrew/bin/par2").exists() {
+        return "/opt/homebrew/bin/par2".to_string();
+    }
+    "par2".to_string()
+}
+
+/// Generate par2 recovery files for `payload` and register both the payload
+/// and every par2 file as yEnc articles on the mock server, with the given
+/// payload part indices missing. Returns the NZB `(subject, segments)` file
+/// list (payload file first, then each par2 file).
+///
+/// `redundancy` is the par2 recovery percentage; it must comfortably exceed
+/// the fraction of `missing` parts for repair to succeed.
+pub fn add_repairable_release(
+    server: &MockNntp,
+    payload: &[u8],
+    part_size: usize,
+    media_name: &str,
+    missing: &[usize],
+    redundancy: u32,
+) -> Vec<(String, Vec<(String, u64)>)> {
+    let work = tempfile::tempdir().expect("par2 work dir");
+    let media_path = work.path().join(media_name);
+    std::fs::write(&media_path, payload).expect("write payload for par2");
+
+    // par2 create -r<redundancy> -n1 <base>.par2 <media>
+    let status = std::process::Command::new(par2_bin())
+        .arg("create")
+        .arg("-q")
+        .arg(format!("-r{redundancy}"))
+        .arg("-n1")
+        .arg(format!("{media_name}.par2"))
+        .arg(media_name)
+        .current_dir(work.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("run par2 create");
+    assert!(status.success(), "par2 create failed");
+
+    // File 1: the (damaged) media file.
+    let media_segments =
+        add_yenc_file_missing(server, "media", payload, part_size, media_name, missing);
+    let mut files = vec![(
+        format!(r#"Rel [1/1] - "{media_name}" yEnc"#),
+        media_segments,
+    )];
+
+    // Files 2..: every generated .par2 file, fully present (par2 articles are
+    // almost always available in the wild).
+    let mut par2_names: Vec<String> = std::fs::read_dir(work.path())
+        .expect("read par2 work dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.to_ascii_lowercase().ends_with(".par2"))
+        .collect();
+    par2_names.sort();
+    for (i, par2_name) in par2_names.iter().enumerate() {
+        let bytes = std::fs::read(work.path().join(par2_name)).expect("read par2 file");
+        let segments = add_yenc_file(server, &format!("par2-{i}"), &bytes, part_size, par2_name);
+        files.push((format!(r#"Rel [1/1] - "{par2_name}" yEnc"#), segments));
+    }
+    files
 }
 
 fn xml_escape(s: &str) -> String {

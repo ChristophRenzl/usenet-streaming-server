@@ -31,3 +31,7 @@ session_idle_timeout_secs = 120
 readahead_segments = 16
 ffmpeg_path = "ffmpeg"
 ffprobe_path = "ffprobe"
+# par2cmdline binary for the download-and-repair fallback on partially-
+# available releases. Installed in the Docker image; on bare-metal install
+# `par2` (e.g. apt-get install par2 / brew install par2cmdline).
+par2_path = "par2"

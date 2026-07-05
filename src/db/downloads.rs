@@ -21,6 +21,10 @@ pub struct Download {
     pub nzb_url: String,
     /// `pending`, `downloading`, `complete`, `failed` or `cancelled`.
     pub status: String,
+    /// Finer-grained step within a running job (`downloading`, `repairing`,
+    /// `extracting`, `complete`, `failed`); `None` for plain jobs and legacy
+    /// rows. Primarily set by the par2 download-and-repair fallback.
+    pub phase: Option<String>,
     pub progress_bytes: i64,
     pub total_bytes: Option<i64>,
     /// Absolute path of the finished file (set when `status == "complete"`).
@@ -65,7 +69,7 @@ pub async fn insert(pool: &SqlitePool, new: &NewDownload<'_>) -> AppResult<Downl
 pub async fn list(pool: &SqlitePool) -> AppResult<Vec<Download>> {
     Ok(sqlx::query_as(
         "SELECT id, tmdb_id, media_type, season, episode, release_title, nzb_url,
-                status, progress_bytes, total_bytes, file_path, error, created_at, updated_at
+                status, phase, progress_bytes, total_bytes, file_path, error, created_at, updated_at
          FROM downloads WHERE user_id = 1
          ORDER BY created_at DESC, rowid DESC",
     )
@@ -76,7 +80,7 @@ pub async fn list(pool: &SqlitePool) -> AppResult<Vec<Download>> {
 pub async fn get(pool: &SqlitePool, id: &str) -> AppResult<Option<Download>> {
     Ok(sqlx::query_as(
         "SELECT id, tmdb_id, media_type, season, episode, release_title, nzb_url,
-                status, progress_bytes, total_bytes, file_path, error, created_at, updated_at
+                status, phase, progress_bytes, total_bytes, file_path, error, created_at, updated_at
          FROM downloads WHERE user_id = 1 AND id = ?",
     )
     .bind(id)
@@ -95,7 +99,7 @@ pub async fn completed_for_item(
 ) -> AppResult<Vec<Download>> {
     Ok(sqlx::query_as(
         "SELECT id, tmdb_id, media_type, season, episode, release_title, nzb_url,
-                status, progress_bytes, total_bytes, file_path, error, created_at, updated_at
+                status, phase, progress_bytes, total_bytes, file_path, error, created_at, updated_at
          FROM downloads
          WHERE user_id = 1 AND tmdb_id = ? AND media_type = ?
            AND season IS ? AND episode IS ?
@@ -113,13 +117,25 @@ pub async fn completed_for_item(
 pub async fn mark_downloading(pool: &SqlitePool, id: &str, total_bytes: i64) -> AppResult<()> {
     sqlx::query(
         "UPDATE downloads
-         SET status = 'downloading', total_bytes = ?, updated_at = datetime('now')
+         SET status = 'downloading', phase = 'downloading', total_bytes = ?,
+             updated_at = datetime('now')
          WHERE id = ?",
     )
     .bind(total_bytes)
     .bind(id)
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+/// Set the granular phase of a running repair job (`downloading`,
+/// `repairing`, `extracting`). Leaves the coarse `status` alone.
+pub async fn set_phase(pool: &SqlitePool, id: &str, phase: &str) -> AppResult<()> {
+    sqlx::query("UPDATE downloads SET phase = ?, updated_at = datetime('now') WHERE id = ?")
+        .bind(phase)
+        .bind(id)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -137,7 +153,8 @@ pub async fn set_progress(pool: &SqlitePool, id: &str, progress_bytes: i64) -> A
 pub async fn mark_complete(pool: &SqlitePool, id: &str, file_path: &str) -> AppResult<()> {
     sqlx::query(
         "UPDATE downloads
-         SET status = 'complete', progress_bytes = COALESCE(total_bytes, progress_bytes),
+         SET status = 'complete', phase = 'complete',
+             progress_bytes = COALESCE(total_bytes, progress_bytes),
              file_path = ?, error = NULL, updated_at = datetime('now')
          WHERE id = ?",
     )
@@ -151,7 +168,7 @@ pub async fn mark_complete(pool: &SqlitePool, id: &str, file_path: &str) -> AppR
 pub async fn mark_failed(pool: &SqlitePool, id: &str, error: &str) -> AppResult<()> {
     sqlx::query(
         "UPDATE downloads
-         SET status = 'failed', error = ?, updated_at = datetime('now')
+         SET status = 'failed', phase = 'failed', error = ?, updated_at = datetime('now')
          WHERE id = ?",
     )
     .bind(error)

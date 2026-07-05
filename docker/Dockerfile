@@ -13,10 +13,11 @@ RUN cargo chef cook --release --recipe-path recipe.json
 COPY . .
 RUN cargo build --release
 
-# Runtime stage — ffmpeg is required for HLS remuxing.
+# Runtime stage — ffmpeg is required for HLS remuxing, par2 for the
+# download-and-repair fallback on partially-available releases.
 FROM debian:bookworm-slim
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
+    && apt-get install -y --no-install-recommends ffmpeg par2 ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/target/release/usenet-streaming-server /usr/local/bin/
 VOLUME ["/config", "/data"]

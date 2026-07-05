@@ -19,7 +19,10 @@ use crate::{
     db,
     error::{AppError, AppResult},
     indexer::{client::NewznabClient, RawRelease},
-    nzb::{health_check, main_content_segments, parse_nzb, select_main, MainContent, Nzb},
+    nzb::{
+        assess_release, health_check, main_content_segments, parse_nzb, select_main, HealthVerdict,
+        MainContent, Nzb, RepairAssessment,
+    },
     release::{
         parse::{parse_release_name, Resolution},
         rank::RankedRelease,
@@ -67,6 +70,11 @@ pub struct CreateSessionRequest {
     /// Skip the completed-download shortcut and always stream from Usenet.
     #[serde(default)]
     pub force_nntp: bool,
+    /// Skip the streaming attempt and go straight to a download-and-repair
+    /// job for the best repairable candidate (returns 202 `repairing`). Fails
+    /// with 422 when no candidate is even repairable.
+    #[serde(default)]
+    pub force_repair: bool,
     /// Device capability cap (`480p`, `720p`, `1080p`, `2160p`): releases
     /// above the lower of this and the stored preference max are rejected,
     /// and the best supported resolution ranks first.
@@ -97,27 +105,68 @@ pub struct CreateSessionResponse {
     pub source: String,
 }
 
+/// Returned with HTTP 202 when no candidate is streamable but at least one is
+/// repairable: a download-and-repair job was started. Poll
+/// `GET /downloads/{download_id}` for progress; once it is `complete`, start a
+/// session again (or with `download_id`) to play the repaired file from disk.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RepairingResponse {
+    /// Always `"repairing"` — lets clients distinguish this from a 200 session.
+    pub status: String,
+    /// The download job reconstructing the release via par2.
+    pub download_id: Uuid,
+    /// Title of the release being repaired.
+    pub release_title: String,
+    /// The full ranked candidate list the choice was made from.
+    pub candidates: Vec<RankedRelease>,
+}
+
+/// Either a started playback session (200) or a started repair job (202).
+pub enum SessionOrRepair {
+    Session(Box<CreateSessionResponse>),
+    Repairing(RepairingResponse),
+}
+
+impl IntoResponse for SessionOrRepair {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Session(session) => (StatusCode::OK, Json(*session)).into_response(),
+            Self::Repairing(repair) => (StatusCode::ACCEPTED, Json(repair)).into_response(),
+        }
+    }
+}
+
 /// Start a playback session. Completed downloads are played straight from
-/// disk (unless `force_nntp`); otherwise releases are resolved and the
-/// first healthy streamable candidate is probed and remuxed.
+/// disk (unless `force_nntp`); otherwise releases are resolved and the first
+/// healthy streamable candidate is probed and remuxed.
+///
+/// When no candidate is streamable but at least one is *repairable* (too
+/// damaged to stream, yet recoverable from its par2 recovery files), a
+/// download-and-repair job is started and the endpoint returns **202** with a
+/// [`RepairingResponse`] instead of 422. Poll the download, then start again
+/// once it completes to play the repaired file from disk. Pass `force_repair`
+/// to skip streaming and go straight to repair.
 #[utoipa::path(post, path = "/stream/sessions", tag = "streaming",
     request_body = CreateSessionRequest,
     responses(
-        (status = 200, body = CreateSessionResponse),
+        (status = 200, body = CreateSessionResponse, description = "Playback session started (streaming or disk)"),
+        (status = 202, body = RepairingResponse, description = "No streamable candidate; a download-and-repair job was started"),
         (status = 400, description = "Bad parameters, missing indexers or TMDB key"),
         (status = 404, description = "Unknown TMDB id, release_guid or download_id"),
-        (status = 422, description = "No streamable release found; details list per-candidate reasons"),
+        (status = 422, description = "No streamable or repairable release found; details list per-candidate reasons"),
     ))]
 pub async fn create_session(
     State(state): State<AppState>,
     Json(request): Json<CreateSessionRequest>,
-) -> AppResult<Json<CreateSessionResponse>> {
+) -> AppResult<SessionOrRepair> {
     // Direct playback of one specific finished download.
     if let Some(download_id) = request.download_id {
         let download = db::downloads::get(&state.db, &download_id.to_string())
             .await?
             .ok_or_else(|| AppError::NotFound(format!("download {download_id}")))?;
-        return start_disk_session(&state, &download).await.map(Json);
+        return start_disk_session(&state, &download)
+            .await
+            .map(|s| SessionOrRepair::Session(Box::new(s)));
     }
 
     let (tmdb_id, media_type) = request.tmdb_id.zip(request.media_type).ok_or_else(|| {
@@ -147,7 +196,9 @@ pub async fn create_session(
                 continue;
             };
             if tokio::fs::try_exists(path).await.unwrap_or(false) {
-                return start_disk_session(&state, &download).await.map(Json);
+                return start_disk_session(&state, &download)
+                    .await
+                    .map(|s| SessionOrRepair::Session(Box::new(s)));
             }
         }
     }
@@ -156,20 +207,102 @@ pub async fn create_session(
     let to_try = pick_candidates(&candidates, request.release_guid.as_deref(), MAX_ATTEMPTS)?;
 
     let mut failures: Vec<String> = Vec::new();
+    // Remember the first repairable candidate (in rank order) as the fallback.
+    let mut best_repairable: Option<(RankedRelease, Nzb, MainContent)> = None;
+
     for candidate in to_try {
-        match start_session(&state, &target, &candidate).await {
-            Ok(session) => {
-                return Ok(Json(session_response(
-                    &session, candidate, candidates, "nntp",
-                )));
-            }
+        // Grab + assess this candidate once.
+        let (assessment, nzb, main) = match assess_candidate(&state, &candidate).await {
+            Ok(triple) => triple,
             Err(error) => {
-                tracing::warn!(release = %candidate.raw.title, %error, "candidate failed, trying next");
+                tracing::warn!(release = %candidate.raw.title, %error, "candidate assessment failed, trying next");
                 failures.push(format!("{}: {error}", candidate.raw.title));
+                continue;
+            }
+        };
+
+        match assessment.verdict {
+            HealthVerdict::Streamable if !request.force_repair => {
+                match start_streamable_session(&state, &target, &candidate, nzb, main).await {
+                    Ok(session) => {
+                        return Ok(SessionOrRepair::Session(Box::new(session_response(
+                            &session, candidate, candidates, "nntp",
+                        ))));
+                    }
+                    Err(error) => {
+                        tracing::warn!(release = %candidate.raw.title, %error, "streamable candidate failed to start, trying next");
+                        failures.push(format!("{}: {error}", candidate.raw.title));
+                    }
+                }
+            }
+            HealthVerdict::Streamable | HealthVerdict::Repairable => {
+                // Either force_repair on a streamable one, or a genuinely
+                // repairable-only candidate. Keep the best (first) as fallback.
+                if best_repairable.is_none() {
+                    best_repairable = Some((candidate.clone(), nzb, main));
+                }
+                failures.push(format!(
+                    "{}: not streamable (repairable, {}/{} sampled missing)",
+                    candidate.raw.title, assessment.health.missing, assessment.health.checked
+                ));
+            }
+            HealthVerdict::Unrecoverable => {
+                failures.push(format!(
+                    "{}: unrecoverable ({}/{} sampled missing, par2 {} bytes)",
+                    candidate.raw.title,
+                    assessment.health.missing,
+                    assessment.health.checked,
+                    assessment.par2_recovery_bytes
+                ));
             }
         }
     }
+
+    // No streamable candidate started. Fall back to download-and-repair.
+    if let Some((candidate, nzb, main)) = best_repairable {
+        let download_id = start_repair_job(&state, &target, &candidate, nzb, main).await?;
+        return Ok(SessionOrRepair::Repairing(RepairingResponse {
+            status: "repairing".into(),
+            download_id,
+            release_title: candidate.raw.title.clone(),
+            candidates,
+        }));
+    }
+
     Err(AppError::NoRelease(failures.join("; ")))
+}
+
+/// Start a download-and-repair job for a repairable candidate and return its
+/// id. The job runs in the background; on completion it marks the row complete
+/// with a file path, and the normal disk-playback path serves it.
+async fn start_repair_job(
+    state: &AppState,
+    target: &ReleaseTarget,
+    candidate: &RankedRelease,
+    nzb: Nzb,
+    main: MainContent,
+) -> AppResult<Uuid> {
+    let id = Uuid::new_v4();
+    db::downloads::insert(
+        &state.db,
+        &db::downloads::NewDownload {
+            id: &id.to_string(),
+            tmdb_id: target.tmdb_id,
+            media_type: target.media_type.as_str(),
+            season: target.season,
+            episode: target.episode,
+            release_title: &candidate.raw.title,
+            nzb_url: &candidate.raw.nzb_url,
+        },
+    )
+    .await?;
+    state.downloads.spawn(
+        state.clone(),
+        id,
+        crate::download::DownloadJob::repair(nzb, main),
+    );
+    tracing::info!(download = %id, release = %candidate.raw.title, "repair job queued from session start");
+    Ok(id)
 }
 
 fn session_response(
@@ -196,9 +329,9 @@ fn session_response(
     }
 }
 
-/// Grab a candidate's NZB, parse it, pick the main content and run the
-/// pre-flight health check. Shared by session creation and download jobs.
-pub(crate) async fn fetch_healthy_release(
+/// Grab a candidate's NZB, parse it and pick the main content (no health
+/// check). Shared by streaming, downloads and repair assessment.
+pub(crate) async fn grab_and_select(
     state: &AppState,
     candidate: &RankedRelease,
 ) -> AppResult<(Nzb, MainContent)> {
@@ -215,7 +348,17 @@ pub(crate) async fn fetch_healthy_release(
         .await?;
     let nzb = parse_nzb(&String::from_utf8_lossy(&nzb_bytes))?;
     let main = select_main(&nzb)?;
+    Ok((nzb, main))
+}
 
+/// Grab a candidate's NZB, parse it, pick the main content and run the
+/// pre-flight health check. Errors unless the release is streamable. Used by
+/// the download-job API (which streams the main content to disk).
+pub(crate) async fn fetch_healthy_release(
+    state: &AppState,
+    candidate: &RankedRelease,
+) -> AppResult<(Nzb, MainContent)> {
+    let (nzb, main) = grab_and_select(state, candidate).await?;
     let segments = main_content_segments(&nzb, &main);
     let health = health_check(&segments, &state.nntp_pool, HEALTH_SAMPLE).await?;
     if !health.ok {
@@ -227,16 +370,28 @@ pub(crate) async fn fetch_healthy_release(
     Ok((nzb, main))
 }
 
-/// Try to start a session from one candidate: NZB grab → parse → health
-/// check → virtual file → ffprobe → ffmpeg. On failure the partially
+/// Grab a candidate and run the full repairability assessment. Returns the
+/// verdict together with the parsed NZB and main content so the caller can
+/// reuse them (to stream or to start a repair job) without a second grab.
+async fn assess_candidate(
+    state: &AppState,
+    candidate: &RankedRelease,
+) -> AppResult<(RepairAssessment, Nzb, MainContent)> {
+    let (nzb, main) = grab_and_select(state, candidate).await?;
+    let assessment = assess_release(&nzb, &main, &state.nntp_pool, HEALTH_SAMPLE).await?;
+    Ok((assessment, nzb, main))
+}
+
+/// Start a session from an already-grabbed, already-assessed streamable
+/// candidate: virtual file → ffprobe → ffmpeg. On failure the partially
 /// registered session is torn down.
-async fn start_session(
+async fn start_streamable_session(
     state: &AppState,
     target: &ReleaseTarget,
     candidate: &RankedRelease,
+    nzb: Nzb,
+    main: MainContent,
 ) -> AppResult<Arc<Session>> {
-    let (nzb, main) = fetch_healthy_release(state, candidate).await?;
-
     let source = open_media_source(
         &nzb,
         &main,
