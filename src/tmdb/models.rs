@@ -52,6 +52,8 @@ pub struct Movie {
     pub imdb_id: Option<String>,
     pub title: String,
     pub year: Option<i32>,
+    /// ISO 639-1 code of the original language (e.g. "ja" for anime).
+    pub original_language: Option<String>,
     pub overview: Option<String>,
     pub runtime_minutes: Option<i64>,
     pub poster_url: Option<String>,
@@ -67,6 +69,8 @@ pub struct TvShow {
     pub tvdb_id: Option<i64>,
     pub title: String,
     pub year: Option<i32>,
+    /// ISO 639-1 code of the original language (e.g. "ja" for anime).
+    pub original_language: Option<String>,
     pub overview: Option<String>,
     pub poster_url: Option<String>,
     pub backdrop_url: Option<String>,
@@ -174,6 +178,7 @@ pub(crate) struct RawExternalIds {
 pub(crate) struct RawMovieDetails {
     pub id: i64,
     pub title: String,
+    pub original_language: Option<String>,
     pub release_date: Option<String>,
     pub overview: Option<String>,
     pub runtime: Option<i64>,
@@ -197,6 +202,7 @@ impl From<RawMovieDetails> for Movie {
             imdb_id,
             title: raw.title,
             year: year_of(raw.release_date.as_deref()),
+            original_language: raw.original_language.filter(|s| !s.is_empty()),
             overview: raw.overview,
             runtime_minutes: raw.runtime,
             poster_url: image_url(raw.poster_path.as_deref(), "w500"),
@@ -210,6 +216,7 @@ impl From<RawMovieDetails> for Movie {
 pub(crate) struct RawTvDetails {
     pub id: i64,
     pub name: String,
+    pub original_language: Option<String>,
     pub first_air_date: Option<String>,
     pub overview: Option<String>,
     pub poster_path: Option<String>,
@@ -242,6 +249,7 @@ impl From<RawTvDetails> for TvShow {
             tvdb_id,
             title: raw.name,
             year: year_of(raw.first_air_date.as_deref()),
+            original_language: raw.original_language.filter(|s| !s.is_empty()),
             overview: raw.overview,
             poster_url: image_url(raw.poster_path.as_deref(), "w500"),
             backdrop_url: image_url(raw.backdrop_path.as_deref(), "w780"),

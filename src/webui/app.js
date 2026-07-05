@@ -644,7 +644,7 @@ async function renderPreferences(main) {
             <span class="hint">Leave empty for no limit</span></div>
           <div class="field"><label>Audio language</label>
             <input name="language" value="${esc(prefs.language)}" placeholder="en">
-            <span class="hint">Two-letter code, e.g. en, de</span></div>
+            <span class="hint">Two-letter code (en, de) or "original" for each title's original language</span></div>
         </div>
       </div>
       <div class="card">

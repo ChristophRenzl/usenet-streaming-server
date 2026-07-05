@@ -13,6 +13,9 @@ pub struct Preferences {
     pub preferred_video_codecs: Vec<String>,
     pub preferred_audio_codecs: Vec<String>,
     pub max_size_bytes: Option<i64>,
+    /// Preferred audio language: an ISO 639-1 code ("en", "de", "ja"), a
+    /// full name ("german"), or "original" to prefer each title's original
+    /// language (e.g. Japanese for anime).
     pub language: String,
     /// Boost terms — releases containing these score higher (not required).
     pub allowed_terms: Vec<String>,

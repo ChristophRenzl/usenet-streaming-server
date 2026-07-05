@@ -24,18 +24,25 @@ pub struct RankedRelease {
 /// client (what its display supports). Releases above the cap are rejected,
 /// and scoring treats `min(preferred, effective max)` as the preferred
 /// resolution so the best supported quality ranks first.
+///
+/// `original_language` is the title's original language (ISO 639-1, from
+/// TMDB). It only matters when the language preference is `"original"`:
+/// then it replaces the fixed preferred language, so e.g. anime ranks
+/// Japanese-audio releases first.
 pub fn rank(
     releases: Vec<RawRelease>,
     prefs: &Preferences,
     device_cap: Option<Resolution>,
+    original_language: Option<&str>,
 ) -> Vec<RankedRelease> {
     let scoring_prefs = effective_prefs(prefs, device_cap);
+    let preferred_language = preferred_language_hint(&prefs.language, original_language);
     let mut ranked: Vec<RankedRelease> = releases
         .into_iter()
         .map(|raw| {
             let parsed = parse_release_name(&raw.title);
             let rejected = rejection_reason(&raw, &parsed, prefs, device_cap);
-            let score = score(&raw, &parsed, &scoring_prefs);
+            let score = score(&raw, &parsed, &scoring_prefs, preferred_language.as_deref());
             RankedRelease {
                 raw,
                 parsed,
@@ -103,7 +110,68 @@ fn rejection_reason(
     None
 }
 
-fn score(raw: &RawRelease, parsed: &ParsedRelease, prefs: &Preferences) -> i64 {
+/// Resolve the language preference to the release-name hint token used by
+/// the parser (e.g. "japanese"). Accepts an ISO 639-1 code ("ja"), a full
+/// name ("japanese"), or the special value "original", which defers to the
+/// title's TMDB original language. Returns `None` when the language is
+/// unknown or unavailable — then language does not influence the score.
+fn preferred_language_hint(pref: &str, original_language: Option<&str>) -> Option<String> {
+    let pref = pref.trim().to_lowercase();
+    let code = if pref == "original" {
+        original_language?.trim().to_lowercase()
+    } else {
+        pref
+    };
+    let hint = match code.as_str() {
+        "en" => "english",
+        "de" => "german",
+        "fr" => "french",
+        "it" => "italian",
+        "es" => "spanish",
+        "nl" => "dutch",
+        "sv" | "da" | "no" | "fi" => "nordic",
+        "ko" => "korean",
+        "ja" => "japanese",
+        "hi" => "hindi",
+        "ru" => "russian",
+        // Already a full hint name ("german", "japanese", ...).
+        "english" | "german" | "french" | "italian" | "spanish" | "dutch" | "nordic" | "korean"
+        | "japanese" | "hindi" | "russian" => return Some(code),
+        _ => return None,
+    };
+    Some(hint.to_string())
+}
+
+/// Language score against the hints parsed from the release name. Scene
+/// convention: untagged releases are English, foreign audio is tagged
+/// (GERMAN, JAPANESE, ...), MULTi/DUAL carry several audio tracks.
+fn language_score(preferred: &str, languages: &[String]) -> i64 {
+    let has = |wanted: &str| languages.iter().any(|l| l == wanted);
+    if has(preferred) {
+        400
+    } else if has("multi") || has("dual") || has("vostfr") {
+        // Likely includes the preferred audio track (VOSTFR = original
+        // audio with French subs).
+        250
+    } else if languages.is_empty() {
+        // Untagged usually means English audio.
+        if preferred == "english" {
+            400
+        } else {
+            0
+        }
+    } else {
+        // Explicitly tagged with other languages only.
+        -400
+    }
+}
+
+fn score(
+    raw: &RawRelease,
+    parsed: &ParsedRelease,
+    prefs: &Preferences,
+    preferred_language: Option<&str>,
+) -> i64 {
     let mut score: i64 = 0;
 
     // Resolution: exact preferred match wins big; otherwise penalize by
@@ -114,6 +182,10 @@ fn score(raw: &RawRelease, parsed: &ParsedRelease, prefs: &Preferences) -> i64 {
         Some(res) => 1000 - 300 * (res.tier() - prefs.preferred_resolution.tier()).abs(),
         None => 100,
     };
+
+    if let Some(lang) = preferred_language {
+        score += language_score(lang, &parsed.languages);
+    }
 
     if let Some(codec) = parsed.video_codec {
         if contains_ci(&prefs.preferred_video_codecs, codec.as_str()) {
@@ -199,6 +271,7 @@ mod tests {
             ],
             &prefs(),
             None,
+            None,
         );
         assert_eq!(ranked.len(), 2);
         assert!(ranked[0].rejected.is_none());
@@ -212,7 +285,12 @@ mod tests {
     fn max_resolution_is_enforced() {
         let mut p = prefs();
         p.max_resolution = Resolution::R1080p;
-        let ranked = rank(vec![release("Movie.2026.2160p.WEB-DL.HEVC-X")], &p, None);
+        let ranked = rank(
+            vec![release("Movie.2026.2160p.WEB-DL.HEVC-X")],
+            &p,
+            None,
+            None,
+        );
         let reason = ranked[0]
             .rejected
             .as_deref()
@@ -225,7 +303,12 @@ mod tests {
     fn max_size_is_enforced() {
         let mut p = prefs();
         p.max_size_bytes = Some(1024);
-        let ranked = rank(vec![release("Movie.2026.1080p.BluRay.x264-BIG")], &p, None);
+        let ranked = rank(
+            vec![release("Movie.2026.1080p.BluRay.x264-BIG")],
+            &p,
+            None,
+            None,
+        );
         assert!(ranked[0].rejected.as_deref().unwrap().contains("size"));
     }
 
@@ -237,6 +320,7 @@ mod tests {
                 release("Movie.2026.1080p.BluRay.x264-FHD"),
             ],
             &prefs(),
+            None,
             None,
         );
         assert!(
@@ -256,6 +340,7 @@ mod tests {
             ],
             &prefs(),
             None,
+            None,
         );
         let titles: Vec<&str> = ranked.iter().map(|r| r.raw.title.as_str()).collect();
         assert!(titles[0].contains("REMUX"));
@@ -274,6 +359,7 @@ mod tests {
             ],
             &p,
             None,
+            None,
         );
         assert!(ranked[0].raw.title.contains("BOOSTED"));
     }
@@ -282,8 +368,8 @@ mod tests {
     fn deterministic_order_with_equal_scores() {
         let a = release("Movie.2026.1080p.BluRay.x264-AAA");
         let b = release("Movie.2026.1080p.BluRay.x264-BBB");
-        let first = rank(vec![a.clone(), b.clone()], &prefs(), None);
-        let second = rank(vec![b, a], &prefs(), None);
+        let first = rank(vec![a.clone(), b.clone()], &prefs(), None, None);
+        let second = rank(vec![b, a], &prefs(), None, None);
         let order1: Vec<&str> = first.iter().map(|r| r.raw.title.as_str()).collect();
         let order2: Vec<&str> = second.iter().map(|r| r.raw.title.as_str()).collect();
         assert_eq!(order1, order2, "input order must not matter");
@@ -298,7 +384,7 @@ mod tests {
         let mut old = release("Movie.2026.1080p.BluRay.x264-OLD");
         old.posted_at = Some(Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap());
         let newer = release("Movie.2026.1080p.BluRay.x264-NEW");
-        let ranked = rank(vec![old, newer], &prefs(), None);
+        let ranked = rank(vec![old, newer], &prefs(), None, None);
         assert!(ranked[0].raw.title.ends_with("NEW"));
     }
 
@@ -312,6 +398,7 @@ mod tests {
             ],
             &prefs(),
             Some(Resolution::R1080p),
+            None,
         );
         assert!(ranked[0].raw.title.contains("1080p"));
         assert!(ranked[0].rejected.is_none());
@@ -330,10 +417,12 @@ mod tests {
             vec![release("Movie.2026.1080p.BluRay.x264-FHD")],
             &p,
             Some(Resolution::R1080p),
+            None,
         );
         let native = rank(
             vec![release("Movie.2026.1080p.BluRay.x264-FHD")],
             &prefs(), // prefers 1080p natively
+            None,
             None,
         );
         assert!(capped[0].rejected.is_none());
@@ -357,6 +446,7 @@ mod tests {
             ],
             &p,
             Some(Resolution::R1080p),
+            None,
         );
         let titles: Vec<&str> = ranked.iter().map(|r| r.raw.title.as_str()).collect();
         assert!(titles[0].contains("1080p"), "order was: {titles:?}");
@@ -374,6 +464,7 @@ mod tests {
             vec![release("Movie.2026.2160p.WEB-DL.HEVC-X")],
             &p,
             Some(Resolution::R2160p),
+            None,
         );
         let reason = ranked[0].rejected.as_deref().expect("must be rejected");
         assert!(reason.contains("exceeds max 1080p"), "reason was: {reason}");
@@ -385,7 +476,102 @@ mod tests {
         let mut small = release("Movie.2026.1080p.BluRay.x264-SMALL");
         small.size_bytes = Some(10 * 1024 * 1024);
         let normal = release("Movie.2026.1080p.BluRay.x264-NORMAL");
-        let ranked = rank(vec![small, normal], &prefs(), None);
+        let ranked = rank(vec![small, normal], &prefs(), None, None);
         assert!(ranked[0].raw.title.ends_with("NORMAL"));
+    }
+
+    #[test]
+    fn fixed_language_boosts_matching_release() {
+        let mut p = prefs();
+        p.language = "de".into();
+        let ranked = rank(
+            vec![
+                release("Movie.2026.German.1080p.BluRay.x264-DEU"),
+                release("Movie.2026.1080p.BluRay.x264-PLAIN"),
+                release("Movie.2026.French.1080p.BluRay.x264-FRA"),
+            ],
+            &p,
+            None,
+            None,
+        );
+        let titles: Vec<&str> = ranked.iter().map(|r| r.raw.title.as_str()).collect();
+        assert!(titles[0].contains("German"), "order was: {titles:?}");
+        assert!(titles[2].contains("French"), "order was: {titles:?}");
+    }
+
+    #[test]
+    fn original_language_prefers_native_audio() {
+        // Anime: original language is Japanese, so the JAPANESE release must
+        // outrank MULTi, which must outrank a German-only dub.
+        let mut p = prefs();
+        p.language = "original".into();
+        let ranked = rank(
+            vec![
+                release("Anime.2026.German.1080p.WEB-DL.x264-DUB"),
+                release("Anime.2026.Japanese.1080p.WEB-DL.x264-NATIVE"),
+                release("Anime.2026.Multi.1080p.WEB-DL.x264-MULTI"),
+            ],
+            &p,
+            None,
+            Some("ja"),
+        );
+        let titles: Vec<&str> = ranked.iter().map(|r| r.raw.title.as_str()).collect();
+        assert!(titles[0].contains("NATIVE"), "order was: {titles:?}");
+        assert!(titles[1].contains("MULTI"), "order was: {titles:?}");
+        assert!(titles[2].contains("DUB"), "order was: {titles:?}");
+    }
+
+    #[test]
+    fn original_language_english_prefers_untagged() {
+        // Original language English: untagged releases count as English and
+        // must outrank a foreign-tagged dub.
+        let mut p = prefs();
+        p.language = "original".into();
+        let ranked = rank(
+            vec![
+                release("Movie.2026.German.1080p.BluRay.x264-DUB"),
+                release("Movie.2026.1080p.BluRay.x264-PLAIN"),
+            ],
+            &p,
+            None,
+            Some("en"),
+        );
+        assert!(ranked[0].raw.title.contains("PLAIN"));
+    }
+
+    #[test]
+    fn original_language_missing_is_neutral() {
+        // "original" preference but TMDB gave no original language: language
+        // must not influence the order (title tiebreak decides).
+        let mut p = prefs();
+        p.language = "original".into();
+        let ranked = rank(
+            vec![
+                release("Movie.2026.1080p.BluRay.x264-BBB"),
+                release("Movie.2026.German.1080p.BluRay.x264-AAA"),
+            ],
+            &p,
+            None,
+            None,
+        );
+        assert_eq!(ranked[0].score, ranked[1].score);
+    }
+
+    #[test]
+    fn language_pref_accepts_full_names_and_codes() {
+        assert_eq!(
+            preferred_language_hint("ja", None).as_deref(),
+            Some("japanese")
+        );
+        assert_eq!(
+            preferred_language_hint("German", None).as_deref(),
+            Some("german")
+        );
+        assert_eq!(
+            preferred_language_hint("original", Some("de")).as_deref(),
+            Some("german")
+        );
+        assert_eq!(preferred_language_hint("original", None), None);
+        assert_eq!(preferred_language_hint("zz", None), None);
     }
 }

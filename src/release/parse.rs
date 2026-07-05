@@ -149,8 +149,8 @@ pub struct ParsedRelease {
 }
 
 const LANGUAGE_HINTS: &[&str] = &[
-    "german", "french", "italian", "spanish", "dutch", "nordic", "korean", "japanese", "hindi",
-    "russian", "multi", "dual", "vostfr",
+    "english", "german", "french", "italian", "spanish", "dutch", "nordic", "korean", "japanese",
+    "hindi", "russian", "multi", "dual", "vostfr",
 ];
 
 /// Tokens that follow a `-` but are quality markers, not release groups.

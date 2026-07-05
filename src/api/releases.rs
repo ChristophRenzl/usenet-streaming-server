@@ -64,10 +64,10 @@ pub async fn resolve_candidates(
     }
 
     let tmdb = tmdb_client(state).await?;
-    let query = match target.media_type {
+    let (query, original_language) = match target.media_type {
         MediaType::Movie => {
             let movie = tmdb.movie_details(target.tmdb_id).await?;
-            match movie.imdb_id {
+            let query = match movie.imdb_id {
                 Some(imdb_id) => SearchQuery::MovieByImdb { imdb_id },
                 None => SearchQuery::Raw {
                     query: match movie.year {
@@ -75,7 +75,8 @@ pub async fn resolve_candidates(
                         None => movie.title,
                     },
                 },
-            }
+            };
+            (query, movie.original_language)
         }
         MediaType::Tv => {
             let (season, episode) = target
@@ -83,7 +84,7 @@ pub async fn resolve_candidates(
                 .zip(target.episode)
                 .expect("validated TV target");
             let show = tmdb.tv_details(target.tmdb_id).await?;
-            match show.tvdb_id {
+            let query = match show.tvdb_id {
                 Some(tvdb_id) => SearchQuery::TvByTvdb {
                     tvdb_id,
                     season,
@@ -92,13 +93,19 @@ pub async fn resolve_candidates(
                 None => SearchQuery::Raw {
                     query: format!("{} S{season:02}E{episode:02}", show.title),
                 },
-            }
+            };
+            (query, show.original_language)
         }
     };
 
     let raw = indexer::search_all(&state.http, indexers, &query).await;
     let prefs = db::preferences::get(&state.db).await?;
-    Ok(rank(raw, &prefs, max_resolution))
+    Ok(rank(
+        raw,
+        &prefs,
+        max_resolution,
+        original_language.as_deref(),
+    ))
 }
 
 /// Pick the candidates to actually try: the guid-pinned release when given,
