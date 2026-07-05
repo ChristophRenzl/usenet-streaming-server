@@ -138,9 +138,9 @@ fn language_score(languages: &[String], target: &LanguageTarget) -> i64 {
         LanguageTarget::Fixed(word) => Some(*word),
         LanguageTarget::Original(word) => *word,
     };
-    let foreign = languages.iter().any(|l| {
-        !matches!(l.as_str(), "multi" | "dual" | "english") && Some(l.as_str()) != wanted
-    });
+    let foreign = languages
+        .iter()
+        .any(|l| !matches!(l.as_str(), "multi" | "dual" | "english") && Some(l.as_str()) != wanted);
 
     match wanted {
         Some(word) => {
@@ -313,7 +313,12 @@ mod tests {
     fn max_resolution_is_enforced() {
         let mut p = prefs();
         p.max_resolution = Resolution::R1080p;
-        let ranked = rank(vec![release("Movie.2026.2160p.WEB-DL.HEVC-X")], &p, None, None);
+        let ranked = rank(
+            vec![release("Movie.2026.2160p.WEB-DL.HEVC-X")],
+            &p,
+            None,
+            None,
+        );
         let reason = ranked[0]
             .rejected
             .as_deref()
@@ -326,7 +331,12 @@ mod tests {
     fn max_size_is_enforced() {
         let mut p = prefs();
         p.max_size_bytes = Some(1024);
-        let ranked = rank(vec![release("Movie.2026.1080p.BluRay.x264-BIG")], &p, None, None);
+        let ranked = rank(
+            vec![release("Movie.2026.1080p.BluRay.x264-BIG")],
+            &p,
+            None,
+            None,
+        );
         assert!(ranked[0].rejected.as_deref().unwrap().contains("size"));
     }
 
