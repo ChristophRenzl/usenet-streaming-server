@@ -13,6 +13,10 @@ pub struct Preferences {
     pub preferred_video_codecs: Vec<String>,
     pub preferred_audio_codecs: Vec<String>,
     pub max_size_bytes: Option<i64>,
+    /// Preferred audio language: an ISO 639-1 code / language name
+    /// (`en`, `de`, `german`, ...) or the special value `original`, which
+    /// resolves to each title's TMDB original language at ranking time
+    /// (e.g. Japanese audio for anime).
     pub language: String,
     /// Boost terms — releases containing these score higher (not required).
     pub allowed_terms: Vec<String>,

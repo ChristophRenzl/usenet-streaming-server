@@ -57,6 +57,8 @@ pub struct Movie {
     pub poster_url: Option<String>,
     pub backdrop_url: Option<String>,
     pub vote_average: Option<f64>,
+    /// ISO 639-1 code of the title's original language (e.g. "ja").
+    pub original_language: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -71,6 +73,8 @@ pub struct TvShow {
     pub poster_url: Option<String>,
     pub backdrop_url: Option<String>,
     pub vote_average: Option<f64>,
+    /// ISO 639-1 code of the show's original language (e.g. "ja").
+    pub original_language: Option<String>,
     pub seasons: Vec<SeasonSummary>,
 }
 
@@ -181,6 +185,7 @@ pub(crate) struct RawMovieDetails {
     pub backdrop_path: Option<String>,
     pub vote_average: Option<f64>,
     pub imdb_id: Option<String>,
+    pub original_language: Option<String>,
     pub external_ids: Option<RawExternalIds>,
 }
 
@@ -202,6 +207,7 @@ impl From<RawMovieDetails> for Movie {
             poster_url: image_url(raw.poster_path.as_deref(), "w500"),
             backdrop_url: image_url(raw.backdrop_path.as_deref(), "w780"),
             vote_average: raw.vote_average,
+            original_language: raw.original_language,
         }
     }
 }
@@ -215,6 +221,7 @@ pub(crate) struct RawTvDetails {
     pub poster_path: Option<String>,
     pub backdrop_path: Option<String>,
     pub vote_average: Option<f64>,
+    pub original_language: Option<String>,
     pub external_ids: Option<RawExternalIds>,
     #[serde(default)]
     pub seasons: Vec<RawSeasonSummary>,
@@ -246,6 +253,7 @@ impl From<RawTvDetails> for TvShow {
             poster_url: image_url(raw.poster_path.as_deref(), "w500"),
             backdrop_url: image_url(raw.backdrop_path.as_deref(), "w780"),
             vote_average: raw.vote_average,
+            original_language: raw.original_language,
             seasons: raw
                 .seasons
                 .into_iter()
