@@ -86,7 +86,7 @@ what is still missing) and all operational settings:
 - **Usenet Providers** — add/edit/test/delete NNTP servers
 - **Indexers** — add/edit/test/delete Newznab indexers
 - **TMDB** — set the metadata API key
-- **Preferences** — resolutions, codecs, language, size limit, blocked terms
+- **Preferences** — resolutions, codecs, audio language (fixed or `original`, e.g. Japanese for anime), size limit, blocked terms
 - **Downloads** — watch progress, cancel or delete jobs
 - **Security** — rotate the server API key
 
