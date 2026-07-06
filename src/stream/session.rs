@@ -48,6 +48,11 @@ pub struct MediaInfo {
     pub video_codec: Option<String>,
     pub audio_codec: Option<String>,
     pub audio_transcoded: bool,
+    /// HLS `VIDEO-RANGE` (`PQ`, `HLG` or `SDR`); empty until probed.
+    /// Reflects the *served* stream: `SDR` when tone-mapping.
+    pub video_range: String,
+    /// True when the video is tone-mapped to SDR for an HDR-incapable client.
+    pub video_transcoded: bool,
 }
 
 /// Everything needed to register a new session.

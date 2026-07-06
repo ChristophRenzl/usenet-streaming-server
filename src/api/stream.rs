@@ -5,7 +5,7 @@
 use std::path::Path as FsPath;
 use std::sync::{Arc, LazyLock};
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -71,6 +71,10 @@ pub struct CreateSessionRequest {
     /// above the lower of this and the stored preference max are rejected,
     /// and the best supported resolution ranks first.
     pub max_resolution: Option<Resolution>,
+    /// Whether the device/display can render HDR (PQ/HLG). When `false`,
+    /// HDR sources are tone-mapped to 1080p SDR H.264 instead of
+    /// stream-copied. Absent means HDR-capable.
+    pub supports_hdr: Option<bool>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -112,12 +116,16 @@ pub async fn create_session(
     State(state): State<AppState>,
     Json(request): Json<CreateSessionRequest>,
 ) -> AppResult<Json<CreateSessionResponse>> {
+    let supports_hdr = request.supports_hdr.unwrap_or(true);
+
     // Direct playback of one specific finished download.
     if let Some(download_id) = request.download_id {
         let download = db::downloads::get(&state.db, &download_id.to_string())
             .await?
             .ok_or_else(|| AppError::NotFound(format!("download {download_id}")))?;
-        return start_disk_session(&state, &download).await.map(Json);
+        return start_disk_session(&state, &download, supports_hdr)
+            .await
+            .map(Json);
     }
 
     let (tmdb_id, media_type) = request.tmdb_id.zip(request.media_type).ok_or_else(|| {
@@ -147,7 +155,9 @@ pub async fn create_session(
                 continue;
             };
             if tokio::fs::try_exists(path).await.unwrap_or(false) {
-                return start_disk_session(&state, &download).await.map(Json);
+                return start_disk_session(&state, &download, supports_hdr)
+                    .await
+                    .map(Json);
             }
         }
     }
@@ -157,7 +167,7 @@ pub async fn create_session(
 
     let mut failures: Vec<String> = Vec::new();
     for candidate in to_try {
-        match start_session(&state, &target, &candidate).await {
+        match start_session(&state, &target, &candidate, supports_hdr).await {
             Ok(session) => {
                 return Ok(Json(session_response(
                     &session, candidate, candidates, "nntp",
@@ -234,6 +244,7 @@ async fn start_session(
     state: &AppState,
     target: &ReleaseTarget,
     candidate: &RankedRelease,
+    supports_hdr: bool,
 ) -> AppResult<Arc<Session>> {
     let (nzb, main) = fetch_healthy_release(state, candidate).await?;
 
@@ -273,7 +284,7 @@ async fn start_session(
     state.sessions.insert(session.clone());
 
     // From here on, clean up the registered session on failure.
-    match probe_and_spawn(state, &session).await {
+    match probe_and_spawn(state, &session, supports_hdr).await {
         Ok(()) => {}
         Err(error) => {
             state.sessions.teardown(&session.id).await;
@@ -304,6 +315,7 @@ async fn start_session(
 async fn start_disk_session(
     state: &AppState,
     download: &db::downloads::Download,
+    supports_hdr: bool,
 ) -> AppResult<CreateSessionResponse> {
     if download.status != "complete" {
         return Err(AppError::BadRequest(format!(
@@ -363,7 +375,7 @@ async fn start_disk_session(
     .await?;
     state.sessions.insert(session.clone());
 
-    match probe_and_spawn(state, &session).await {
+    match probe_and_spawn(state, &session, supports_hdr).await {
         Ok(()) => {}
         Err(error) => {
             state.sessions.teardown(&session.id).await;
@@ -422,15 +434,28 @@ fn loopback_url(state: &AppState, session: &Session) -> String {
     )
 }
 
-async fn probe_and_spawn(state: &AppState, session: &Arc<Session>) -> AppResult<()> {
+async fn probe_and_spawn(
+    state: &AppState,
+    session: &Arc<Session>,
+    supports_hdr: bool,
+) -> AppResult<()> {
     let url = loopback_url(state, session);
     let probe = ffprobe::probe_url(&state.config.streaming.ffprobe_path, &url).await?;
     let audio_transcoded = ffmpeg::should_transcode_audio(probe.audio_codec.as_deref());
+    // AVPlayer refuses PQ/HLG variants outright on SDR-only outputs, so HDR
+    // sources are tone-mapped for clients that declare no HDR support.
+    let video_transcoded = !supports_hdr && probe.video_range != "SDR";
     session.set_info(MediaInfo {
         duration_secs: probe.duration_secs,
-        video_codec: probe.video_codec,
+        video_codec: probe.video_codec.clone(),
         audio_codec: probe.audio_codec,
         audio_transcoded,
+        video_range: if video_transcoded {
+            "SDR".to_string()
+        } else {
+            probe.video_range
+        },
+        video_transcoded,
     });
     ffmpeg::spawn_hls(
         session,
@@ -439,6 +464,8 @@ async fn probe_and_spawn(state: &AppState, session: &Arc<Session>) -> AppResult<
             input_url: &url,
             start_secs: 0.0,
             transcode_audio: audio_transcoded,
+            video_codec: probe.video_codec.as_deref(),
+            tonemap_to_sdr: video_transcoded,
         },
     )
     .await
@@ -457,6 +484,8 @@ pub struct SessionStatus {
     pub video_codec: Option<String>,
     pub audio_codec: Option<String>,
     pub audio_transcoded: bool,
+    /// True when the video is tone-mapped to SDR for this session.
+    pub video_transcoded: bool,
     pub container: String,
     pub release_title: String,
     pub inner_file_name: String,
@@ -494,6 +523,7 @@ pub async fn session_status(
         video_codec: info.video_codec,
         audio_codec: info.audio_codec,
         audio_transcoded: info.audio_transcoded,
+        video_transcoded: info.video_transcoded,
         container: session.container.clone(),
         release_title: session.release_title.clone(),
         inner_file_name: session.inner_file_name.clone(),
@@ -536,6 +566,56 @@ pub async fn delete_session(
 
 // ---- HLS playlists and segments ----------------------------------------------
 
+/// `?apikey=` on playlist requests. AVPlayer resolves the relative URIs
+/// inside a playlist without the query string, so the key must be written
+/// back into every URI for the follow-up requests to authenticate.
+#[derive(Debug, Deserialize)]
+pub struct PlaylistQuery {
+    apikey: Option<String>,
+}
+
+/// `?apikey=...` (URL-encoded) when a key was presented, `""` otherwise.
+fn apikey_suffix(apikey: Option<&str>) -> String {
+    match apikey {
+        Some(key) => format!(
+            "?apikey={}",
+            form_urlencoded::byte_serialize(key.as_bytes()).collect::<String>()
+        ),
+        None => String::new(),
+    }
+}
+
+/// Append `suffix` to every URI in an HLS playlist: plain segment lines and
+/// the `URI="..."` attribute of `#EXT-X-MAP` tags.
+fn propagate_apikey(playlist: &str, suffix: &str) -> String {
+    if suffix.is_empty() {
+        return playlist.to_string();
+    }
+    let mut out = String::with_capacity(playlist.len());
+    for line in playlist.lines() {
+        if line.starts_with("#EXT-X-MAP:") {
+            if let Some(start) = line.find("URI=\"") {
+                let uri_start = start + "URI=\"".len();
+                if let Some(end) = line[uri_start..].find('"') {
+                    out.push_str(&line[..uri_start + end]);
+                    out.push_str(suffix);
+                    out.push_str(&line[uri_start + end..]);
+                    out.push('\n');
+                    continue;
+                }
+            }
+            out.push_str(line);
+        } else if !line.starts_with('#') && !line.trim().is_empty() {
+            out.push_str(line);
+            out.push_str(suffix);
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    out
+}
+
 /// HLS master playlist (single variant, points at `media.m3u8`).
 #[utoipa::path(get, path = "/stream/{session_id}/master.m3u8", tag = "streaming",
     params(("session_id" = Uuid, Path, description = "Session id")),
@@ -546,18 +626,27 @@ pub async fn delete_session(
 pub async fn master_playlist(
     State(state): State<AppState>,
     Path(session_id): Path<Uuid>,
+    Query(query): Query<PlaylistQuery>,
 ) -> AppResult<Response> {
     let session = get_session(&state, &session_id)?;
     session.touch();
-    let master = "#EXTM3U\n\
-                  #EXT-X-VERSION:7\n\
-                  #EXT-X-STREAM-INF:BANDWIDTH=20000000\n\
-                  media.m3u8\n";
-    Ok((
-        [(header::CONTENT_TYPE, PLAYLIST_CONTENT_TYPE)],
-        master.to_string(),
-    )
-        .into_response())
+    // AVPlayer assumes SDR when VIDEO-RANGE is absent and rejects the stream
+    // ("video range specified by playlist is less than actual format
+    // description") once the format description says PQ/HLG.
+    let info = session.info();
+    let video_range = if info.video_range.is_empty() {
+        "SDR"
+    } else {
+        &info.video_range
+    };
+    let master = format!(
+        "#EXTM3U\n\
+         #EXT-X-VERSION:7\n\
+         #EXT-X-STREAM-INF:BANDWIDTH=20000000,VIDEO-RANGE={video_range}\n\
+         media.m3u8{}\n",
+        apikey_suffix(query.apikey.as_deref())
+    );
+    Ok(([(header::CONTENT_TYPE, PLAYLIST_CONTENT_TYPE)], master).into_response())
 }
 
 /// HLS media playlist written by ffmpeg. While the session is still
@@ -572,11 +661,15 @@ pub async fn master_playlist(
 pub async fn media_playlist(
     State(state): State<AppState>,
     Path(session_id): Path<Uuid>,
+    Query(query): Query<PlaylistQuery>,
 ) -> AppResult<Response> {
     let session = get_session(&state, &session_id)?;
     session.touch();
-    match tokio::fs::read(session.playlist_path()).await {
-        Ok(bytes) => Ok(([(header::CONTENT_TYPE, PLAYLIST_CONTENT_TYPE)], bytes).into_response()),
+    match tokio::fs::read_to_string(session.playlist_path()).await {
+        Ok(text) => {
+            let body = propagate_apikey(&text, &apikey_suffix(query.apikey.as_deref()));
+            Ok(([(header::CONTENT_TYPE, PLAYLIST_CONTENT_TYPE)], body).into_response())
+        }
         Err(_) => match session.state() {
             SessionState::Starting => Ok((
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -719,13 +812,16 @@ pub async fn seek_session(
     session.clear_stderr();
 
     let url = loopback_url(&state, &session);
+    let info = session.info();
     ffmpeg::spawn_hls(
         &session,
         SpawnOptions {
             ffmpeg_path: &state.config.streaming.ffmpeg_path,
             input_url: &url,
             start_secs: target,
-            transcode_audio: session.info().audio_transcoded,
+            transcode_audio: info.audio_transcoded,
+            video_codec: info.video_codec.as_deref(),
+            tonemap_to_sdr: info.video_transcoded,
         },
     )
     .await?;
@@ -794,6 +890,25 @@ mod tests {
         ] {
             assert!(!SEGMENT_NAME.is_match(bad), "should reject {bad}");
         }
+    }
+
+    #[test]
+    fn apikey_is_propagated_into_playlist_uris() {
+        let playlist = "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:6.000000,\nseg_00000.m4s\n#EXTINF:4.5,\nseg_00001.m4s\n";
+        let suffix = apikey_suffix(Some("s3cret&x=1"));
+        assert_eq!(suffix, "?apikey=s3cret%26x%3D1");
+        let rewritten = propagate_apikey(playlist, &suffix);
+        assert_eq!(
+            rewritten,
+            "#EXTM3U\n\
+             #EXT-X-MAP:URI=\"init.mp4?apikey=s3cret%26x%3D1\"\n\
+             #EXTINF:6.000000,\n\
+             seg_00000.m4s?apikey=s3cret%26x%3D1\n\
+             #EXTINF:4.5,\n\
+             seg_00001.m4s?apikey=s3cret%26x%3D1\n"
+        );
+        // No key presented: playlist passes through untouched.
+        assert_eq!(propagate_apikey(playlist, ""), playlist);
     }
 
     #[tokio::test]
