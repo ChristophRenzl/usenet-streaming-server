@@ -1121,6 +1121,11 @@ pub async fn session_status(
     Path(session_id): Path<Uuid>,
 ) -> AppResult<Json<SessionStatus>> {
     let session = get_session(&state, &session_id)?;
+    // A client polling status is expressing interest: keep the idle reaper
+    // away, like every other session route. This is what lets a client
+    // pre-create the next episode's session (autoplay) minutes before it is
+    // played — without the touch it would be reaped at the idle timeout.
+    session.touch();
     let info = session.info();
     let (state_label, error) = match session.state() {
         SessionState::Failed(message) => ("failed".to_string(), Some(message)),
