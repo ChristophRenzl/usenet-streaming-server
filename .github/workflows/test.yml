@@ -8,8 +8,30 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# The repo lives on both GitHub and a Forgejo instance (git.kreideee.com);
+# each job is gated on the server it runs on, so one workflow file serves
+# both without either side scheduling jobs it has no runners for.
 jobs:
   check:
+    if: github.server_url == 'https://github.com'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install ffmpeg, par2 and chromaprint
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg par2 libchromaprint-tools
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test
+
+  check-forgejo:
+    if: github.server_url != 'https://github.com'
     runs-on: docker
     steps:
       - uses: actions/checkout@v4
@@ -17,8 +39,8 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Install ffmpeg and par2
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg par2
+      - name: Install ffmpeg, par2 and chromaprint
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg par2 libchromaprint-tools
       - name: Format
         run: cargo fmt --check
       - name: Clippy
