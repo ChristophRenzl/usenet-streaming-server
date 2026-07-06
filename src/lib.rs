@@ -22,25 +22,40 @@ use state::AppState;
 
 pub async fn run(config: AppConfig) -> anyhow::Result<()> {
     let addr = format!("{}:{}", config.server.host, config.server.port);
-    // Bind before building the state: ffmpeg/ffprobe reach the virtual files
-    // through a loopback URL that needs the actually-bound port (which may
-    // be ephemeral, e.g. port 0 in tests).
-    let listener = tokio::net::TcpListener::bind(&addr)
+    // Public listener on the configured host/port.
+    let public = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("failed to bind {addr}"))?;
-    let local_addr = listener.local_addr().context("reading bound address")?;
+    let public_addr = public.local_addr().context("reading bound address")?;
+
+    // Dedicated internal listener on 127.0.0.1 (ephemeral port). ffmpeg/ffprobe
+    // read the virtual files through this loopback URL. Binding it separately
+    // means the internal route is reachable regardless of the public `host` —
+    // a specific host such as `192.168.1.10` would otherwise leave 127.0.0.1
+    // unbound and the probe would get "connection refused".
+    let loopback = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .context("failed to bind internal loopback listener")?;
+    let loopback_addr = loopback.local_addr().context("reading loopback address")?;
 
     let state = AppState::new(config)
         .await?
-        .with_loopback_base(&format!("http://127.0.0.1:{}", local_addr.port()));
+        .with_loopback_base(&format!("http://127.0.0.1:{}", loopback_addr.port()));
     let app = api::router(state);
-
-    tracing::info!("listening on http://{local_addr} (docs at /docs)");
     // ConnectInfo is required by the loopback guard on /internal/vfs.
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await?;
+    let make = app.into_make_service_with_connect_info::<SocketAddr>();
+    let make_loopback = make.clone();
+
+    tracing::info!(
+        "listening on http://{public_addr} (docs at /docs); internal loopback on {loopback_addr}"
+    );
+    tokio::try_join!(
+        async move { axum::serve(public, make).await.map_err(anyhow::Error::from) },
+        async move {
+            axum::serve(loopback, make_loopback)
+                .await
+                .map_err(anyhow::Error::from)
+        },
+    )?;
     Ok(())
 }
