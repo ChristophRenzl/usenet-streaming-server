@@ -62,14 +62,20 @@ fn parse_frame_rate(rate: Option<&str>) -> Option<f64> {
     fps.is_finite().then_some(fps)
 }
 
-/// Run `ffprobe -v quiet -print_format json -show_format -show_streams`
-/// against `url` with a 20s timeout. Fails when no video stream is found
-/// (nothing we could remux).
+/// Run `ffprobe -v error -print_format json -show_format -show_streams`
+/// against `url` with a 20s timeout. On failure the error carries ffprobe's
+/// own stderr so the reason is actionable. Fails when no video stream is
+/// found (nothing we could remux).
 pub async fn probe_url(ffprobe_path: &str, url: &str) -> AppResult<ProbeResult> {
     let child = tokio::process::Command::new(ffprobe_path)
+        // `-v error` (not `quiet`) so ffprobe writes the real failure reason to
+        // stderr — captured below — while the JSON still goes to stdout. This
+        // turns the opaque "is the media readable?" into an actionable message
+        // (e.g. "Invalid data found" vs "Server returned 5XX" for a missing
+        // article vs "moov atom not found").
         .args([
             "-v",
-            "quiet",
+            "error",
             "-print_format",
             "json",
             "-show_format",
@@ -78,7 +84,7 @@ pub async fn probe_url(ffprobe_path: &str, url: &str) -> AppResult<ProbeResult> 
         .arg(url)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| {
@@ -96,10 +102,25 @@ pub async fn probe_url(ffprobe_path: &str, url: &str) -> AppResult<ProbeResult> 
         .map_err(|e| AppError::Internal(anyhow::anyhow!("waiting for ffprobe: {e}")))?;
 
     if !output.status.success() {
-        return Err(AppError::Upstream(format!(
-            "ffprobe exited with {} (is the media readable?)",
-            output.status
-        )));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim();
+        // Keep the tail (the last line is usually the actionable one) bounded.
+        let detail: String = detail
+            .chars()
+            .rev()
+            .take(400)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        return Err(AppError::Upstream(if detail.is_empty() {
+            format!(
+                "ffprobe exited with {} (is the media readable?)",
+                output.status
+            )
+        } else {
+            format!("ffprobe exited with {}: {detail}", output.status)
+        }));
     }
 
     let doc: ProbeDoc = serde_json::from_slice(&output.stdout)
