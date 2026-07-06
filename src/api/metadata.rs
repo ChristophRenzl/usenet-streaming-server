@@ -15,7 +15,7 @@ use crate::{
     state::AppState,
     tmdb::{
         client::{ListKind, PagedSearchResults, SearchType, TrendingType, TrendingWindow},
-        models::{Episode, Movie, SearchResult, Season, TvShow},
+        models::{Episode, GenreList, MediaType, Movie, SearchResult, Season, TvShow},
         TmdbClient,
     },
 };
@@ -215,6 +215,70 @@ pub async fn top_rated_tv(
     Ok(Json(client.tv_list(ListKind::TopRated, page).await?.into()))
 }
 
+// ---- Genres + genre-filtered discovery --------------------------------------
+
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct GenresParams {
+    /// Which genre catalog to return: `movie` or `tv`.
+    pub media_type: MediaType,
+}
+
+/// List the TMDB genres for movies or TV shows.
+#[utoipa::path(get, path = "/genres", tag = "metadata",
+    params(GenresParams),
+    responses(
+        (status = 200, body = GenreList),
+        (status = 400, description = "Missing/invalid media_type or TMDB API key not configured"),
+        (status = 502, description = "TMDB upstream error"),
+    ))]
+pub async fn genres(
+    State(state): State<AppState>,
+    Query(params): Query<GenresParams>,
+) -> AppResult<Json<GenreList>> {
+    let client = tmdb_client(&state).await?;
+    let genres = client.genres(params.media_type).await?;
+    Ok(Json(GenreList { genres }))
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct DiscoverParams {
+    /// Which catalog to browse: `movie` or `tv`.
+    pub media_type: MediaType,
+    /// Optional TMDB genre id to filter by (see `GET /genres`). Omit to
+    /// discover without a genre filter.
+    pub genre_id: Option<i64>,
+    /// 1-based page (defaults to 1).
+    pub page: Option<u32>,
+    /// TMDB sort order (defaults to `popularity.desc`); passed through as-is.
+    pub sort_by: Option<String>,
+}
+
+/// Discover movies or TV shows, optionally filtered by genre and sorted.
+/// Returns the same paged envelope as `/trending`.
+#[utoipa::path(get, path = "/discover", tag = "metadata",
+    params(DiscoverParams),
+    responses(
+        (status = 200, body = DiscoverResponse),
+        (status = 400, description = "Missing/invalid media_type, bad page or TMDB API key not configured"),
+        (status = 502, description = "TMDB upstream error"),
+    ))]
+pub async fn discover(
+    State(state): State<AppState>,
+    Query(params): Query<DiscoverParams>,
+) -> AppResult<Json<DiscoverResponse>> {
+    let page = validated_page(params.page)?;
+    let client = tmdb_client(&state).await?;
+    let paged = client
+        .discover(
+            params.media_type,
+            params.genre_id,
+            page,
+            params.sort_by.as_deref(),
+        )
+        .await?;
+    Ok(Json(paged.into()))
+}
+
 // ---- Details ----------------------------------------------------------------
 
 /// Movie details (includes IMDb id).
@@ -291,6 +355,8 @@ pub fn router() -> OpenApiRouter<AppState> {
     // (`/movies/{tmdb_id}`) in axum 0.8, so both can coexist.
     OpenApiRouter::new()
         .routes(routes!(search))
+        .routes(routes!(genres))
+        .routes(routes!(discover))
         .routes(routes!(trending))
         .routes(routes!(popular_movies))
         .routes(routes!(top_rated_movies))

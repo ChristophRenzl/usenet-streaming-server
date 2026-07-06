@@ -33,6 +33,19 @@ impl MediaType {
 
 // ---- Clean DTOs ------------------------------------------------------------
 
+/// A TMDB genre (e.g. `{ "id": 28, "name": "Action" }`).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct Genre {
+    pub id: i64,
+    pub name: String,
+}
+
+/// The list of genres for a media type, as returned by `GET /genres`.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct GenreList {
+    pub genres: Vec<Genre>,
+}
+
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct SearchResult {
     pub tmdb_id: i64,
@@ -59,6 +72,10 @@ pub struct Movie {
     pub vote_average: Option<f64>,
     /// ISO 639-1 code of the title's original language (e.g. "ja").
     pub original_language: Option<String>,
+    /// YouTube video key for the best available trailer (build a URL as
+    /// `https://youtube.com/watch?v={key}` or `youtube://{key}`), or `null`
+    /// when TMDB has no YouTube trailer/teaser.
+    pub trailer_youtube_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -75,6 +92,10 @@ pub struct TvShow {
     pub vote_average: Option<f64>,
     /// ISO 639-1 code of the show's original language (e.g. "ja").
     pub original_language: Option<String>,
+    /// YouTube video key for the best available trailer (build a URL as
+    /// `https://youtube.com/watch?v={key}` or `youtube://{key}`), or `null`
+    /// when TMDB has no YouTube trailer/teaser.
+    pub trailer_youtube_key: Option<String>,
     pub seasons: Vec<SeasonSummary>,
 }
 
@@ -109,6 +130,13 @@ pub struct Episode {
 }
 
 // ---- Raw TMDB shapes -------------------------------------------------------
+
+/// TMDB `/genre/{movie,tv}/list` response: `{ "genres": [...] }`.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct RawGenreList {
+    #[serde(default)]
+    pub genres: Vec<Genre>,
+}
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct RawSearchResponse {
@@ -174,6 +202,56 @@ pub(crate) struct RawExternalIds {
     pub tvdb_id: Option<i64>,
 }
 
+/// The `videos` sub-object appended via `append_to_response=videos`.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct RawVideos {
+    #[serde(default)]
+    pub results: Vec<RawVideo>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct RawVideo {
+    #[serde(default)]
+    pub site: Option<String>,
+    #[serde(rename = "type", default)]
+    pub video_type: Option<String>,
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default)]
+    pub official: bool,
+}
+
+/// Pick the best YouTube trailer key from a `videos.results[]` list.
+///
+/// Preference order: an official YouTube "Trailer", then any YouTube
+/// "Trailer", then any YouTube "Teaser". Returns `None` when no suitable
+/// YouTube video exists.
+pub(crate) fn best_trailer_youtube_key(videos: &RawVideos) -> Option<String> {
+    let is_youtube = |v: &&RawVideo| v.site.as_deref() == Some("YouTube") && v.key.is_some();
+    let is_type = |v: &&RawVideo, ty: &str| v.video_type.as_deref() == Some(ty);
+
+    videos
+        .results
+        .iter()
+        // Official YouTube trailer.
+        .find(|v| is_youtube(v) && is_type(v, "Trailer") && v.official)
+        // Any YouTube trailer.
+        .or_else(|| {
+            videos
+                .results
+                .iter()
+                .find(|v| is_youtube(v) && is_type(v, "Trailer"))
+        })
+        // Any YouTube teaser.
+        .or_else(|| {
+            videos
+                .results
+                .iter()
+                .find(|v| is_youtube(v) && is_type(v, "Teaser"))
+        })
+        .and_then(|v| v.key.clone())
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct RawMovieDetails {
     pub id: i64,
@@ -187,6 +265,8 @@ pub(crate) struct RawMovieDetails {
     pub imdb_id: Option<String>,
     pub original_language: Option<String>,
     pub external_ids: Option<RawExternalIds>,
+    #[serde(default)]
+    pub videos: Option<RawVideos>,
 }
 
 impl From<RawMovieDetails> for Movie {
@@ -196,6 +276,7 @@ impl From<RawMovieDetails> for Movie {
             .and_then(|e| e.imdb_id)
             .or(raw.imdb_id)
             .filter(|s| !s.is_empty());
+        let trailer_youtube_key = raw.videos.as_ref().and_then(best_trailer_youtube_key);
         Movie {
             tmdb_id: raw.id,
             media_type: MediaType::Movie,
@@ -208,6 +289,7 @@ impl From<RawMovieDetails> for Movie {
             backdrop_url: image_url(raw.backdrop_path.as_deref(), "w780"),
             vote_average: raw.vote_average,
             original_language: raw.original_language,
+            trailer_youtube_key,
         }
     }
 }
@@ -223,6 +305,8 @@ pub(crate) struct RawTvDetails {
     pub vote_average: Option<f64>,
     pub original_language: Option<String>,
     pub external_ids: Option<RawExternalIds>,
+    #[serde(default)]
+    pub videos: Option<RawVideos>,
     #[serde(default)]
     pub seasons: Vec<RawSeasonSummary>,
 }
@@ -242,6 +326,7 @@ impl From<RawTvDetails> for TvShow {
             .external_ids
             .map(|e| (e.imdb_id.filter(|s| !s.is_empty()), e.tvdb_id))
             .unwrap_or((None, None));
+        let trailer_youtube_key = raw.videos.as_ref().and_then(best_trailer_youtube_key);
         TvShow {
             tmdb_id: raw.id,
             media_type: MediaType::Tv,
@@ -254,6 +339,7 @@ impl From<RawTvDetails> for TvShow {
             backdrop_url: image_url(raw.backdrop_path.as_deref(), "w780"),
             vote_average: raw.vote_average,
             original_language: raw.original_language,
+            trailer_youtube_key,
             seasons: raw
                 .seasons
                 .into_iter()

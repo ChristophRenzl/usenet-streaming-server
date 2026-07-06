@@ -100,7 +100,7 @@ UI, click **Authorize** to set the key for "Try it out".
 | Area | Endpoints |
 |---|---|
 | Search | `GET /search`, `GET /movies/{id}`, `GET /tv/{id}[/season/{n}[/episode/{e}]]` |
-| Discovery | `GET /trending?media_type=all\|movie\|tv&window=day\|week`, `GET /movies/popular`, `GET /movies/top_rated`, `GET /tv/popular`, `GET /tv/top_rated` (all take `?page=`) |
+| Discovery | `GET /trending?media_type=all\|movie\|tv&window=day\|week`, `GET /movies/popular`, `GET /movies/top_rated`, `GET /tv/popular`, `GET /tv/top_rated` (all take `?page=`), `GET /genres?media_type=movie\|tv`, `GET /discover?media_type=movie\|tv[&genre_id=…][&page=…][&sort_by=popularity.desc]` |
 | Watchlist | `GET/POST /watchlist`, `GET /watchlist/status?tmdb_id=…&media_type=…`, `DELETE /watchlist/{tmdb_id}?media_type=…` |
 | Releases | `GET /releases?tmdb_id=…[&max_resolution=…]` — ranked candidates for manual override; `max_resolution` caps quality to what the device supports (also accepted in `POST /stream/sessions` and `POST /downloads` bodies) |
 | Streaming | `POST /stream/sessions`, `GET /stream/{id}/master.m3u8`, `GET /stream/{id}/raw` (byte ranges), `DELETE /stream/{id}` |

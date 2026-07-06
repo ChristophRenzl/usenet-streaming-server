@@ -131,7 +131,7 @@ async fn movie_details_extracts_imdb_id_from_external_ids() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/movie/27205"))
-        .and(query_param("append_to_response", "external_ids"))
+        .and(query_param("append_to_response", "external_ids,videos"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "adult": false,
             "backdrop_path": "/xJHokMbljvjADYdit5fK5VQsXEG.jpg",
@@ -171,7 +171,7 @@ async fn tv_details_include_tvdb_id_and_seasons() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/tv/1396"))
-        .and(query_param("append_to_response", "external_ids"))
+        .and(query_param("append_to_response", "external_ids,videos"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "id": 1396,
             "name": "Breaking Bad",
@@ -328,4 +328,169 @@ async fn tmdb_5xx_maps_to_upstream() {
         AppError::Upstream(msg) => assert!(msg.contains("503"), "msg: {msg}"),
         other => panic!("expected Upstream, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn movie_details_pick_official_youtube_trailer_over_teaser() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/movie/27205"))
+        .and(query_param("append_to_response", "external_ids,videos"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 27205,
+            "title": "Inception",
+            "release_date": "2010-07-15",
+            "videos": {
+                "results": [
+                    {
+                        "site": "YouTube",
+                        "type": "Teaser",
+                        "key": "teaser_key",
+                        "official": true,
+                        "name": "Teaser Trailer"
+                    },
+                    {
+                        "site": "YouTube",
+                        "type": "Trailer",
+                        "key": "unofficial_key",
+                        "official": false,
+                        "name": "Fan Trailer"
+                    },
+                    {
+                        "site": "Vimeo",
+                        "type": "Trailer",
+                        "key": "vimeo_key",
+                        "official": true,
+                        "name": "Vimeo Trailer"
+                    },
+                    {
+                        "site": "YouTube",
+                        "type": "Trailer",
+                        "key": "official_key",
+                        "official": true,
+                        "name": "Official Trailer"
+                    }
+                ]
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let movie = client(&server)
+        .movie_details(27205)
+        .await
+        .expect("details must succeed");
+    assert_eq!(
+        movie.trailer_youtube_key.as_deref(),
+        Some("official_key"),
+        "official YouTube Trailer must win over teaser/unofficial/non-YouTube"
+    );
+}
+
+#[tokio::test]
+async fn tv_details_fall_back_to_teaser_when_no_trailer() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/tv/1396"))
+        .and(query_param("append_to_response", "external_ids,videos"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 1396,
+            "name": "Breaking Bad",
+            "first_air_date": "2008-01-20",
+            "videos": {
+                "results": [
+                    { "site": "YouTube", "type": "Teaser", "key": "teaser_key", "official": false },
+                    { "site": "YouTube", "type": "Clip", "key": "clip_key", "official": true }
+                ]
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let show = client(&server).tv_details(1396).await.expect("tv details");
+    assert_eq!(
+        show.trailer_youtube_key.as_deref(),
+        Some("teaser_key"),
+        "with no Trailer, the first YouTube Teaser is used"
+    );
+}
+
+#[tokio::test]
+async fn movie_details_without_videos_have_no_trailer_key() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/movie/603"))
+        .and(query_param("append_to_response", "external_ids,videos"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 603,
+            "title": "The Matrix",
+            "release_date": "1999-03-31"
+        })))
+        .mount(&server)
+        .await;
+
+    let movie = client(&server).movie_details(603).await.expect("details");
+    assert!(movie.trailer_youtube_key.is_none());
+}
+
+#[tokio::test]
+async fn genres_map_movie_list() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/genre/movie/list"))
+        .and(query_param("api_key", "test-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "genres": [
+                { "id": 28, "name": "Action" },
+                { "id": 35, "name": "Comedy" }
+            ]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let genres = client(&server)
+        .genres(MediaType::Movie)
+        .await
+        .expect("genres must succeed");
+    assert_eq!(genres.len(), 2);
+    assert_eq!(genres[0].id, 28);
+    assert_eq!(genres[0].name, "Action");
+    assert_eq!(genres[1].id, 35);
+}
+
+#[tokio::test]
+async fn discover_passes_genre_page_and_sort() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/discover/tv"))
+        .and(query_param("with_genres", "28"))
+        .and(query_param("page", "2"))
+        .and(query_param("sort_by", "vote_average.desc"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "page": 2,
+            "results": [{
+                "id": 1396,
+                "name": "Breaking Bad",
+                "first_air_date": "2008-01-20",
+                "poster_path": "/p.jpg",
+                "vote_average": 8.9
+            }],
+            "total_pages": 7,
+            "total_results": 140
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let paged = client(&server)
+        .discover(MediaType::Tv, Some(28), Some(2), Some("vote_average.desc"))
+        .await
+        .expect("discover must succeed");
+    assert_eq!(paged.page, 2);
+    assert_eq!(paged.total_pages, 7);
+    assert_eq!(paged.results.len(), 1);
+    // /discover/tv omits media_type; the client stamps it.
+    assert_eq!(paged.results[0].media_type, MediaType::Tv);
+    assert_eq!(paged.results[0].title, "Breaking Bad");
 }

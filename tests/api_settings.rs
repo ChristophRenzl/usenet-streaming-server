@@ -297,3 +297,42 @@ async fn app_settings_mask_the_tmdb_key() {
         .await;
     assert!(!response.text().contains("abcdef7890wxyz"));
 }
+
+#[tokio::test]
+async fn app_settings_trim_surrounding_whitespace_on_keys() {
+    let server = server().await;
+
+    // A pasted key/username with surrounding whitespace and a trailing newline
+    // (e.g. copied from a webpage) must be stored trimmed, otherwise the
+    // trailing bytes corrupt the OpenSubtitles Api-Key header (301/403).
+    let response = server
+        .put("/api/v1/settings/app")
+        .add_header("x-api-key", API_KEY)
+        .json(&json!({
+            "tmdb_api_key": "  abcdef7890wxyz\n",
+            "opensubtitles_api_key": "\topensubs1234\n",
+            "opensubtitles_username": "  alice \n"
+        }))
+        .await;
+    assert_eq!(response.status_code(), 200);
+    let settings: Value = response.json();
+
+    // If the key were stored untrimmed, mask_secret would surface the trailing
+    // "\n" in the last four characters instead of the real tail.
+    assert_eq!(
+        settings["tmdb_api_key"],
+        json!("****wxyz"),
+        "tmdb key must be trimmed before storage"
+    );
+    assert_eq!(
+        settings["opensubtitles_api_key"],
+        json!("****1234"),
+        "opensubtitles key must be trimmed before storage"
+    );
+    // Username is reported verbatim (not masked); it must come back trimmed.
+    assert_eq!(
+        settings["opensubtitles_username"],
+        json!("alice"),
+        "opensubtitles username must be trimmed before storage"
+    );
+}

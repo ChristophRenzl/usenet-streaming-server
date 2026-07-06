@@ -12,8 +12,8 @@ use utoipa::ToSchema;
 use crate::error::{AppError, AppResult};
 
 use super::models::{
-    Episode, MediaType, Movie, RawEpisode, RawMovieDetails, RawSearchResponse, RawSeasonDetails,
-    RawTvDetails, SearchResult, Season, TvShow,
+    Episode, Genre, MediaType, Movie, RawEpisode, RawGenreList, RawMovieDetails, RawSearchResponse,
+    RawSeasonDetails, RawTvDetails, SearchResult, Season, TvShow,
 };
 
 /// Search scope for [`TmdbClient::search`].
@@ -230,23 +230,66 @@ impl TmdbClient {
         .await
     }
 
-    /// Movie details including the IMDb id (via `append_to_response=external_ids`).
+    /// Genre list for a media type: `/genre/movie/list` or `/genre/tv/list`.
+    pub async fn genres(&self, media_type: MediaType) -> AppResult<Vec<Genre>> {
+        let raw: RawGenreList = self
+            .get_json(&format!("/genre/{}/list", media_type.as_str()), &[])
+            .await?;
+        Ok(raw.genres)
+    }
+
+    /// Discover movies or TV shows, optionally filtered by genre and sorted.
+    /// Maps `/discover/movie` or `/discover/tv` with `with_genres`, `page` and
+    /// `sort_by` (TMDB default `popularity.desc` when `sort_by` is `None`).
+    pub async fn discover(
+        &self,
+        media_type: MediaType,
+        genre_id: Option<i64>,
+        page: Option<u32>,
+        sort_by: Option<&str>,
+    ) -> AppResult<PagedSearchResults> {
+        let mut params = Vec::new();
+        if let Some(genre_id) = genre_id {
+            params.push(("with_genres", genre_id.to_string()));
+        }
+        if let Some(page) = page {
+            params.push(("page", page.to_string()));
+        }
+        if let Some(sort_by) = sort_by {
+            params.push(("sort_by", sort_by.to_string()));
+        }
+        let path = format!("/discover/{}", media_type.as_str());
+        let raw: RawSearchResponse = self.get_json(&path, &params).await?;
+        Ok(PagedSearchResults {
+            page: raw.page,
+            total_pages: raw.total_pages,
+            results: raw
+                .results
+                .into_iter()
+                .filter_map(|item| item.into_result(Some(media_type)))
+                .collect(),
+        })
+    }
+
+    /// Movie details including the IMDb id and best YouTube trailer key (via
+    /// `append_to_response=external_ids,videos`).
     pub async fn movie_details(&self, tmdb_id: i64) -> AppResult<Movie> {
         let raw: RawMovieDetails = self
             .get_json(
                 &format!("/movie/{tmdb_id}"),
-                &[("append_to_response", "external_ids".to_string())],
+                &[("append_to_response", "external_ids,videos".to_string())],
             )
             .await?;
         Ok(raw.into())
     }
 
-    /// TV show details including external ids (IMDb/TVDB) and the season list.
+    /// TV show details including external ids (IMDb/TVDB), the best YouTube
+    /// trailer key and the season list (via `append_to_response=external_ids,videos`).
     pub async fn tv_details(&self, tmdb_id: i64) -> AppResult<TvShow> {
         let raw: RawTvDetails = self
             .get_json(
                 &format!("/tv/{tmdb_id}"),
-                &[("append_to_response", "external_ids".to_string())],
+                &[("append_to_response", "external_ids,videos".to_string())],
             )
             .await?;
         Ok(raw.into())

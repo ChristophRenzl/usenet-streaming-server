@@ -232,6 +232,131 @@ async fn popular_and_top_rated_tv_are_mapped() {
 }
 
 #[tokio::test]
+async fn genres_list_is_returned() {
+    let tmdb = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/genre/movie/list"))
+        .and(query_param("api_key", "tmdb-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "genres": [
+                { "id": 28, "name": "Action" },
+                { "id": 878, "name": "Science Fiction" }
+            ]
+        })))
+        .expect(1)
+        .mount(&tmdb)
+        .await;
+    let server = server_with_tmdb(&tmdb).await;
+
+    let response = server
+        .get("/api/v1/genres?media_type=movie")
+        .add_header("x-api-key", API_KEY)
+        .await;
+    assert_eq!(response.status_code(), 200);
+    let body: Value = response.json();
+    let genres = body["genres"].as_array().expect("genres array");
+    assert_eq!(genres.len(), 2);
+    assert_eq!(genres[0]["id"], json!(28));
+    assert_eq!(genres[0]["name"], json!("Action"));
+    assert_eq!(genres[1]["id"], json!(878));
+}
+
+#[tokio::test]
+async fn genres_require_media_type() {
+    let tmdb = MockServer::start().await;
+    let server = server_with_tmdb(&tmdb).await;
+
+    let response = server
+        .get("/api/v1/genres")
+        .add_header("x-api-key", API_KEY)
+        .await;
+    assert_eq!(response.status_code(), 400);
+}
+
+#[tokio::test]
+async fn discover_filters_by_genre_and_returns_paged_envelope() {
+    let tmdb = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/discover/movie"))
+        .and(query_param("with_genres", "28"))
+        .and(query_param("sort_by", "popularity.desc"))
+        .and(query_param("page", "1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "page": 1,
+            "results": [movie_item(27205, "Inception", false)],
+            "total_pages": 12,
+            "total_results": 240
+        })))
+        .expect(1)
+        .mount(&tmdb)
+        .await;
+    let server = server_with_tmdb(&tmdb).await;
+
+    let response = server
+        .get("/api/v1/discover?media_type=movie&genre_id=28&page=1&sort_by=popularity.desc")
+        .add_header("x-api-key", API_KEY)
+        .await;
+    assert_eq!(response.status_code(), 200);
+    let body: Value = response.json();
+    assert_eq!(body["page"], json!(1));
+    assert_eq!(body["total_pages"], json!(12));
+    assert_eq!(body["results"][0]["tmdb_id"], json!(27205));
+    assert_eq!(body["results"][0]["media_type"], json!("movie"));
+    assert_eq!(body["results"][0]["title"], json!("Inception"));
+}
+
+#[tokio::test]
+async fn discover_without_genre_still_works() {
+    let tmdb = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/discover/tv"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "page": 1,
+            "results": [tv_item(1396, "Breaking Bad", false)],
+            "total_pages": 5,
+            "total_results": 100
+        })))
+        .expect(1)
+        .mount(&tmdb)
+        .await;
+    let server = server_with_tmdb(&tmdb).await;
+
+    let response = server
+        .get("/api/v1/discover?media_type=tv")
+        .add_header("x-api-key", API_KEY)
+        .await;
+    assert_eq!(response.status_code(), 200);
+    let body: Value = response.json();
+    assert_eq!(body["results"][0]["media_type"], json!("tv"));
+    assert_eq!(body["results"][0]["title"], json!("Breaking Bad"));
+}
+
+#[tokio::test]
+async fn discover_requires_media_type() {
+    let tmdb = MockServer::start().await;
+    let server = server_with_tmdb(&tmdb).await;
+
+    let response = server
+        .get("/api/v1/discover")
+        .add_header("x-api-key", API_KEY)
+        .await;
+    assert_eq!(response.status_code(), 400);
+}
+
+#[tokio::test]
+async fn discover_page_zero_is_a_bad_request() {
+    let tmdb = MockServer::start().await;
+    let server = server_with_tmdb(&tmdb).await;
+
+    let response = server
+        .get("/api/v1/discover?media_type=movie&page=0")
+        .add_header("x-api-key", API_KEY)
+        .await;
+    assert_eq!(response.status_code(), 400);
+    assert!(response.text().contains("page"));
+}
+
+#[tokio::test]
 async fn page_zero_is_a_bad_request() {
     let tmdb = MockServer::start().await;
     let server = server_with_tmdb(&tmdb).await;
