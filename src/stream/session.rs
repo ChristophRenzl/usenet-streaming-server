@@ -11,11 +11,24 @@ use rand::Rng;
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
+use crate::subtitles::SubtitleTrack;
 use crate::tmdb::models::MediaType;
 use crate::vfs::VirtualFile;
 
 /// How many trailing ffmpeg stderr lines are kept for error reporting.
 const STDERR_TAIL_LINES: usize = 50;
+
+/// Lower-cased primary subtag of a language tag: the part before the first `-`
+/// (`en-US` → `en`, `PT-BR` → `pt`, `de` → `de`). Used to match a manual
+/// offset request's language against an attached track's language.
+fn primary_subtag(language: &str) -> String {
+    language
+        .split('-')
+        .next()
+        .unwrap_or(language)
+        .trim()
+        .to_ascii_lowercase()
+}
 
 /// Lifecycle of a playback session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +61,9 @@ pub struct MediaInfo {
     pub video_codec: Option<String>,
     pub audio_codec: Option<String>,
     pub audio_transcoded: bool,
+    /// Frames per second of the video, when ffprobe reported it. Drives the
+    /// fps-mismatch subtitle rescale.
+    pub fps: Option<f64>,
 }
 
 /// Everything needed to register a new session.
@@ -97,6 +113,9 @@ pub struct Session {
     stderr_tail: Mutex<VecDeque<String>>,
     /// Serializes seek/teardown so kill+wipe+respawn is atomic.
     pub(crate) control: tokio::sync::Mutex<()>,
+    /// External subtitle renditions attached to this session (WebVTT written
+    /// into the temp dir, surfaced via the master playlist).
+    subtitles: Mutex<Vec<SubtitleTrack>>,
 }
 
 impl Session {
@@ -148,11 +167,68 @@ impl Session {
             child: tokio::sync::Mutex::new(None),
             stderr_tail: Mutex::new(VecDeque::new()),
             control: tokio::sync::Mutex::new(()),
+            subtitles: Mutex::new(Vec::new()),
         }))
     }
 
     pub fn playlist_path(&self) -> PathBuf {
         self.temp_dir.join("media.m3u8")
+    }
+
+    /// Snapshot of the attached subtitle renditions.
+    pub fn subtitle_tracks(&self) -> Vec<SubtitleTrack> {
+        self.subtitles.lock().expect("subtitle lock").clone()
+    }
+
+    /// Record an attached subtitle track. Returns the 1-based index it was
+    /// assigned among the tracks of the same language (used to name files).
+    pub fn add_subtitle_track(&self, track: SubtitleTrack) {
+        self.subtitles.lock().expect("subtitle lock").push(track);
+    }
+
+    /// How many subtitle tracks of `language` are already attached (used to
+    /// pick the next `sub_<lang>_<n>` sequence number).
+    pub fn subtitle_count_for(&self, language: &str) -> usize {
+        self.subtitles
+            .lock()
+            .expect("subtitle lock")
+            .iter()
+            .filter(|t| t.language == language)
+            .count()
+    }
+
+    /// Look up an attached subtitle track by its stable `<lang>_<n>` key.
+    pub fn subtitle_track_by_key(&self, key: &str) -> Option<SubtitleTrack> {
+        self.subtitles
+            .lock()
+            .expect("subtitle lock")
+            .iter()
+            .find(|t| t.key == key)
+            .cloned()
+    }
+
+    /// Look up the first attached subtitle track whose language matches
+    /// `language` on its primary subtag, case-insensitively (`en` matches
+    /// `en`, `EN`, and the `en` of `en-US`). This is how the manual-offset
+    /// endpoint addresses a track: by language, targeting the first/selected
+    /// one when several of the same language are attached.
+    pub fn subtitle_track_by_language(&self, language: &str) -> Option<SubtitleTrack> {
+        let want = primary_subtag(language);
+        self.subtitles
+            .lock()
+            .expect("subtitle lock")
+            .iter()
+            .find(|t| primary_subtag(&t.language) == want)
+            .cloned()
+    }
+
+    /// Store a new cumulative manual `offset_ms` on the track with `key`,
+    /// returning the updated track (or `None` when there is no such track).
+    pub fn set_subtitle_offset(&self, key: &str, offset_ms: i64) -> Option<SubtitleTrack> {
+        let mut tracks = self.subtitles.lock().expect("subtitle lock");
+        let track = tracks.iter_mut().find(|t| t.key == key)?;
+        track.offset_ms = offset_ms;
+        Some(track.clone())
     }
 
     /// Set the probe result; only the first call wins.

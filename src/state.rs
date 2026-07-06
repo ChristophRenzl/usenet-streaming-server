@@ -3,8 +3,8 @@ use std::{sync::Arc, time::Duration};
 use anyhow::Context;
 
 use crate::{
-    config::AppConfig, db, download::DownloadManager, nntp::NntpPool, stream::SessionManager, tmdb,
-    vfs::SegmentCache,
+    config::AppConfig, db, download::DownloadManager, nntp::NntpPool, stream::SessionManager,
+    subtitles, tmdb, vfs::SegmentCache,
 };
 
 #[derive(Clone)]
@@ -15,6 +15,12 @@ pub struct AppState {
     pub http: reqwest::Client,
     /// TMDB API base URL; overridable so tests can point at a mock server.
     pub tmdb_base_url: Arc<str>,
+    /// OpenSubtitles API base URL; overridable so tests can point at a mock
+    /// server.
+    pub opensubtitles_base_url: Arc<str>,
+    /// Cached OpenSubtitles user JWT (logging in lifts the download quota).
+    /// Cleared when the stored credentials change or the token is rejected.
+    pub opensubtitles_token: subtitles::TokenCache,
     /// Multi-provider NNTP pool, built from the enabled providers in the DB
     /// and reloaded live when providers change through the API.
     pub nntp_pool: NntpPool,
@@ -67,6 +73,8 @@ impl AppState {
             db,
             http: build_http_client()?,
             tmdb_base_url: tmdb::DEFAULT_BASE_URL.into(),
+            opensubtitles_base_url: subtitles::DEFAULT_BASE_URL.into(),
+            opensubtitles_token: subtitles::TokenCache::default(),
             nntp_pool,
             segment_cache,
             sessions,
@@ -80,6 +88,12 @@ impl AppState {
     /// Point the TMDB client at a different base URL (tests).
     pub fn with_tmdb_base_url(mut self, base_url: &str) -> Self {
         self.tmdb_base_url = base_url.into();
+        self
+    }
+
+    /// Point the OpenSubtitles client at a different base URL (tests).
+    pub fn with_opensubtitles_base_url(mut self, base_url: &str) -> Self {
+        self.opensubtitles_base_url = base_url.into();
         self
     }
 

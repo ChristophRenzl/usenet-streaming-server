@@ -143,6 +143,7 @@ const routes = {
   providers: renderProviders,
   indexers: renderIndexers,
   tmdb: renderTmdb,
+  opensubtitles: renderOpensubtitles,
   preferences: renderPreferences,
   downloads: renderDownloads,
   security: renderSecurity,
@@ -266,6 +267,15 @@ async function renderDashboard(main) {
             tmdbSet ? "Configured — search and artwork work." : "Needed for search, posters and metadata.",
             "#/tmdb",
             "TMDB"
+          )}
+          ${item(
+            !!app.opensubtitles_configured,
+            "OpenSubtitles (optional)",
+            app.opensubtitles_configured
+              ? "Configured — subtitles are searched and auto-attached."
+              : "Optional — add a key to enable automatic subtitles.",
+            "#/opensubtitles",
+            "Subtitles"
           )}
         </ul>
       </div>
@@ -602,6 +612,84 @@ async function renderTmdb(main) {
         body: JSON.stringify({ tmdb_api_key: e.target.key.value.trim() }),
       });
       toast("TMDB key saved.", "success");
+      navigate();
+    } catch (err) {
+      toast(err.message);
+    }
+  });
+}
+
+// ---- OpenSubtitles ------------------------------------------------------------------
+
+async function renderOpensubtitles(main) {
+  const app = await api("/settings/app");
+  main.innerHTML = `
+    ${pageHead("Subtitles", "OpenSubtitles powers automatic subtitle search and delivery. Optional — playback works without it. When set, the server auto-attaches subtitles at playback start (release-accurate moviehash matching, with fps-drift correction) and offers them natively; a manual offset lets you nudge timing.")}
+    <div class="card" style="max-width:560px">
+      <h2>API key</h2>
+      <p class="muted" style="margin-top:0">
+        Current key: ${app.opensubtitles_api_key ? `<code>${esc(app.opensubtitles_api_key)}</code>` : '<span class="chip warn">not set</span>'}
+      </p>
+      <form id="os-key-form">
+        <div class="field">
+          <label>New OpenSubtitles API key</label>
+          <input name="key" required autocomplete="off" placeholder="Paste your OpenSubtitles API key">
+          <span class="hint">Get a free consumer API key at
+            <a href="https://www.opensubtitles.com/consumers" target="_blank" rel="noopener">opensubtitles.com/consumers</a>.</span>
+        </div>
+        <div class="form-actions">
+          <button type="submit" class="btn primary">Save key</button>
+        </div>
+      </form>
+    </div>
+    <div class="card" style="max-width:560px;margin-top:16px">
+      <h2>Account (optional)</h2>
+      <p class="muted" style="margin-top:0">
+        Logging in with an OpenSubtitles account lifts the anonymous daily
+        download quota.
+        ${app.opensubtitles_username ? `Signed in as <code>${esc(app.opensubtitles_username)}</code>.` : '<span class="chip">no account set</span>'}
+        ${app.opensubtitles_password_set ? '<span class="chip accent">password stored</span>' : ""}
+      </p>
+      <form id="os-account-form">
+        <div class="field">
+          <label>Username</label>
+          <input name="username" autocomplete="off" placeholder="OpenSubtitles username (not e-mail)" value="${app.opensubtitles_username ? esc(app.opensubtitles_username) : ""}">
+        </div>
+        <div class="field">
+          <label>Password</label>
+          <input name="password" type="password" autocomplete="off" placeholder="Leave blank to keep the stored password">
+          <span class="hint">Write-only: the stored password is never shown.</span>
+        </div>
+        <div class="form-actions">
+          <button type="submit" class="btn primary">Save account</button>
+        </div>
+      </form>
+    </div>`;
+
+  $("#os-key-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    try {
+      await api("/settings/app", {
+        method: "PUT",
+        body: JSON.stringify({ opensubtitles_api_key: e.target.key.value.trim() }),
+      });
+      toast("OpenSubtitles key saved.", "success");
+      navigate();
+    } catch (err) {
+      toast(err.message);
+    }
+  });
+
+  $("#os-account-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    // Only send fields the user actually touched: username always (may be
+    // cleared), password only when non-empty so blank keeps the stored one.
+    const body = { opensubtitles_username: e.target.username.value.trim() };
+    const password = e.target.password.value;
+    if (password) body.opensubtitles_password = password;
+    try {
+      await api("/settings/app", { method: "PUT", body: JSON.stringify(body) });
+      toast("OpenSubtitles account saved.", "success");
       navigate();
     } catch (err) {
       toast(err.message);

@@ -16,6 +16,9 @@ pub struct ProbeResult {
     pub video_codec: Option<String>,
     pub audio_codec: Option<String>,
     pub audio_channels: Option<i64>,
+    /// Frames per second of the first video stream, when reported. Used to
+    /// correct fps-mismatch drift when attaching external subtitles.
+    pub fps: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -35,6 +38,24 @@ struct ProbeStream {
     codec_type: Option<String>,
     codec_name: Option<String>,
     channels: Option<i64>,
+    /// Rational frame rate `num/den`, e.g. `24000/1001`. `avg_frame_rate` is
+    /// preferred (real average); `r_frame_rate` is the fallback base rate.
+    avg_frame_rate: Option<String>,
+    r_frame_rate: Option<String>,
+}
+
+/// Parse an ffprobe rational frame rate (`num/den`, e.g. `24000/1001`) to fps.
+/// Returns `None` for missing, zero (`0/0`) or unparseable values.
+fn parse_frame_rate(rate: Option<&str>) -> Option<f64> {
+    let rate = rate?.trim();
+    let (num, den) = rate.split_once('/')?;
+    let num: f64 = num.trim().parse().ok()?;
+    let den: f64 = den.trim().parse().ok()?;
+    if den == 0.0 || num == 0.0 {
+        return None;
+    }
+    let fps = num / den;
+    fps.is_finite().then_some(fps)
 }
 
 /// Run `ffprobe -v quiet -print_format json -show_format -show_streams`
@@ -92,11 +113,14 @@ fn parse_probe(doc: ProbeDoc) -> AppResult<ProbeResult> {
     let mut video_codec = None;
     let mut audio_codec = None;
     let mut audio_channels = None;
+    let mut fps = None;
     for stream in &doc.streams {
         match stream.codec_type.as_deref() {
             Some("video") if !has_video => {
                 has_video = true;
                 video_codec = stream.codec_name.clone();
+                fps = parse_frame_rate(stream.avg_frame_rate.as_deref())
+                    .or_else(|| parse_frame_rate(stream.r_frame_rate.as_deref()));
             }
             Some("audio") if audio_codec.is_none() => {
                 audio_codec = stream.codec_name.clone();
@@ -117,6 +141,7 @@ fn parse_probe(doc: ProbeDoc) -> AppResult<ProbeResult> {
         video_codec,
         audio_codec,
         audio_channels,
+        fps,
     })
 }
 
@@ -129,7 +154,7 @@ mod tests {
         let doc: ProbeDoc = serde_json::from_str(
             r#"{
                 "streams": [
-                    {"codec_type": "video", "codec_name": "h264"},
+                    {"codec_type": "video", "codec_name": "h264", "avg_frame_rate": "24000/1001"},
                     {"codec_type": "audio", "codec_name": "ac3", "channels": 6},
                     {"codec_type": "audio", "codec_name": "aac", "channels": 2}
                 ],
@@ -143,6 +168,29 @@ mod tests {
         // First audio stream wins.
         assert_eq!(result.audio_codec.as_deref(), Some("ac3"));
         assert_eq!(result.audio_channels, Some(6));
+        // 24000/1001 ~= 23.976 fps.
+        assert!((result.fps.unwrap() - 23.976).abs() < 0.001);
+    }
+
+    #[test]
+    fn frame_rate_parsing_handles_rationals_and_junk() {
+        assert!((parse_frame_rate(Some("25/1")).unwrap() - 25.0).abs() < 1e-9);
+        assert!((parse_frame_rate(Some("24000/1001")).unwrap() - 23.976).abs() < 0.001);
+        // Zero numerator/denominator and junk yield None.
+        assert_eq!(parse_frame_rate(Some("0/0")), None);
+        assert_eq!(parse_frame_rate(Some("30/0")), None);
+        assert_eq!(parse_frame_rate(Some("nonsense")), None);
+        assert_eq!(parse_frame_rate(None), None);
+    }
+
+    #[test]
+    fn falls_back_to_r_frame_rate_when_avg_missing() {
+        let doc: ProbeDoc = serde_json::from_str(
+            r#"{"streams": [{"codec_type": "video", "codec_name": "h264", "r_frame_rate": "25/1"}]}"#,
+        )
+        .expect("parse");
+        let result = parse_probe(doc).expect("probe");
+        assert!((result.fps.unwrap() - 25.0).abs() < 1e-9);
     }
 
     #[test]

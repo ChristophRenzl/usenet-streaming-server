@@ -104,9 +104,50 @@ UI, click **Authorize** to set the key for "Try it out".
 | Watchlist | `GET/POST /watchlist`, `GET /watchlist/status?tmdb_id=…&media_type=…`, `DELETE /watchlist/{tmdb_id}?media_type=…` |
 | Releases | `GET /releases?tmdb_id=…[&max_resolution=…]` — ranked candidates for manual override; `max_resolution` caps quality to what the device supports (also accepted in `POST /stream/sessions` and `POST /downloads` bodies) |
 | Streaming | `POST /stream/sessions`, `GET /stream/{id}/master.m3u8`, `GET /stream/{id}/raw` (byte ranges), `DELETE /stream/{id}` |
+| Subtitles | `GET /subtitles/search?tmdb_id=…`, `POST /stream/{id}/subtitles` (attach), `POST /stream/{id}/subtitles/{language}/offset` (nudge timing) |
 | Downloads | `POST /downloads`, `GET /downloads[/{id}]`, `DELETE /downloads/{id}` |
 | History | `GET/POST /history`, `DELETE /history/{id}` |
 | Settings | `/settings/preferences`, `/settings/providers`, `/settings/indexers`, `/settings/app` |
+
+## Subtitles
+
+Optional [OpenSubtitles](https://www.opensubtitles.com) integration. Add a free
+consumer API key on the **Subtitles** page of the web UI (or via
+`PUT /api/v1/settings/app` with `opensubtitles_api_key`); an OpenSubtitles
+account (`opensubtitles_username` / `opensubtitles_password`) is optional and
+lifts the anonymous daily download quota. Subtitles are **best-effort and
+non-fatal** — playback works without a key, and any subtitle failure is logged
+and skipped rather than failing the session.
+
+Subtitles are delivered as **HLS `#EXT-X-MEDIA:TYPE=SUBTITLES` renditions**, so
+tvOS AVPlayer offers them natively in its own subtitle menu (each track is a
+single-segment WebVTT converted from the source SubRip). Three things keep the
+timing accurate:
+
+- **moviehash auto-sync (release-accurate).** When a session starts with
+  `subtitle_languages` requested, the server computes the OpenSubtitles/OSDb
+  moviehash of the media file (size + first/last 64 KiB) and passes it to the
+  search. Hash-matched subtitles were timed against *this exact release*, so
+  they line up perfectly and are ranked first.
+- **fps drift correction.** For a chosen subtitle that is *not* hash-matched but
+  reports its own frame rate, cue timestamps are linearly rescaled by
+  `media_fps / subtitle_fps` (media fps comes from ffprobe) to remove the
+  constant drift a frame-rate mismatch causes. Hash-matched subtitles are
+  assumed correct and never rescaled.
+- **manual offset (the nudge fallback).**
+  `POST /api/v1/stream/{session_id}/subtitles/{language}/offset` with body
+  `{"ms": <i64>}` shifts a track's cues (positive = later, negative = earlier;
+  negatives clamp to 0). `{language}` addresses the track by its primary
+  language subtag (case-insensitive: `en` also matches `en-US`). `ms` is an
+  **absolute** offset relative to the original timing — repeated nudges replace
+  the previous offset rather than compounding — and the WebVTT is re-emitted in
+  place (the playlist URI is unchanged, so the player just reloads the track).
+  Returns the updated track, or 404 when no track of that language exists.
+
+The standalone `GET /subtitles/search` stays TMDB-based (no file, so no
+moviehash); hash matching and fps/offset correction apply only in the session
+auto-attach path. A session's attached tracks are reported in the
+`subtitle_tracks` array of the `POST /stream/sessions` response.
 
 ## Configuration
 

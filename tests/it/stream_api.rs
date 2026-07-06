@@ -284,6 +284,8 @@ async fn openapi_documents_streaming_but_not_internal_routes() {
         "/stream/{session_id}/{segment}",
         "/stream/{session_id}/raw",
         "/stream/{session_id}/seek",
+        "/stream/{session_id}/subtitles",
+        "/stream/{session_id}/subtitles/{language}/offset",
     ] {
         assert!(paths.contains_key(documented), "missing {documented}");
     }
@@ -411,6 +413,7 @@ struct HlsStack {
     client: reqwest::Client,
     nntp: MockNntp,
     session_root: tempfile::TempDir,
+    opensubtitles: MockServer,
     _tmdb: MockServer,
     _indexer: MockServer,
     _server: tokio::task::JoinHandle<()>,
@@ -421,6 +424,7 @@ async fn hls_stack(media: &[u8], part_size: usize, tweak: impl FnOnce(&mut AppCo
     let segments = add_yenc_file(&nntp, "media", media, part_size, "movie.mkv");
     let nzb_xml = build_nzb_xml(&[(r#"Movie [1/1] - "movie.mkv" yEnc"#.to_string(), segments)]);
 
+    let opensubtitles = MockServer::start().await;
     let tmdb = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/movie/27205"))
@@ -457,7 +461,8 @@ async fn hls_stack(media: &[u8], part_size: usize, tweak: impl FnOnce(&mut AppCo
     let state = AppState::for_tests(config)
         .await
         .expect("state")
-        .with_tmdb_base_url(&tmdb.uri());
+        .with_tmdb_base_url(&tmdb.uri())
+        .with_opensubtitles_base_url(&opensubtitles.uri());
     let (base, state, server) = spawn_app(state).await;
     let client = reqwest::Client::new();
 
@@ -507,6 +512,7 @@ async fn hls_stack(media: &[u8], part_size: usize, tweak: impl FnOnce(&mut AppCo
         client,
         nntp,
         session_root,
+        opensubtitles,
         _tmdb: tmdb,
         _indexer: indexer,
         _server: server,
@@ -524,11 +530,17 @@ impl HlsStack {
     }
 
     async fn create_session(&self) -> Value {
+        self.create_session_body(json!({ "tmdb_id": 27205, "media_type": "movie" }))
+            .await
+    }
+
+    /// Create a session from an arbitrary request body (200 asserted).
+    async fn create_session_body(&self, body: Value) -> Value {
         let response = self
             .client
             .post(format!("{}/api/v1/stream/sessions", self.base))
             .header("x-api-key", API_KEY)
-            .json(&json!({ "tmdb_id": 27205, "media_type": "movie" }))
+            .json(&body)
             .send()
             .await
             .expect("POST session");
@@ -536,6 +548,58 @@ impl HlsStack {
         let body: Value = response.json().await.expect("session json");
         assert_eq!(status, 200, "session creation failed: {body}");
         body
+    }
+
+    /// Configure the OpenSubtitles API key and mount a mock search (returning
+    /// one hash-matched English subtitle) plus the two-step download (link +
+    /// CDN bytes) on the `opensubtitles` mock server, so the session
+    /// auto-attach path finds and downloads a subtitle.
+    async fn setup_opensubtitles(&self, srt: &str) {
+        let response = self
+            .client
+            .put(format!("{}/api/v1/settings/app", self.base))
+            .header("x-api-key", API_KEY)
+            .json(&json!({ "opensubtitles_api_key": "os-key-1234" }))
+            .send()
+            .await
+            .expect("PUT os key");
+        assert_eq!(response.status(), 200);
+
+        // Search: one English, moviehash-matched subtitle (so no fps rescale).
+        Mock::given(method("GET"))
+            .and(path("/subtitles"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{
+                    "id": "sub-en",
+                    "attributes": {
+                        "language": "en",
+                        "release": "Test.Movie.2026.1080p.BluRay",
+                        "download_count": 1234,
+                        "hearing_impaired": false,
+                        "ai_translated": false,
+                        "moviehash_match": true,
+                        "files": [{ "file_id": 555, "file_name": "sub.srt" }]
+                    }
+                }]
+            })))
+            .mount(&self.opensubtitles)
+            .await;
+
+        // Download link → CDN bytes (the SRT itself).
+        let cdn_link = format!("{}/cdn/sub.srt", self.opensubtitles.uri());
+        Mock::given(method("POST"))
+            .and(path("/download"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "link": cdn_link,
+                "remaining": 99
+            })))
+            .mount(&self.opensubtitles)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/cdn/sub.srt"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(srt.to_string()))
+            .mount(&self.opensubtitles)
+            .await;
     }
 
     /// Poll the status endpoint until the state is one of `accept`.
@@ -870,4 +934,159 @@ async fn seek_beyond_frontier_restarts_ffmpeg() {
     assert_eq!(response.status(), 200);
     let seek: Value = response.json().await.expect("seek json");
     assert_eq!(seek["restarted"], false);
+}
+
+// ---- Subtitles: auto-attach, HLS rendition and manual offset -----------------------
+
+/// Parse the first cue's start timestamp (seconds) from a WebVTT document.
+fn first_cue_start_secs(vtt: &str) -> f64 {
+    let timing = vtt
+        .lines()
+        .find(|l| l.contains("-->"))
+        .expect("a cue timing line");
+    let start = timing.split("-->").next().unwrap().trim();
+    // HH:MM:SS.mmm
+    let (hms, ms) = start.split_once('.').expect("fractional seconds");
+    let mut parts = hms.split(':').map(|p| p.parse::<f64>().unwrap());
+    let h = parts.next().unwrap();
+    let m = parts.next().unwrap();
+    let s = parts.next().unwrap();
+    h * 3600.0 + m * 60.0 + s + ms.parse::<f64>().unwrap() / 1000.0
+}
+
+#[tokio::test]
+async fn hls_auto_attaches_subtitle_and_manual_offset_shifts_cues() {
+    if !ffmpeg_available() {
+        eprintln!("skipping hls_auto_attaches_subtitle_and_manual_offset_shifts_cues: ffmpeg/ffprobe not found");
+        return;
+    }
+    let media_dir = tempfile::tempdir().expect("media dir");
+    let media_path = generate_media(media_dir.path(), 10, 24, &["-c:a", "ac3", "-b:a", "96k"])
+        .expect("generate test media");
+    let media = std::fs::read(&media_path).expect("read media");
+
+    let stack = hls_stack(&media, 64 * 1024, |_| {}).await;
+    // A subtitle whose first cue starts at 5.000s.
+    let srt = "1\r\n00:00:05,000 --> 00:00:07,000\r\nHello subtitle\r\n";
+    stack.setup_opensubtitles(srt).await;
+
+    // Start a session asking for English subtitles: the server searches
+    // OpenSubtitles (with the media's moviehash), downloads and attaches it.
+    let created = stack
+        .create_session_body(json!({
+            "tmdb_id": 27205,
+            "media_type": "movie",
+            "subtitle_languages": ["en"]
+        }))
+        .await;
+    let id = created["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    // The session response advertises the attached subtitle track.
+    let tracks = created["subtitle_tracks"]
+        .as_array()
+        .expect("subtitle_tracks");
+    assert_eq!(tracks.len(), 1, "one English track attached: {created}");
+    assert_eq!(tracks[0]["language"], "en");
+    assert_eq!(tracks[0]["default"], true, "first track is default");
+    let playlist_url = tracks[0]["playlist_url"].as_str().expect("playlist_url");
+    assert_eq!(playlist_url, format!("/api/v1/stream/{id}/sub_en_1.m3u8"));
+
+    // The master playlist advertises the subtitle rendition for AVPlayer.
+    let master = stack
+        .get(&format!("/api/v1/stream/{id}/master.m3u8"))
+        .await
+        .text()
+        .await
+        .expect("master");
+    assert!(
+        master.contains("#EXT-X-MEDIA:TYPE=SUBTITLES"),
+        "master must advertise subtitles:\n{master}"
+    );
+    assert!(master.contains("LANGUAGE=\"en\""), "master:\n{master}");
+    assert!(master.contains("SUBTITLES=\"subs\""), "variant:\n{master}");
+
+    // The served WebVTT has the cue at its original 5.000s (hash-matched, so
+    // no fps rescale).
+    let vtt = stack
+        .get(&format!("/api/v1/stream/{id}/sub_en_1.vtt"))
+        .await
+        .text()
+        .await
+        .expect("vtt");
+    assert!(vtt.starts_with("WEBVTT"), "vtt:\n{vtt}");
+    assert!(vtt.contains("Hello subtitle"));
+    assert!(
+        (first_cue_start_secs(&vtt) - 5.0).abs() < 0.01,
+        "cue at 5s:\n{vtt}"
+    );
+
+    // Nudge the subtitle +2000ms via the manual offset endpoint (addressed by
+    // language). The cue moves from 5.000s to 7.000s.
+    let response = stack
+        .client
+        .post(format!(
+            "{}/api/v1/stream/{id}/subtitles/en/offset",
+            stack.base
+        ))
+        .header("x-api-key", API_KEY)
+        .json(&json!({ "ms": 2000 }))
+        .send()
+        .await
+        .expect("POST offset");
+    assert_eq!(response.status(), 200);
+    let updated: Value = response.json().await.expect("offset json");
+    assert_eq!(updated["language"], "en");
+
+    let vtt = stack
+        .get(&format!("/api/v1/stream/{id}/sub_en_1.vtt"))
+        .await
+        .text()
+        .await
+        .expect("vtt after offset");
+    assert!(vtt.starts_with("WEBVTT"), "still valid vtt:\n{vtt}");
+    assert!(
+        (first_cue_start_secs(&vtt) - 7.0).abs() < 0.01,
+        "cue moved to 7s:\n{vtt}"
+    );
+
+    // Offset is absolute, not cumulative: re-sending +2000 keeps it at 7s.
+    let response = stack
+        .client
+        .post(format!(
+            "{}/api/v1/stream/{id}/subtitles/en/offset",
+            stack.base
+        ))
+        .header("x-api-key", API_KEY)
+        .json(&json!({ "ms": 2000 }))
+        .send()
+        .await
+        .expect("POST offset again");
+    assert_eq!(response.status(), 200);
+    let vtt = stack
+        .get(&format!("/api/v1/stream/{id}/sub_en_1.vtt"))
+        .await
+        .text()
+        .await
+        .expect("vtt after repeat offset");
+    assert!(
+        (first_cue_start_secs(&vtt) - 7.0).abs() < 0.01,
+        "absolute offset does not compound:\n{vtt}"
+    );
+
+    // Unknown language → 404.
+    let response = stack
+        .client
+        .post(format!(
+            "{}/api/v1/stream/{id}/subtitles/zz/offset",
+            stack.base
+        ))
+        .header("x-api-key", API_KEY)
+        .json(&json!({ "ms": 100 }))
+        .send()
+        .await
+        .expect("POST offset unknown lang");
+    assert_eq!(response.status(), 404);
 }

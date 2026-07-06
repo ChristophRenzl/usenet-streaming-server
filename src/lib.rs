@@ -10,6 +10,7 @@ pub mod rar;
 pub mod release;
 pub mod state;
 pub mod stream;
+pub mod subtitles;
 pub mod tmdb;
 pub mod vfs;
 
