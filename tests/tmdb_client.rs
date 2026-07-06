@@ -131,7 +131,10 @@ async fn movie_details_extracts_imdb_id_from_external_ids() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/movie/27205"))
-        .and(query_param("append_to_response", "external_ids,videos,credits"))
+        .and(query_param(
+            "append_to_response",
+            "external_ids,videos,credits",
+        ))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "adult": false,
             "backdrop_path": "/xJHokMbljvjADYdit5fK5VQsXEG.jpg",
@@ -171,7 +174,10 @@ async fn tv_details_include_tvdb_id_and_seasons() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/tv/1396"))
-        .and(query_param("append_to_response", "external_ids,videos,credits"))
+        .and(query_param(
+            "append_to_response",
+            "external_ids,videos,credits",
+        ))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "id": 1396,
             "name": "Breaking Bad",
@@ -335,7 +341,10 @@ async fn movie_details_pick_official_youtube_trailer_over_teaser() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/movie/27205"))
-        .and(query_param("append_to_response", "external_ids,videos,credits"))
+        .and(query_param(
+            "append_to_response",
+            "external_ids,videos,credits",
+        ))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "id": 27205,
             "title": "Inception",
@@ -392,7 +401,10 @@ async fn tv_details_fall_back_to_teaser_when_no_trailer() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/tv/1396"))
-        .and(query_param("append_to_response", "external_ids,videos,credits"))
+        .and(query_param(
+            "append_to_response",
+            "external_ids,videos,credits",
+        ))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "id": 1396,
             "name": "Breaking Bad",
@@ -420,7 +432,10 @@ async fn movie_details_without_videos_have_no_trailer_key() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/movie/603"))
-        .and(query_param("append_to_response", "external_ids,videos,credits"))
+        .and(query_param(
+            "append_to_response",
+            "external_ids,videos,credits",
+        ))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "id": 603,
             "title": "The Matrix",

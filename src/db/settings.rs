@@ -24,6 +24,16 @@ pub const OPENSUBTITLES_PASSWORD: &str = "opensubtitles_password";
 /// file / environment (the latter stays valid as a recovery path).
 pub const API_KEY_OVERRIDE: &str = "api_key_override";
 
+/// Trakt API app credentials (the user's own Trakt application) and the OAuth
+/// token pair from the device-code link. All optional: Trakt sync is a
+/// best-effort side feature.
+pub const TRAKT_CLIENT_ID: &str = "trakt_client_id";
+pub const TRAKT_CLIENT_SECRET: &str = "trakt_client_secret";
+pub const TRAKT_ACCESS_TOKEN: &str = "trakt_access_token";
+pub const TRAKT_REFRESH_TOKEN: &str = "trakt_refresh_token";
+/// Unix-seconds expiry of [`TRAKT_ACCESS_TOKEN`].
+pub const TRAKT_EXPIRES_AT: &str = "trakt_expires_at";
+
 pub async fn get(pool: &SqlitePool, key: &str) -> AppResult<Option<String>> {
     let value: Option<(String,)> = sqlx::query_as("SELECT value FROM app_settings WHERE key = ?")
         .bind(key)

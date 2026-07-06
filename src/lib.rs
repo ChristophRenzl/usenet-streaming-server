@@ -12,6 +12,7 @@ pub mod state;
 pub mod stream;
 pub mod subtitles;
 pub mod tmdb;
+pub mod trakt;
 pub mod vfs;
 
 use std::net::SocketAddr;

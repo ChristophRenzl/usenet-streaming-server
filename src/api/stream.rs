@@ -876,6 +876,9 @@ async fn start_streamable_session(
     )
     .await?;
 
+    // Best-effort Trakt scrobble; a Trakt problem never affects playback.
+    super::trakt::spawn_scrobble(state, &session, crate::trakt::ScrobbleAction::Start);
+
     Ok(session)
 }
 
@@ -978,6 +981,9 @@ async fn start_disk_session(
         },
     )
     .await?;
+
+    // Best-effort Trakt scrobble; a Trakt problem never affects playback.
+    super::trakt::spawn_scrobble(state, &session, crate::trakt::ScrobbleAction::Start);
 
     // Best-effort auto-subtitles: never fails the session.
     auto_attach_subtitles(state, &session, subtitle_languages).await;
@@ -1179,7 +1185,13 @@ pub async fn delete_session(
     State(state): State<AppState>,
     Path(session_id): Path<Uuid>,
 ) -> AppResult<StatusCode> {
+    // Grab the session before teardown removes it, so the final Trakt
+    // scrobble (stop, with the last reported progress) can still fire.
+    let session = state.sessions.get(&session_id);
     if state.sessions.teardown(&session_id).await {
+        if let Some(session) = session {
+            super::trakt::spawn_scrobble(&state, &session, crate::trakt::ScrobbleAction::Stop);
+        }
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(AppError::NotFound(format!("session {session_id}")))

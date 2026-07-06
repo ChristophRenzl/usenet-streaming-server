@@ -8,6 +8,7 @@ pub mod settings;
 pub mod stream;
 pub mod subtitles;
 pub mod system;
+pub mod trakt;
 pub mod watchlist;
 pub mod webui;
 
@@ -79,6 +80,7 @@ pub fn router(state: AppState) -> Router {
         .merge(downloads::router())
         .merge(history::router())
         .merge(settings::router())
+        .merge(trakt::router())
         .split_for_parts();
 
     let api_router = api_router.layer(middleware::from_fn_with_state(
