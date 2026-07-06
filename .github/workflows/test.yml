@@ -10,15 +10,15 @@ env:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: docker
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Install ffmpeg, par2 and chromaprint (fpcalc)
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg par2 libchromaprint-tools
+      - name: Install ffmpeg and par2
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg par2
       - name: Format
         run: cargo fmt --check
       - name: Clippy
