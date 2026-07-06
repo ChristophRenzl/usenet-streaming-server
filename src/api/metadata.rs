@@ -289,6 +289,47 @@ pub async fn genres(
     Ok(Json(GenreList { genres }))
 }
 
+/// Movies similar to one movie (TMDB recommendations), for the "More Like
+/// This" row on the detail screen.
+#[utoipa::path(get, path = "/movies/{tmdb_id}/similar", tag = "metadata",
+    params(("tmdb_id" = i64, Path, description = "TMDB movie id")),
+    responses(
+        (status = 200, body = DiscoverResponse),
+        (status = 400, description = "TMDB API key not configured"),
+        (status = 502, description = "TMDB upstream error"),
+    ))]
+pub async fn similar_movies(
+    State(state): State<AppState>,
+    Path(tmdb_id): Path<i64>,
+) -> AppResult<Json<DiscoverResponse>> {
+    let client = tmdb_client(&state).await?;
+    Ok(Json(
+        client
+            .recommendations(MediaType::Movie, tmdb_id)
+            .await?
+            .into(),
+    ))
+}
+
+/// Shows similar to one show (TMDB recommendations), for the "More Like
+/// This" row on the detail screen.
+#[utoipa::path(get, path = "/tv/{tmdb_id}/similar", tag = "metadata",
+    params(("tmdb_id" = i64, Path, description = "TMDB show id")),
+    responses(
+        (status = 200, body = DiscoverResponse),
+        (status = 400, description = "TMDB API key not configured"),
+        (status = 502, description = "TMDB upstream error"),
+    ))]
+pub async fn similar_tv(
+    State(state): State<AppState>,
+    Path(tmdb_id): Path<i64>,
+) -> AppResult<Json<DiscoverResponse>> {
+    let client = tmdb_client(&state).await?;
+    Ok(Json(
+        client.recommendations(MediaType::Tv, tmdb_id).await?.into(),
+    ))
+}
+
 /// A movie collection ("saga"): its member movies in release order, for the
 /// Collection button on movies that belong to one.
 #[utoipa::path(get, path = "/collections/{id}", tag = "metadata",
@@ -453,4 +494,6 @@ pub fn router() -> OpenApiRouter<AppState> {
         .routes(routes!(episode_details))
         .routes(routes!(collection_details))
         .routes(routes!(person_details))
+        .routes(routes!(similar_movies))
+        .routes(routes!(similar_tv))
 }

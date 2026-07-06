@@ -303,6 +303,25 @@ impl TmdbClient {
         Ok(raw.into())
     }
 
+    /// Titles similar to one movie/show (TMDB recommendations, page 1) — the
+    /// "More Like This" row on detail screens.
+    pub async fn recommendations(
+        &self,
+        media_type: MediaType,
+        tmdb_id: i64,
+    ) -> AppResult<PagedSearchResults> {
+        let segment = match media_type {
+            MediaType::Movie => "movie",
+            MediaType::Tv => "tv",
+        };
+        self.paged_list(
+            &format!("/{segment}/{tmdb_id}/recommendations"),
+            Some(media_type),
+            None,
+        )
+        .await
+    }
+
     /// A movie collection ("saga") with its member movies in release order.
     pub async fn collection(&self, id: i64) -> AppResult<Collection> {
         let raw: RawCollection = self.get_json(&format!("/collection/{id}"), &[]).await?;
