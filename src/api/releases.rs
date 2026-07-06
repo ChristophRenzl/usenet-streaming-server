@@ -109,11 +109,14 @@ pub async fn resolve_candidates(
 }
 
 /// Pick the candidates to actually try: the guid-pinned release when given,
-/// otherwise the top `max_attempts` accepted ones in rank order. Shared by
-/// session creation and download jobs.
+/// otherwise the top `max_attempts` accepted ones in rank order. When
+/// `preferred_title` names an accepted candidate (the release last watched
+/// for this item), it is moved to the front so resuming reuses the same
+/// release. Shared by session creation and download jobs.
 pub fn pick_candidates(
     candidates: &[RankedRelease],
     release_guid: Option<&str>,
+    preferred_title: Option<&str>,
     max_attempts: usize,
 ) -> AppResult<Vec<RankedRelease>> {
     let to_try: Vec<RankedRelease> = match release_guid {
@@ -125,12 +128,28 @@ pub fn pick_candidates(
                 .ok_or_else(|| AppError::NotFound(format!("release with guid '{guid}'")))?;
             vec![chosen]
         }
-        None => candidates
-            .iter()
-            .filter(|c| c.rejected.is_none())
-            .take(max_attempts)
-            .cloned()
-            .collect(),
+        None => {
+            let mut accepted: Vec<RankedRelease> = candidates
+                .iter()
+                .filter(|c| c.rejected.is_none())
+                .take(max_attempts)
+                .cloned()
+                .collect();
+            // The last-watched release wins over the ranking, even when it
+            // fell below the top `max_attempts` cut in a fresh search.
+            if let Some(title) = preferred_title {
+                if let Some(index) = accepted.iter().position(|c| c.raw.title == title) {
+                    accepted[..=index].rotate_right(1);
+                } else if let Some(preferred) = candidates
+                    .iter()
+                    .find(|c| c.rejected.is_none() && c.raw.title == title)
+                {
+                    accepted.insert(0, preferred.clone());
+                    accepted.truncate(max_attempts);
+                }
+            }
+            accepted
+        }
     };
     if to_try.is_empty() {
         return Err(AppError::NoRelease(
@@ -188,4 +207,73 @@ pub async fn find_releases(
 
 pub fn router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new().routes(routes!(find_releases))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::release::parse::parse_release_name;
+
+    fn candidate(title: &str, score: i64, rejected: Option<&str>) -> RankedRelease {
+        RankedRelease {
+            raw: crate::indexer::RawRelease {
+                title: title.into(),
+                guid: format!("guid-{title}"),
+                nzb_url: format!("https://x/{title}.nzb"),
+                size_bytes: None,
+                posted_at: None,
+                indexer_id: 1,
+                indexer_name: "test".into(),
+            },
+            parsed: parse_release_name(title),
+            score,
+            rejected: rejected.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn preferred_title_moves_to_front_keeping_rank_order_behind_it() {
+        let candidates = vec![
+            candidate("A", 30, None),
+            candidate("B", 20, None),
+            candidate("C", 10, None),
+        ];
+        let picked = pick_candidates(&candidates, None, Some("B"), 5).unwrap();
+        let titles: Vec<&str> = picked.iter().map(|c| c.raw.title.as_str()).collect();
+        assert_eq!(titles, ["B", "A", "C"]);
+    }
+
+    #[test]
+    fn preferred_title_below_the_attempt_cut_is_still_tried_first() {
+        let candidates = vec![
+            candidate("A", 30, None),
+            candidate("B", 20, None),
+            candidate("C", 10, None),
+        ];
+        let picked = pick_candidates(&candidates, None, Some("C"), 2).unwrap();
+        let titles: Vec<&str> = picked.iter().map(|c| c.raw.title.as_str()).collect();
+        assert_eq!(titles, ["C", "A"]);
+    }
+
+    #[test]
+    fn unknown_or_rejected_preferred_title_changes_nothing() {
+        let candidates = vec![
+            candidate("A", 30, None),
+            candidate("B", 20, Some("blocked term")),
+            candidate("C", 10, None),
+        ];
+        for preferred in [Some("Gone"), Some("B"), None] {
+            let picked = pick_candidates(&candidates, None, preferred, 5).unwrap();
+            let titles: Vec<&str> = picked.iter().map(|c| c.raw.title.as_str()).collect();
+            assert_eq!(titles, ["A", "C"]);
+        }
+    }
+
+    #[test]
+    fn guid_pin_ignores_the_preferred_title() {
+        let candidates = vec![candidate("A", 30, None), candidate("B", 20, None)];
+        let picked = pick_candidates(&candidates, Some("guid-B"), Some("A"), 5).unwrap();
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].raw.title, "B");
+    }
 }

@@ -5,6 +5,21 @@ use sqlx::SqlitePool;
 
 use crate::error::AppResult;
 
+/// TMDB metadata captured best-effort at session start. All fields are
+/// optional: a failed lookup stores NULLs, and updates never overwrite a
+/// previously stored value with NULL (COALESCE in the UPDATE).
+#[derive(Debug, Clone, Default)]
+pub struct MediaMeta {
+    /// Movie or show title.
+    pub title: Option<String>,
+    pub poster_url: Option<String>,
+    pub backdrop_url: Option<String>,
+    /// Episode title (tv only).
+    pub episode_title: Option<String>,
+    /// Episode still image (tv only).
+    pub still_url: Option<String>,
+}
+
 /// Data recorded when a playback session starts.
 pub struct SessionStart<'a> {
     pub tmdb_id: i64,
@@ -17,6 +32,7 @@ pub struct SessionStart<'a> {
     pub indexer_id: Option<i64>,
     pub nzb_url: &'a str,
     pub duration_secs: Option<f64>,
+    pub meta: MediaMeta,
 }
 
 /// One watch-history row as stored.
@@ -31,6 +47,11 @@ pub struct HistoryEntry {
     pub position_secs: f64,
     pub duration_secs: Option<f64>,
     pub watched_at: String,
+    pub title: Option<String>,
+    pub poster_url: Option<String>,
+    pub backdrop_url: Option<String>,
+    pub episode_title: Option<String>,
+    pub still_url: Option<String>,
 }
 
 /// A position update from a client (history API or the per-session
@@ -67,9 +88,16 @@ pub async fn record_session_start(pool: &SqlitePool, start: &SessionStart<'_>) -
 
     match existing {
         Some((id, position)) => {
+            // COALESCE keeps previously stored metadata when a later session
+            // start could not fetch it (TMDB hiccup).
             sqlx::query(
                 "UPDATE watch_history
                  SET release_title = ?, indexer_id = ?, nzb_url = ?, duration_secs = ?,
+                     title = COALESCE(?, title),
+                     poster_url = COALESCE(?, poster_url),
+                     backdrop_url = COALESCE(?, backdrop_url),
+                     episode_title = COALESCE(?, episode_title),
+                     still_url = COALESCE(?, still_url),
                      watched_at = datetime('now')
                  WHERE id = ?",
             )
@@ -77,6 +105,11 @@ pub async fn record_session_start(pool: &SqlitePool, start: &SessionStart<'_>) -
             .bind(start.indexer_id)
             .bind(start.nzb_url)
             .bind(start.duration_secs)
+            .bind(&start.meta.title)
+            .bind(&start.meta.poster_url)
+            .bind(&start.meta.backdrop_url)
+            .bind(&start.meta.episode_title)
+            .bind(&start.meta.still_url)
             .bind(id)
             .execute(pool)
             .await?;
@@ -86,8 +119,9 @@ pub async fn record_session_start(pool: &SqlitePool, start: &SessionStart<'_>) -
             sqlx::query(
                 "INSERT INTO watch_history
                      (user_id, tmdb_id, media_type, season, episode, release_title,
-                      indexer_id, nzb_url, duration_secs)
-                 VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)",
+                      indexer_id, nzb_url, duration_secs, title, poster_url,
+                      backdrop_url, episode_title, still_url)
+                 VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(start.tmdb_id)
             .bind(start.media_type)
@@ -97,6 +131,11 @@ pub async fn record_session_start(pool: &SqlitePool, start: &SessionStart<'_>) -
             .bind(start.indexer_id)
             .bind(start.nzb_url)
             .bind(start.duration_secs)
+            .bind(&start.meta.title)
+            .bind(&start.meta.poster_url)
+            .bind(&start.meta.backdrop_url)
+            .bind(&start.meta.episode_title)
+            .bind(&start.meta.still_url)
             .execute(pool)
             .await?;
             Ok(0.0)
@@ -108,7 +147,8 @@ pub async fn record_session_start(pool: &SqlitePool, start: &SessionStart<'_>) -
 pub async fn list(pool: &SqlitePool) -> AppResult<Vec<HistoryEntry>> {
     Ok(sqlx::query_as(
         "SELECT id, tmdb_id, media_type, season, episode, release_title,
-                position_secs, duration_secs, watched_at
+                position_secs, duration_secs, watched_at,
+                title, poster_url, backdrop_url, episode_title, still_url
          FROM watch_history WHERE user_id = 1
          ORDER BY watched_at DESC, id DESC",
     )
@@ -119,7 +159,8 @@ pub async fn list(pool: &SqlitePool) -> AppResult<Vec<HistoryEntry>> {
 pub async fn get(pool: &SqlitePool, id: i64) -> AppResult<Option<HistoryEntry>> {
     Ok(sqlx::query_as(
         "SELECT id, tmdb_id, media_type, season, episode, release_title,
-                position_secs, duration_secs, watched_at
+                position_secs, duration_secs, watched_at,
+                title, poster_url, backdrop_url, episode_title, still_url
          FROM watch_history WHERE user_id = 1 AND id = ?",
     )
     .bind(id)
@@ -190,6 +231,29 @@ pub async fn delete(pool: &SqlitePool, id: i64) -> AppResult<bool> {
     Ok(result.rows_affected() > 0)
 }
 
+/// Release last used to play an item, when recorded. Lets session creation
+/// prefer the release the user actually watched when auto-selecting.
+pub async fn last_release_title(
+    pool: &SqlitePool,
+    tmdb_id: i64,
+    media_type: &str,
+    season: Option<u32>,
+    episode: Option<u32>,
+) -> AppResult<Option<String>> {
+    let row: Option<(Option<String>,)> = sqlx::query_as(
+        "SELECT release_title FROM watch_history
+         WHERE user_id = 1 AND tmdb_id = ? AND media_type = ?
+           AND season IS ? AND episode IS ?",
+    )
+    .bind(tmdb_id)
+    .bind(media_type)
+    .bind(season)
+    .bind(episode)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.and_then(|(title,)| title))
+}
+
 /// Stored resume position for an item, when any.
 pub async fn position_secs(
     pool: &SqlitePool,
@@ -232,6 +296,11 @@ mod tests {
             indexer_id: Some(1),
             nzb_url: "https://x/a.nzb",
             duration_secs: Some(100.0),
+            meta: MediaMeta {
+                title: Some("The Movie".into()),
+                backdrop_url: Some("https://img/backdrop.jpg".into()),
+                ..Default::default()
+            },
         };
         assert_eq!(record_session_start(&pool, &start).await.unwrap(), 0.0);
 
@@ -242,8 +311,10 @@ mod tests {
             .unwrap();
 
         // Starting again returns the stored position and does not duplicate.
+        // The empty meta must not erase the previously stored metadata.
         let again = SessionStart {
             release_title: "Second.Release",
+            meta: MediaMeta::default(),
             ..start
         };
         assert_eq!(record_session_start(&pool, &again).await.unwrap(), 33.5);
@@ -255,6 +326,27 @@ mod tests {
         .unwrap();
         assert_eq!(count, 1);
         assert_eq!(title, "Second.Release");
+
+        let entry = &list(&pool).await.unwrap()[0];
+        assert_eq!(entry.title.as_deref(), Some("The Movie"));
+        assert_eq!(
+            entry.backdrop_url.as_deref(),
+            Some("https://img/backdrop.jpg")
+        );
+
+        assert_eq!(
+            last_release_title(&pool, 42, "movie", None, None)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("Second.Release")
+        );
+        assert_eq!(
+            last_release_title(&pool, 42, "tv", None, None)
+                .await
+                .unwrap(),
+            None
+        );
 
         assert_eq!(
             position_secs(&pool, 42, "movie", None, None).await.unwrap(),
@@ -334,6 +426,7 @@ mod tests {
                 indexer_id: Some(1),
                 nzb_url: "https://x/e.nzb",
                 duration_secs: None,
+                meta: MediaMeta::default(),
             };
             record_session_start(&pool, &start).await.unwrap();
         }

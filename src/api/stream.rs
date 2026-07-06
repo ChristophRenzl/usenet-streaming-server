@@ -39,6 +39,7 @@ use crate::{
     vfs::DiskFile,
 };
 
+use super::metadata::tmdb_client;
 use super::releases::{pick_candidates, resolve_candidates, ReleaseTarget};
 use super::subtitles::{download_subtitle, opensubtitles_client};
 
@@ -234,7 +235,22 @@ pub async fn create_session(
     }
 
     let candidates = resolve_candidates(&state, &target, request.max_resolution).await?;
-    let to_try = pick_candidates(&candidates, request.release_guid.as_deref(), MAX_ATTEMPTS)?;
+    // Prefer the release this item was last watched with, so resuming from
+    // history continues in the exact same release when it is still available.
+    let last_release = db::watch_history::last_release_title(
+        &state.db,
+        target.tmdb_id,
+        target.media_type.as_str(),
+        target.season,
+        target.episode,
+    )
+    .await?;
+    let to_try = pick_candidates(
+        &candidates,
+        request.release_guid.as_deref(),
+        last_release.as_deref(),
+        MAX_ATTEMPTS,
+    )?;
 
     let mut failures: Vec<String> = Vec::new();
     // Remember the first repairable candidate (in rank order) as the fallback.
@@ -523,6 +539,59 @@ async fn assess_candidate(
     Ok((assessment, nzb, main))
 }
 
+/// Best-effort TMDB metadata for a watch-history row: media title, artwork
+/// and (for tv) the episode title + still. Any failure — missing TMDB key,
+/// upstream error — degrades to empty metadata instead of failing the
+/// session; the history upsert keeps previously stored values (COALESCE).
+async fn fetch_media_meta(
+    state: &AppState,
+    tmdb_id: i64,
+    media_type: MediaType,
+    season: Option<u32>,
+    episode: Option<u32>,
+) -> db::watch_history::MediaMeta {
+    let mut meta = db::watch_history::MediaMeta::default();
+    let tmdb = match tmdb_client(state).await {
+        Ok(tmdb) => tmdb,
+        Err(error) => {
+            tracing::info!(%error, "skipping history metadata (no TMDB client)");
+            return meta;
+        }
+    };
+    match media_type {
+        MediaType::Movie => match tmdb.movie_details(tmdb_id).await {
+            Ok(movie) => {
+                meta.title = Some(movie.title);
+                meta.poster_url = movie.poster_url;
+                meta.backdrop_url = movie.backdrop_url;
+            }
+            Err(error) => tracing::info!(tmdb_id, %error, "history metadata lookup failed"),
+        },
+        MediaType::Tv => {
+            match tmdb.tv_details(tmdb_id).await {
+                Ok(show) => {
+                    meta.title = Some(show.title);
+                    meta.poster_url = show.poster_url;
+                    meta.backdrop_url = show.backdrop_url;
+                }
+                Err(error) => tracing::info!(tmdb_id, %error, "history metadata lookup failed"),
+            }
+            if let Some((season, episode)) = season.zip(episode) {
+                match tmdb.episode_details(tmdb_id, season, episode).await {
+                    Ok(details) => {
+                        meta.episode_title = details.title;
+                        meta.still_url = details.still_url;
+                    }
+                    Err(error) => {
+                        tracing::info!(tmdb_id, season, episode, %error, "episode metadata lookup failed");
+                    }
+                }
+            }
+        }
+    }
+    meta
+}
+
 /// Start a session from an already-grabbed, already-assessed streamable
 /// candidate: virtual file → ffprobe → ffmpeg. On failure the partially
 /// registered session is torn down.
@@ -578,6 +647,14 @@ async fn start_streamable_session(
         }
     }
 
+    let meta = fetch_media_meta(
+        state,
+        target.tmdb_id,
+        target.media_type,
+        target.season,
+        target.episode,
+    )
+    .await;
     db::watch_history::record_session_start(
         &state.db,
         &db::watch_history::SessionStart {
@@ -589,6 +666,7 @@ async fn start_streamable_session(
             indexer_id: Some(candidate.raw.indexer_id),
             nzb_url: &candidate.raw.nzb_url,
             duration_secs: session.info().duration_secs,
+            meta,
         },
     )
     .await?;
@@ -670,6 +748,7 @@ async fn start_disk_session(
         }
     }
 
+    let meta = fetch_media_meta(state, download.tmdb_id, media_type, season, episode).await;
     db::watch_history::record_session_start(
         &state.db,
         &db::watch_history::SessionStart {
@@ -681,6 +760,7 @@ async fn start_disk_session(
             indexer_id: None,
             nzb_url: &download.nzb_url,
             duration_secs: session.info().duration_secs,
+            meta,
         },
     )
     .await?;
