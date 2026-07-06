@@ -136,6 +136,32 @@ pub struct CreateSessionResponse {
     /// External subtitle tracks attached at session start (empty when none
     /// were requested, none were found, or no OpenSubtitles key is set).
     pub subtitle_tracks: Vec<SubtitleTrackInfo>,
+    /// End (seconds) of the media's intro/opening chapter, when it has one —
+    /// the client offers "Skip Intro" up to this timestamp. `null` for the
+    /// vast majority of releases (no chapters), where the client falls back to
+    /// its own heuristic.
+    pub intro_end_secs: Option<f64>,
+    /// Embedded chapter markers from the probe, in file order. Empty when the
+    /// release has no chapters.
+    pub chapters: Vec<ChapterInfo>,
+}
+
+/// A media chapter marker surfaced to the client.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ChapterInfo {
+    pub start_secs: f64,
+    pub end_secs: f64,
+    pub title: Option<String>,
+}
+
+impl ChapterInfo {
+    fn from_chapter(chapter: &crate::stream::ffprobe::Chapter) -> Self {
+        Self {
+            start_secs: chapter.start_secs,
+            end_secs: chapter.end_secs,
+            title: chapter.title.clone(),
+        }
+    }
 }
 
 /// Returned with HTTP 202 when no candidate is streamable but at least one is
@@ -389,6 +415,12 @@ fn session_response(
             .subtitle_tracks()
             .iter()
             .map(|t| SubtitleTrackInfo::from_track(&session.id, t))
+            .collect(),
+        intro_end_secs: info.intro_end_secs,
+        chapters: info
+            .chapters
+            .iter()
+            .map(ChapterInfo::from_chapter)
             .collect(),
     }
 }
@@ -836,6 +868,8 @@ async fn probe_and_spawn(
             probe.video_range
         },
         video_transcoded,
+        chapters: probe.chapters,
+        intro_end_secs: probe.intro_end_secs,
     });
     ffmpeg::spawn_hls(
         session,
@@ -872,6 +906,11 @@ pub struct SessionStatus {
     /// Number of finished HLS media segments on disk.
     pub segments_ready: usize,
     pub resume_position_secs: Option<f64>,
+    /// End (seconds) of the media's intro/opening chapter for "Skip Intro", or
+    /// `null` when the release has no intro chapter.
+    pub intro_end_secs: Option<f64>,
+    /// Embedded chapter markers from the probe, in file order (empty when none).
+    pub chapters: Vec<ChapterInfo>,
 }
 
 fn get_session(state: &AppState, id: &Uuid) -> AppResult<Arc<Session>> {
@@ -910,6 +949,12 @@ pub async fn session_status(
         segments_ready: count_segments(&session.temp_dir).await,
         resume_position_secs: (session.resume_position_secs > 0.0)
             .then_some(session.resume_position_secs),
+        intro_end_secs: info.intro_end_secs,
+        chapters: info
+            .chapters
+            .iter()
+            .map(ChapterInfo::from_chapter)
+            .collect(),
     }))
 }
 

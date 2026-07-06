@@ -8,6 +8,6 @@ pub mod range;
 pub mod session;
 pub mod source;
 
-pub use ffprobe::ProbeResult;
+pub use ffprobe::{Chapter, ProbeResult};
 pub use session::{MediaInfo, NewSession, Session, SessionManager, SessionState};
 pub use source::{open_media_source, MediaSource};

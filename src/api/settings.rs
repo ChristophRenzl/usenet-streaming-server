@@ -358,8 +358,25 @@ pub async fn get_app_settings(State(state): State<AppState>) -> AppResult<Json<A
     Ok(Json(current_app_settings(&state).await?))
 }
 
+/// Store `value` for `key`, or DELETE the row when `value` is empty so it
+/// reads back as "not set". An explicit empty string in the PUT body is the
+/// clear signal (a field omitted from the body is left untouched by the
+/// caller); a non-empty value is stored as-is (already trimmed by the caller
+/// where trimming is wanted).
+async fn upsert_or_clear(state: &AppState, key: &str, value: &str) -> AppResult<()> {
+    if value.is_empty() {
+        db::settings::delete(&state.db, key).await
+    } else {
+        db::settings::set(&state.db, key, value).await
+    }
+}
+
 /// Update app-level settings. A new `api_key` (min. 16 characters) is stored
 /// as an override; the bootstrap config key stays valid for recovery.
+///
+/// TMDB / OpenSubtitles fields follow "omit = unchanged, `\"\"` = clear": an
+/// explicit empty string deletes the stored value so it reverts to not-set
+/// (and any cached OpenSubtitles login token is dropped).
 #[utoipa::path(put, path = "/settings/app", tag = "settings",
     request_body = AppSettingsInput,
     responses(
@@ -380,17 +397,17 @@ pub async fn put_app_settings(
         db::settings::set(&state.db, db::settings::API_KEY_OVERRIDE, key).await?;
     }
     if let Some(key) = input.tmdb_api_key {
-        db::settings::set(&state.db, db::settings::TMDB_API_KEY, key.trim()).await?;
+        upsert_or_clear(&state, db::settings::TMDB_API_KEY, key.trim()).await?;
     }
     let opensubtitles_changed = input.opensubtitles_api_key.is_some()
         || input.opensubtitles_username.is_some()
         || input.opensubtitles_password.is_some();
     if let Some(key) = input.opensubtitles_api_key {
-        db::settings::set(&state.db, db::settings::OPENSUBTITLES_API_KEY, key.trim()).await?;
+        upsert_or_clear(&state, db::settings::OPENSUBTITLES_API_KEY, key.trim()).await?;
     }
     if let Some(username) = input.opensubtitles_username {
-        db::settings::set(
-            &state.db,
+        upsert_or_clear(
+            &state,
             db::settings::OPENSUBTITLES_USERNAME,
             username.trim(),
         )
@@ -398,7 +415,7 @@ pub async fn put_app_settings(
     }
     if let Some(password) = input.opensubtitles_password {
         // Deliberately not trimmed: passwords may legitimately contain spaces.
-        db::settings::set(&state.db, db::settings::OPENSUBTITLES_PASSWORD, &password).await?;
+        upsert_or_clear(&state, db::settings::OPENSUBTITLES_PASSWORD, &password).await?;
     }
     if opensubtitles_changed {
         // A cached login token may belong to the old key/credentials.

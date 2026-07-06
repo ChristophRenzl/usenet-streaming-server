@@ -69,6 +69,11 @@ pub struct MediaInfo {
     pub video_range: String,
     /// True when the video is tone-mapped to SDR for an HDR-incapable client.
     pub video_transcoded: bool,
+    /// Embedded chapter markers from the probe (empty for most releases).
+    pub chapters: Vec<crate::stream::ffprobe::Chapter>,
+    /// End (seconds) of the detected intro/opening chapter, for the client's
+    /// "Skip Intro". `None` when the media has no intro chapter.
+    pub intro_end_secs: Option<f64>,
 }
 
 /// Everything needed to register a new session.

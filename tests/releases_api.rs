@@ -222,6 +222,193 @@ async fn releases_max_resolution_applies_device_cap() {
     assert!(reason.contains("device max 1080p"), "reason was: {reason}");
 }
 
+/// Absolute-numbered anime releases, as returned for `q={title} {absolute}`.
+const ANIME_ABSOLUTE_RSS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:newznab="http://www.newznab.com/DTD/2010/feeds/attributes/">
+  <channel>
+    <title>example</title>
+    <item>
+      <title>[Erai-raws] One Piece - 1100 [1080p][HEVC]</title>
+      <guid isPermaLink="true">https://indexer.example/details/op1100</guid>
+      <link>https://indexer.example/getnzb/op1100.nzb</link>
+      <pubDate>Wed, 03 Jul 2024 12:30:00 +0000</pubDate>
+      <newznab:attr name="size" value="1400000000"/>
+    </item>
+  </channel>
+</rss>"#;
+
+const EMPTY_RSS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:newznab="http://www.newznab.com/DTD/2010/feeds/attributes/">
+  <channel><title>example</title></channel>
+</rss>"#;
+
+/// Anime (original_language "ja", multi-season): the scene-numbered tvsearch
+/// returns nothing, but the absolute-episode-number query (`One Piece 1100`)
+/// finds the real release, and it lands in the candidate list.
+#[tokio::test]
+async fn releases_for_anime_issue_absolute_episode_query() {
+    let tmdb = MockServer::start().await;
+    let indexer = MockServer::start().await;
+
+    // Season 1 has 1099 episodes; season 2 episode 1 → absolute 1100.
+    Mock::given(method("GET"))
+        .and(path("/tv/81797"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 81797,
+            "name": "One Piece",
+            "first_air_date": "1999-10-20",
+            "original_language": "ja",
+            "external_ids": { "tvdb_id": 81797 },
+            "seasons": [
+                { "season_number": 0, "episode_count": 10 },
+                { "season_number": 1, "episode_count": 1099 },
+                { "season_number": 2, "episode_count": 50 }
+            ]
+        })))
+        .mount(&tmdb)
+        .await;
+
+    // tvsearch (scene numbering) returns zero results for newer anime.
+    Mock::given(method("GET"))
+        .and(path("/api"))
+        .and(query_param("t", "tvsearch"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(EMPTY_RSS, "application/rss+xml"))
+        .mount(&indexer)
+        .await;
+
+    // The SxxExx text fallback also finds nothing.
+    Mock::given(method("GET"))
+        .and(path("/api"))
+        .and(query_param("t", "search"))
+        .and(query_param("q", "One Piece S02E01"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(EMPTY_RSS, "application/rss+xml"))
+        .mount(&indexer)
+        .await;
+
+    // The absolute-number query finds the real release.
+    Mock::given(method("GET"))
+        .and(path("/api"))
+        .and(query_param("t", "search"))
+        .and(query_param("q", "One Piece 1100"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(ANIME_ABSOLUTE_RSS, "application/rss+xml"),
+        )
+        .expect(1)
+        .mount(&indexer)
+        .await;
+
+    let mut config = AppConfig::default();
+    config.auth.api_key = API_KEY.into();
+    let state = AppState::for_tests(config)
+        .await
+        .expect("test state")
+        .with_tmdb_base_url(&tmdb.uri());
+    let server = TestServer::new(api::router(state));
+
+    let response = server
+        .put("/api/v1/settings/app")
+        .add_header("x-api-key", API_KEY)
+        .json(&json!({ "tmdb_api_key": "tmdb-key" }))
+        .await;
+    assert_eq!(response.status_code(), 200);
+    let response = server
+        .post("/api/v1/settings/indexers")
+        .add_header("x-api-key", API_KEY)
+        .json(&json!({ "name": "mock", "base_url": indexer.uri(), "api_key": "indexer-key" }))
+        .await;
+    assert_eq!(response.status_code(), 200);
+
+    let response = server
+        .get("/api/v1/releases?tmdb_id=81797&type=tv&season=2&episode=1")
+        .add_header("x-api-key", API_KEY)
+        .await;
+    assert_eq!(response.status_code(), 200);
+    let body: Value = response.json();
+    let candidates = body["candidates"].as_array().expect("candidates array");
+    assert!(
+        candidates
+            .iter()
+            .any(|c| c["raw"]["title"] == json!("[Erai-raws] One Piece - 1100 [1080p][HEVC]")),
+        "absolute-named anime release must appear: {candidates:?}"
+    );
+}
+
+/// A non-anime (English) show must NOT issue the absolute-number query — only
+/// the tvsearch and SxxExx strategies run.
+#[tokio::test]
+async fn releases_for_non_anime_do_not_issue_absolute_query() {
+    let tmdb = MockServer::start().await;
+    let indexer = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/tv/1396"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 1396,
+            "name": "Breaking Bad",
+            "first_air_date": "2008-01-20",
+            "original_language": "en",
+            "external_ids": { "tvdb_id": 81189 },
+            "seasons": [
+                { "season_number": 1, "episode_count": 7 },
+                { "season_number": 2, "episode_count": 13 }
+            ]
+        })))
+        .mount(&tmdb)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api"))
+        .and(query_param("t", "tvsearch"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(EMPTY_RSS, "application/rss+xml"))
+        .mount(&indexer)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api"))
+        .and(query_param("t", "search"))
+        .and(query_param("q", "Breaking Bad S02E01"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(EMPTY_RSS, "application/rss+xml"))
+        .mount(&indexer)
+        .await;
+    // An absolute-number query would be `Breaking Bad 8`; assert it is never
+    // sent by making the matching mock expect exactly zero hits.
+    Mock::given(method("GET"))
+        .and(path("/api"))
+        .and(query_param("t", "search"))
+        .and(query_param("q", "Breaking Bad 8"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(EMPTY_RSS, "application/rss+xml"))
+        .expect(0)
+        .mount(&indexer)
+        .await;
+
+    let mut config = AppConfig::default();
+    config.auth.api_key = API_KEY.into();
+    let state = AppState::for_tests(config)
+        .await
+        .expect("test state")
+        .with_tmdb_base_url(&tmdb.uri());
+    let server = TestServer::new(api::router(state));
+
+    let response = server
+        .put("/api/v1/settings/app")
+        .add_header("x-api-key", API_KEY)
+        .json(&json!({ "tmdb_api_key": "tmdb-key" }))
+        .await;
+    assert_eq!(response.status_code(), 200);
+    let response = server
+        .post("/api/v1/settings/indexers")
+        .add_header("x-api-key", API_KEY)
+        .json(&json!({ "name": "mock", "base_url": indexer.uri(), "api_key": "indexer-key" }))
+        .await;
+    assert_eq!(response.status_code(), 200);
+
+    let response = server
+        .get("/api/v1/releases?tmdb_id=1396&type=tv&season=2&episode=1")
+        .add_header("x-api-key", API_KEY)
+        .await;
+    assert_eq!(response.status_code(), 200);
+    // The `.expect(0)` mock verifies on drop that the absolute query never fired.
+}
+
 #[tokio::test]
 async fn releases_for_tv_require_season_and_episode() {
     let mut config = AppConfig::default();

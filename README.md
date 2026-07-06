@@ -10,7 +10,14 @@ clients; a built-in web admin UI at `/` handles all configuration.
 1. Client searches TMDB through the server and picks a movie or episode.
 2. The server queries your Newznab indexers, parses and ranks the candidate
    releases against your preferences (resolution, codecs, size, blocked terms),
-   health-checks the winner via NNTP `STAT`, and falls back automatically.
+   health-checks the winner via NNTP `STAT`, and falls back automatically. For
+   TV it runs several search strategies and merges the results: `tvsearch` by
+   TVDB id, an `SxxExx` text fallback, and — for **anime** (TMDB original
+   language Japanese) — an **absolute episode number** query. Anime is indexed
+   by a running episode count (e.g. `One Piece - 1100`), not `SxxExx`, so the
+   absolute strategy is what actually finds newer anime episodes. The absolute
+   number is computed from TMDB season data (sum of prior regular seasons'
+   episode counts + the episode; specials/season 0 excluded).
 3. A **virtual file** is built over the NZB: byte ranges are served by fetching
    only the needed article segments, yEnc-decoding them, and mapping through
    store-mode RAR offsets. Nothing is written to disk.
@@ -102,7 +109,7 @@ UI, click **Authorize** to set the key for "Try it out".
 | Search | `GET /search`, `GET /movies/{id}`, `GET /tv/{id}[/season/{n}[/episode/{e}]]` |
 | Discovery | `GET /trending?media_type=all\|movie\|tv&window=day\|week`, `GET /movies/popular`, `GET /movies/top_rated`, `GET /tv/popular`, `GET /tv/top_rated` (all take `?page=`), `GET /genres?media_type=movie\|tv`, `GET /discover?media_type=movie\|tv[&genre_id=…][&page=…][&sort_by=popularity.desc]` |
 | Watchlist | `GET/POST /watchlist`, `GET /watchlist/status?tmdb_id=…&media_type=…`, `DELETE /watchlist/{tmdb_id}?media_type=…` |
-| Releases | `GET /releases?tmdb_id=…[&max_resolution=…]` — ranked candidates for manual override; `max_resolution` caps quality to what the device supports (also accepted in `POST /stream/sessions` and `POST /downloads` bodies) |
+| Releases | `GET /releases?tmdb_id=…[&max_resolution=…]` — ranked candidates for manual override (anime episodes are also searched by absolute episode number); `max_resolution` caps quality to what the device supports (also accepted in `POST /stream/sessions` and `POST /downloads` bodies) |
 | Streaming | `POST /stream/sessions`, `GET /stream/{id}/master.m3u8`, `GET /stream/{id}/raw` (byte ranges), `DELETE /stream/{id}` |
 | Subtitles | `GET /subtitles/search?tmdb_id=…`, `POST /stream/{id}/subtitles` (attach), `POST /stream/{id}/subtitles/{language}/offset` (nudge timing) |
 | Downloads | `POST /downloads`, `GET /downloads[/{id}]`, `DELETE /downloads/{id}` |
@@ -118,6 +125,14 @@ account (`opensubtitles_username` / `opensubtitles_password`) is optional and
 lifts the anonymous daily download quota. Subtitles are **best-effort and
 non-fatal** — playback works without a key, and any subtitle failure is logged
 and skipped rather than failing the session.
+
+**Clearing stored credentials.** On `PUT /api/v1/settings/app`, omitting a
+field leaves it unchanged, and sending an explicit empty string `""` **clears**
+it — the stored value is deleted so it reverts to not-set. This applies to
+`tmdb_api_key`, `opensubtitles_api_key`, `opensubtitles_username` and
+`opensubtitles_password`. Clearing or changing any OpenSubtitles credential also
+drops the cached login token. The Subtitles page has a **Remove key** button and
+a **Sign out / clear account** button that do exactly this.
 
 ### Configure the API key once at deploy time (the "Jellyfin experience")
 
@@ -171,6 +186,22 @@ The standalone `GET /subtitles/search` stays TMDB-based (no file, so no
 moviehash); hash matching and fps/offset correction apply only in the session
 auto-attach path. A session's attached tracks are reported in the
 `subtitle_tracks` array of the `POST /stream/sessions` response.
+
+## Streaming: chapters and Skip Intro
+
+ffprobe reads embedded **chapter markers** during session start. When a chapter
+looks like the opening (title matching `intro`/`opening`/`op`/`avant`,
+case-insensitive) and starts within the first ~5 minutes, its end time is
+surfaced as `intro_end_secs` so the client can offer **Skip Intro**. Both the
+`POST /stream/sessions` response and `GET /stream/{id}` status carry:
+
+- `intro_end_secs: Option<f64>` — end (seconds) of the detected intro chapter,
+  or `null`;
+- `chapters: [{ start_secs, end_secs, title }]` — all chapter markers in file
+  order (empty for the many releases with no chapters).
+
+Most releases have no chapters, so both are commonly `null`/empty — the client
+is expected to fall back to its own Skip-Intro heuristic then.
 
 ## Configuration
 

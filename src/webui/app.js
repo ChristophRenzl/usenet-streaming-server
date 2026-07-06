@@ -654,6 +654,7 @@ async function renderOpensubtitles(main) {
         </div>
         <div class="form-actions">
           <button type="submit" class="btn primary">Save key</button>
+          ${app.opensubtitles_api_key ? '<button type="button" id="os-key-remove" class="btn danger">Remove key</button>' : ""}
         </div>
       </form>
     </div>
@@ -677,6 +678,7 @@ async function renderOpensubtitles(main) {
         </div>
         <div class="form-actions">
           <button type="submit" class="btn primary">Save account</button>
+          ${app.opensubtitles_username || app.opensubtitles_password_set ? '<button type="button" id="os-account-clear" class="btn danger">Sign out / clear account</button>' : ""}
         </div>
       </form>
     </div>`;
@@ -703,6 +705,24 @@ async function renderOpensubtitles(main) {
     }
   });
 
+  const removeKeyBtn = $("#os-key-remove");
+  if (removeKeyBtn) {
+    removeKeyBtn.addEventListener("click", async () => {
+      if (!confirm("Remove the stored OpenSubtitles API key? Subtitles will be unavailable unless the server has a built-in key.")) return;
+      try {
+        // An explicit empty string clears the stored key server-side.
+        await api("/settings/app", {
+          method: "PUT",
+          body: JSON.stringify({ opensubtitles_api_key: "" }),
+        });
+        toast("OpenSubtitles key removed.", "success");
+        navigate();
+      } catch (err) {
+        toast(err.message);
+      }
+    });
+  }
+
   $("#os-account-form").addEventListener("submit", async (e) => {
     e.preventDefault();
     // Only send fields the user actually touched: username always (may be
@@ -718,6 +738,27 @@ async function renderOpensubtitles(main) {
       toast(err.message);
     }
   });
+
+  const clearAccountBtn = $("#os-account-clear");
+  if (clearAccountBtn) {
+    clearAccountBtn.addEventListener("click", async () => {
+      if (!confirm("Sign out and clear the stored OpenSubtitles username and password?")) return;
+      try {
+        // Empty strings clear both the username and password server-side.
+        await api("/settings/app", {
+          method: "PUT",
+          body: JSON.stringify({
+            opensubtitles_username: "",
+            opensubtitles_password: "",
+          }),
+        });
+        toast("OpenSubtitles account cleared.", "success");
+        navigate();
+      } catch (err) {
+        toast(err.message);
+      }
+    });
+  }
 }
 
 // ---- Preferences --------------------------------------------------------------------

@@ -18,7 +18,7 @@ use crate::{
         rank::{rank, RankedRelease},
     },
     state::AppState,
-    tmdb::models::MediaType,
+    tmdb::models::{MediaType, TvShow},
 };
 
 use super::metadata::tmdb_client;
@@ -64,7 +64,7 @@ pub async fn resolve_candidates(
     }
 
     let tmdb = tmdb_client(state).await?;
-    let (query, original_language) = match target.media_type {
+    let (queries, original_language) = match target.media_type {
         MediaType::Movie => {
             let movie = tmdb.movie_details(target.tmdb_id).await?;
             let query = match movie.imdb_id {
@@ -76,7 +76,7 @@ pub async fn resolve_candidates(
                     },
                 },
             };
-            (query, movie.original_language)
+            (vec![query], movie.original_language)
         }
         MediaType::Tv => {
             let (season, episode) = target
@@ -84,21 +84,12 @@ pub async fn resolve_candidates(
                 .zip(target.episode)
                 .expect("validated TV target");
             let show = tmdb.tv_details(target.tmdb_id).await?;
-            let query = match show.tvdb_id {
-                Some(tvdb_id) => SearchQuery::TvByTvdb {
-                    tvdb_id,
-                    season,
-                    episode,
-                },
-                None => SearchQuery::Raw {
-                    query: format!("{} S{season:02}E{episode:02}", show.title),
-                },
-            };
-            (query, show.original_language)
+            let queries = tv_search_queries(&show, season, episode);
+            (queries, show.original_language)
         }
     };
 
-    let raw = indexer::search_all(&state.http, indexers, &query).await;
+    let raw = indexer::search_many(&state.http, indexers, &queries).await;
     let prefs = db::preferences::get(&state.db).await?;
     Ok(rank(
         raw,
@@ -106,6 +97,62 @@ pub async fn resolve_candidates(
         max_resolution,
         original_language.as_deref(),
     ))
+}
+
+/// Build the set of indexer search strategies for one TV episode. Their
+/// results are merged and deduped downstream, so issuing several is cheap and
+/// only widens coverage:
+///
+/// 1. `tvsearch` by TVDB id + season + episode (when a TVDB id is known) — the
+///    canonical scene-numbered lookup.
+/// 2. A `"{title} SxxExx"` free-text query — always, as a fallback for
+///    indexers that do not index the TVDB mapping.
+/// 3. For **anime only** (original language Japanese), a `"{title} {absolute}"`
+///    free-text query using the *absolute* episode number. Anime is released
+///    and indexed by a running episode count (e.g. `One Piece - 1100`) rather
+///    than `SxxExx`, so scene-numbered lookups return nothing for it. Skipped
+///    when the absolute number cannot be derived from TMDB's season data.
+pub fn tv_search_queries(show: &TvShow, season: u32, episode: u32) -> Vec<SearchQuery> {
+    let mut queries = Vec::new();
+    if let Some(tvdb_id) = show.tvdb_id {
+        queries.push(SearchQuery::TvByTvdb {
+            tvdb_id,
+            season,
+            episode,
+        });
+    }
+    queries.push(SearchQuery::Raw {
+        query: format!("{} S{season:02}E{episode:02}", show.title),
+    });
+    // Anime is numbered absolutely, not SxxExx. Gate on Japanese original
+    // language and require enough season data to compute the running count.
+    if show.original_language.as_deref() == Some("ja") {
+        if let Some(absolute) = absolute_episode(show, season, episode) {
+            queries.push(SearchQuery::Raw {
+                query: format!("{} {absolute}", show.title),
+            });
+        }
+    }
+    queries
+}
+
+/// Compute the absolute episode number: the running count across all prior
+/// regular seasons plus this episode. Season 0 (specials) is ignored. Returns
+/// `None` when the target season's data is missing, so the caller can skip the
+/// absolute-number strategy gracefully.
+pub fn absolute_episode(show: &TvShow, season: u32, episode: u32) -> Option<u32> {
+    // The target season must be present in TMDB's data; without it we cannot
+    // trust the running count.
+    if !show.seasons.iter().any(|s| s.season_number == season) {
+        return None;
+    }
+    let prior: u32 = show
+        .seasons
+        .iter()
+        .filter(|s| s.season_number >= 1 && s.season_number < season)
+        .map(|s| s.episode_count.unwrap_or(0).max(0) as u32)
+        .sum();
+    Some(prior + episode)
 }
 
 /// Pick the candidates to actually try: the guid-pinned release when given,
@@ -213,6 +260,103 @@ pub fn router() -> OpenApiRouter<AppState> {
 mod tests {
     use super::*;
     use crate::release::parse::parse_release_name;
+    use crate::tmdb::models::SeasonSummary;
+
+    fn season(number: u32, episode_count: Option<i64>) -> SeasonSummary {
+        SeasonSummary {
+            season_number: number,
+            title: Some(format!("Season {number}")),
+            episode_count,
+            air_date: None,
+            poster_url: None,
+        }
+    }
+
+    fn show(title: &str, original_language: &str, seasons: Vec<SeasonSummary>) -> TvShow {
+        TvShow {
+            tmdb_id: 1,
+            media_type: MediaType::Tv,
+            imdb_id: None,
+            tvdb_id: Some(81797),
+            title: title.into(),
+            year: None,
+            overview: None,
+            poster_url: None,
+            backdrop_url: None,
+            vote_average: None,
+            original_language: Some(original_language.into()),
+            trailer_youtube_key: None,
+            seasons,
+        }
+    }
+
+    #[test]
+    fn absolute_episode_sums_prior_regular_seasons_plus_episode() {
+        // Specials (season 0) are ignored; seasons 1 & 2 (12 + 13) precede the
+        // target season 3 episode 1 → 12 + 13 + 1 = 26.
+        let s = show(
+            "One Piece",
+            "ja",
+            vec![
+                season(0, Some(5)),
+                season(1, Some(12)),
+                season(2, Some(13)),
+                season(3, Some(20)),
+            ],
+        );
+        assert_eq!(absolute_episode(&s, 3, 1), Some(26));
+        // Season 1 episode 4 has no prior regular seasons → 4.
+        assert_eq!(absolute_episode(&s, 1, 4), Some(4));
+    }
+
+    #[test]
+    fn absolute_episode_is_none_when_target_season_missing() {
+        let s = show("One Piece", "ja", vec![season(1, Some(12))]);
+        assert_eq!(absolute_episode(&s, 5, 1), None);
+    }
+
+    #[test]
+    fn anime_show_issues_absolute_number_query() {
+        let s = show(
+            "One Piece",
+            "ja",
+            vec![season(1, Some(1099)), season(2, Some(50))],
+        );
+        let queries = tv_search_queries(&s, 2, 1);
+        // tvsearch + SxxExx + absolute-number ("One Piece 1100").
+        assert_eq!(queries.len(), 3);
+        assert!(matches!(queries[0], SearchQuery::TvByTvdb { .. }));
+        assert!(
+            matches!(&queries[2], SearchQuery::Raw { query } if query == "One Piece 1100"),
+            "queries were: {queries:?}"
+        );
+    }
+
+    #[test]
+    fn non_anime_show_does_not_issue_absolute_number_query() {
+        let s = show(
+            "Breaking Bad",
+            "en",
+            vec![season(1, Some(7)), season(2, Some(13))],
+        );
+        let queries = tv_search_queries(&s, 2, 1);
+        // tvsearch + SxxExx only; no absolute-number strategy.
+        assert_eq!(queries.len(), 2);
+        assert!(queries
+            .iter()
+            .all(|q| !matches!(q, SearchQuery::Raw { query } if !query.contains('S'))));
+    }
+
+    #[test]
+    fn anime_without_season_data_skips_absolute_query_gracefully() {
+        let s = show("Mystery Anime", "ja", vec![]);
+        let queries = tv_search_queries(&s, 1, 1);
+        // Only tvsearch + SxxExx; absolute skipped since season data is absent.
+        assert_eq!(queries.len(), 2);
+        assert!(!queries
+            .iter()
+            .any(|q| matches!(q, SearchQuery::Raw { query } if query == "Mystery Anime 1")));
+    }
 
     fn candidate(title: &str, score: i64, rejected: Option<&str>) -> RankedRelease {
         RankedRelease {

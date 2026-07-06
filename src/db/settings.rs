@@ -43,3 +43,13 @@ pub async fn set(pool: &SqlitePool, key: &str, value: &str) -> AppResult<()> {
     .await?;
     Ok(())
 }
+
+/// Remove a setting so it reads back as "not set" (`get` returns `None`).
+/// Idempotent: deleting a missing key is a no-op.
+pub async fn delete(pool: &SqlitePool, key: &str) -> AppResult<()> {
+    sqlx::query("DELETE FROM app_settings WHERE key = ?")
+        .bind(key)
+        .execute(pool)
+        .await?;
+    Ok(())
+}

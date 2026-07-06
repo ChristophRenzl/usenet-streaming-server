@@ -22,13 +22,50 @@ pub struct ProbeResult {
     /// HLS `VIDEO-RANGE` value derived from the color transfer: `PQ`
     /// (HDR10/DV), `HLG`, or `SDR`.
     pub video_range: String,
+    /// Embedded chapter markers, in file order. Empty for the vast majority of
+    /// releases (most have no chapters). Powers the client's "Skip Intro".
+    pub chapters: Vec<Chapter>,
+    /// End time (seconds) of the detected intro/opening chapter, when the
+    /// release has one titled like an intro that starts within the first few
+    /// minutes. `None` when there is no such chapter (the client then falls
+    /// back to its own heuristic).
+    pub intro_end_secs: Option<f64>,
 }
+
+/// One embedded chapter marker.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Chapter {
+    pub start_secs: f64,
+    pub end_secs: f64,
+    pub title: Option<String>,
+}
+
+/// A detected intro chapter must start no later than this into the file, so a
+/// mid-episode chapter merely named "OP reprise" is not mistaken for the
+/// opening.
+const INTRO_MAX_START_SECS: f64 = 300.0;
 
 #[derive(Debug, Deserialize)]
 struct ProbeDoc {
     format: Option<ProbeFormat>,
     #[serde(default)]
     streams: Vec<ProbeStream>,
+    #[serde(default)]
+    chapters: Vec<ProbeChapter>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProbeChapter {
+    /// Chapter start/end are seconds as strings (`start_time`, `end_time`).
+    start_time: Option<String>,
+    end_time: Option<String>,
+    #[serde(default)]
+    tags: ProbeChapterTags,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ProbeChapterTags {
+    title: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -80,6 +117,9 @@ pub async fn probe_url(ffprobe_path: &str, url: &str) -> AppResult<ProbeResult> 
             "json",
             "-show_format",
             "-show_streams",
+            // Chapter markers power the client's "Skip Intro"; harmless (empty)
+            // for the many releases without embedded chapters.
+            "-show_chapters",
         ])
         .arg(url)
         .stdin(Stdio::null())
@@ -170,6 +210,17 @@ fn parse_probe(doc: ProbeDoc) -> AppResult<ProbeResult> {
     }
     .to_string();
 
+    let chapters: Vec<Chapter> = doc
+        .chapters
+        .into_iter()
+        .map(|c| Chapter {
+            start_secs: c.start_time.and_then(|s| s.parse().ok()).unwrap_or(0.0),
+            end_secs: c.end_time.and_then(|s| s.parse().ok()).unwrap_or(0.0),
+            title: c.tags.title,
+        })
+        .collect();
+    let intro_end_secs = detect_intro_end(&chapters);
+
     Ok(ProbeResult {
         duration_secs,
         video_codec,
@@ -177,7 +228,30 @@ fn parse_probe(doc: ProbeDoc) -> AppResult<ProbeResult> {
         audio_channels,
         fps,
         video_range,
+        chapters,
+        intro_end_secs,
     })
+}
+
+/// Find the end of the intro/opening among the chapters: the end time of the
+/// first chapter whose title looks like an intro (`intro`, `opening`, `op`, or
+/// `avant`, case-insensitively) and that starts within the first
+/// [`INTRO_MAX_START_SECS`]. `None` when no chapter qualifies.
+fn detect_intro_end(chapters: &[Chapter]) -> Option<f64> {
+    chapters
+        .iter()
+        .find(|c| c.start_secs <= INTRO_MAX_START_SECS && title_is_intro(c.title.as_deref()))
+        .map(|c| c.end_secs)
+}
+
+/// Whether a chapter title names an intro/opening. Matches whole words so a
+/// title like "Recap" is not caught by the substring "op".
+fn title_is_intro(title: Option<&str>) -> bool {
+    let Some(title) = title else { return false };
+    let lower = title.to_ascii_lowercase();
+    lower
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|word| matches!(word, "intro" | "opening" | "op" | "avant"))
 }
 
 #[cfg(test)]
@@ -262,5 +336,70 @@ mod tests {
         assert_eq!(result.duration_secs, None);
         assert_eq!(result.video_codec, None);
         assert_eq!(result.audio_codec, None);
+        // No chapters element → empty, and no intro marker.
+        assert!(result.chapters.is_empty());
+        assert_eq!(result.intro_end_secs, None);
+    }
+
+    #[test]
+    fn parses_chapters_and_detects_intro() {
+        let doc: ProbeDoc = serde_json::from_str(
+            r#"{
+                "streams": [{"codec_type": "video", "codec_name": "hevc"}],
+                "format": {"duration": "1440.0"},
+                "chapters": [
+                    {"start_time": "0.000", "end_time": "90.000", "tags": {"title": "Intro"}},
+                    {"start_time": "90.000", "end_time": "1440.000", "tags": {"title": "Episode"}}
+                ]
+            }"#,
+        )
+        .expect("parse");
+        let result = parse_probe(doc).expect("probe");
+        assert_eq!(result.chapters.len(), 2);
+        assert_eq!(result.chapters[0].start_secs, 0.0);
+        assert_eq!(result.chapters[0].end_secs, 90.0);
+        assert_eq!(result.chapters[0].title.as_deref(), Some("Intro"));
+        // The intro chapter's end time is the intro end.
+        assert_eq!(result.intro_end_secs, Some(90.0));
+    }
+
+    #[test]
+    fn no_intro_chapter_leaves_intro_end_none() {
+        let doc: ProbeDoc = serde_json::from_str(
+            r#"{
+                "streams": [{"codec_type": "video", "codec_name": "h264"}],
+                "chapters": [
+                    {"start_time": "0.0", "end_time": "600.0", "tags": {"title": "Chapter 1"}},
+                    {"start_time": "600.0", "end_time": "1200.0", "tags": {"title": "Chapter 2"}}
+                ]
+            }"#,
+        )
+        .expect("parse");
+        let result = parse_probe(doc).expect("probe");
+        assert_eq!(result.chapters.len(), 2);
+        assert_eq!(result.intro_end_secs, None);
+    }
+
+    #[test]
+    fn intro_detection_matches_common_titles_and_respects_start_window() {
+        // Whole-word intro synonyms match.
+        for title in ["Intro", "OPENING", "op", "Avant"] {
+            assert!(
+                title_is_intro(Some(title)),
+                "'{title}' should be an intro title"
+            );
+        }
+        // "Recap" must not match on the "op"/"cap" substring.
+        assert!(!title_is_intro(Some("Recap")));
+        assert!(!title_is_intro(Some("Episode")));
+        assert!(!title_is_intro(None));
+
+        // An intro-titled chapter that starts too late is not the opening.
+        let late = vec![Chapter {
+            start_secs: INTRO_MAX_START_SECS + 60.0,
+            end_secs: INTRO_MAX_START_SECS + 120.0,
+            title: Some("Opening".into()),
+        }];
+        assert_eq!(detect_intro_end(&late), None);
     }
 }

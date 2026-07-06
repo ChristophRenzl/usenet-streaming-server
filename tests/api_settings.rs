@@ -336,3 +336,103 @@ async fn app_settings_trim_surrounding_whitespace_on_keys() {
         "opensubtitles username must be trimmed before storage"
     );
 }
+
+#[tokio::test]
+async fn opensubtitles_key_is_cleared_by_empty_string() {
+    let server = server().await;
+
+    // Store a per-user key.
+    let response = server
+        .put("/api/v1/settings/app")
+        .add_header("x-api-key", API_KEY)
+        .json(&json!({ "opensubtitles_api_key": "opensubs1234" }))
+        .await;
+    assert_eq!(response.status_code(), 200);
+    let settings: Value = response.json();
+    assert_eq!(settings["opensubtitles_api_key"], json!("****1234"));
+    assert_eq!(
+        settings["opensubtitles_configured"],
+        json!(true),
+        "a stored per-user key configures subtitles"
+    );
+    assert_eq!(settings["opensubtitles_api_key_source"], json!("user"));
+
+    // An explicit empty string clears it.
+    let response = server
+        .put("/api/v1/settings/app")
+        .add_header("x-api-key", API_KEY)
+        .json(&json!({ "opensubtitles_api_key": "" }))
+        .await;
+    assert_eq!(response.status_code(), 200);
+    let settings: Value = response.json();
+    assert_eq!(
+        settings["opensubtitles_api_key"],
+        Value::Null,
+        "cleared key reads back as not-set"
+    );
+    // No config default in the test config, so subtitles are now unconfigured.
+    assert_eq!(settings["opensubtitles_configured"], json!(false));
+    assert_eq!(settings["opensubtitles_api_key_source"], json!("none"));
+}
+
+#[tokio::test]
+async fn opensubtitles_account_is_cleared_by_empty_strings() {
+    let server = server().await;
+
+    // Sign in with username + password.
+    let response = server
+        .put("/api/v1/settings/app")
+        .add_header("x-api-key", API_KEY)
+        .json(&json!({
+            "opensubtitles_username": "alice",
+            "opensubtitles_password": "s3cret"
+        }))
+        .await;
+    assert_eq!(response.status_code(), 200);
+    let settings: Value = response.json();
+    assert_eq!(settings["opensubtitles_username"], json!("alice"));
+    assert_eq!(settings["opensubtitles_password_set"], json!(true));
+
+    // Clear the account: empty username + empty password.
+    let response = server
+        .put("/api/v1/settings/app")
+        .add_header("x-api-key", API_KEY)
+        .json(&json!({
+            "opensubtitles_username": "",
+            "opensubtitles_password": ""
+        }))
+        .await;
+    assert_eq!(response.status_code(), 200);
+    let settings: Value = response.json();
+    assert_eq!(
+        settings["opensubtitles_username"],
+        Value::Null,
+        "cleared username reads back as not-set"
+    );
+    assert_eq!(
+        settings["opensubtitles_password_set"],
+        json!(false),
+        "cleared password reads back as not-set"
+    );
+}
+
+#[tokio::test]
+async fn tmdb_key_is_cleared_by_empty_string() {
+    let server = server().await;
+
+    let response = server
+        .put("/api/v1/settings/app")
+        .add_header("x-api-key", API_KEY)
+        .json(&json!({ "tmdb_api_key": "abcdef7890wxyz" }))
+        .await;
+    assert_eq!(response.status_code(), 200);
+    assert_eq!(response.json::<Value>()["tmdb_api_key"], json!("****wxyz"));
+
+    let response = server
+        .put("/api/v1/settings/app")
+        .add_header("x-api-key", API_KEY)
+        .json(&json!({ "tmdb_api_key": "" }))
+        .await;
+    assert_eq!(response.status_code(), 200);
+    assert_eq!(response.json::<Value>()["tmdb_api_key"], Value::Null);
+}
