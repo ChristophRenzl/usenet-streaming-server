@@ -15,6 +15,11 @@ use super::session::{Session, SessionState};
 /// Audio codecs HLS.js/AVPlayer play back without transcoding.
 const COPYABLE_AUDIO: &[&str] = &["aac", "ac3", "eac3"];
 
+/// Nominal HLS segment length. The synthetic VOD playlist, ffmpeg's
+/// `-hls_time`, the forced keyframe cadence and the segment-index ↔ time
+/// mapping must all agree on this.
+pub const SEGMENT_SECONDS: f64 = 6.0;
+
 /// HDR→SDR for clients that cannot render PQ/HLG. Downscale first (cheap)
 /// so the linear-light tonemap runs at 1080p, not 4K — that is the
 /// difference between ~0.7x and ~1.4x realtime on a 10-core box.
@@ -94,8 +99,16 @@ pub async fn spawn_hls(session: &Arc<Session>, options: SpawnOptions<'_>) -> App
         "event",
         "-hls_fmp4_init_filename",
         "init.mp4",
-        "-hls_segment_filename",
     ]);
+    if options.start_secs > 0.0 {
+        // Keep segment numbering and fMP4 timestamps on the global VOD
+        // timeline so a restarted ffmpeg slots into the same playlist.
+        let start_number = (options.start_secs / SEGMENT_SECONDS).round() as u64;
+        cmd.arg("-start_number").arg(start_number.to_string());
+        cmd.arg("-output_ts_offset")
+            .arg(format!("{:.3}", options.start_secs));
+    }
+    cmd.arg("-hls_segment_filename");
     cmd.arg(dir.join("seg_%05d.m4s"));
     cmd.arg(dir.join("media.m3u8"));
     cmd.stdin(Stdio::null())

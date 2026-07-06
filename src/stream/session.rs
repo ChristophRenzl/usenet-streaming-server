@@ -94,6 +94,13 @@ pub struct Session {
     last_access: Mutex<Instant>,
     /// `-ss` offset of the currently running ffmpeg (changes on seek).
     start_offset: Mutex<f64>,
+    /// When ffmpeg was last (re)spawned; debounces restart storms when a
+    /// scrub fires several out-of-window segment requests at once.
+    last_spawn: Mutex<Instant>,
+    /// Segment indexes with an in-flight request. The player fetches an
+    /// ascending burst in parallel; only the LOWEST outstanding index may
+    /// restart ffmpeg, everyone above waits for the sweep to reach them.
+    requested: Mutex<std::collections::BTreeMap<u64, u32>>,
     /// Bumped on every ffmpeg (re)spawn so stale monitor tasks stand down.
     generation: AtomicU64,
     /// The running ffmpeg child; taken by whoever reaps it (monitor on
@@ -149,6 +156,8 @@ impl Session {
             state: Mutex::new(SessionState::Starting),
             last_access: Mutex::new(Instant::now()),
             start_offset: Mutex::new(0.0),
+            last_spawn: Mutex::new(Instant::now()),
+            requested: Mutex::new(std::collections::BTreeMap::new()),
             generation: AtomicU64::new(0),
             child: tokio::sync::Mutex::new(None),
             stderr_tail: Mutex::new(VecDeque::new()),
@@ -227,6 +236,46 @@ impl Session {
 
     pub fn start_offset(&self) -> f64 {
         *self.start_offset.lock().expect("session offset lock")
+    }
+
+    pub fn mark_spawned(&self) {
+        *self.last_spawn.lock().expect("session spawn lock") = Instant::now();
+    }
+
+    pub fn begin_segment_request(&self, index: u64) {
+        *self
+            .requested
+            .lock()
+            .expect("session requested lock")
+            .entry(index)
+            .or_insert(0) += 1;
+    }
+
+    pub fn end_segment_request(&self, index: u64) {
+        let mut requested = self.requested.lock().expect("session requested lock");
+        if let Some(count) = requested.get_mut(&index) {
+            *count -= 1;
+            if *count == 0 {
+                requested.remove(&index);
+            }
+        }
+    }
+
+    /// Lowest segment index with an in-flight request.
+    pub fn min_requested(&self) -> Option<u64> {
+        self.requested
+            .lock()
+            .expect("session requested lock")
+            .keys()
+            .next()
+            .copied()
+    }
+
+    pub fn since_spawn(&self) -> std::time::Duration {
+        self.last_spawn
+            .lock()
+            .expect("session spawn lock")
+            .elapsed()
     }
 
     pub fn set_start_offset(&self, secs: f64) {
