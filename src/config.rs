@@ -15,6 +15,8 @@ pub struct AppConfig {
     pub storage: StorageConfig,
     pub cache: CacheConfig,
     pub streaming: StreamingConfig,
+    #[serde(default)]
+    pub subtitles: SubtitlesConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +62,17 @@ pub struct StreamingConfig {
     pub par2_path: String,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SubtitlesConfig {
+    /// Operator-supplied default OpenSubtitles consumer API key, applied when no
+    /// per-user key is stored in `app_settings`. Lets an operator configure the
+    /// key once at deploy time (e.g. `APP_SUBTITLES__OPENSUBTITLES_DEFAULT_API_KEY`)
+    /// so users only ever manage their OpenSubtitles username/password. Default
+    /// `None`; never bundled — get a key at https://www.opensubtitles.com/consumers.
+    #[serde(default)]
+    pub opensubtitles_default_api_key: Option<String>,
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -87,6 +100,7 @@ impl Default for AppConfig {
                 ffprobe_path: "ffprobe".into(),
                 par2_path: "par2".into(),
             },
+            subtitles: SubtitlesConfig::default(),
         }
     }
 }
@@ -137,6 +151,26 @@ mod tests {
             let c = AppConfig::load("config.toml").expect("load");
             assert_eq!(c.server.port, 9001);
             assert_eq!(c.auth.api_key, "from-file");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn opensubtitles_default_key_defaults_to_none() {
+        let c = AppConfig::default();
+        assert!(c.subtitles.opensubtitles_default_api_key.is_none());
+    }
+
+    #[test]
+    fn opensubtitles_default_key_from_env() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("config.toml", "[auth]\napi_key = \"from-file\"\n")?;
+            jail.set_env("APP_SUBTITLES__OPENSUBTITLES_DEFAULT_API_KEY", "deploy-key");
+            let c = AppConfig::load("config.toml").expect("load");
+            assert_eq!(
+                c.subtitles.opensubtitles_default_api_key.as_deref(),
+                Some("deploy-key")
+            );
             Ok(())
         });
     }

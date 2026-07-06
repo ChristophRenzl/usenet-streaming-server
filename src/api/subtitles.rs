@@ -24,19 +24,54 @@ use crate::{
     tmdb::models::MediaType,
 };
 
-/// Build an OpenSubtitles client from the stored API key, failing with a
-/// helpful 400 when the key is not configured.
-pub async fn opensubtitles_client(state: &AppState) -> AppResult<OpenSubtitlesClient> {
-    let key = db::settings::get(&state.db, db::settings::OPENSUBTITLES_API_KEY)
+/// Where the effective OpenSubtitles API key comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiKeySource {
+    /// A per-user key stored in `app_settings` (takes precedence).
+    User,
+    /// The operator-supplied config/env default (`subtitles.opensubtitles_default_api_key`).
+    Default,
+    /// Neither is configured.
+    None,
+}
+
+/// Resolve the effective OpenSubtitles API key and its source: the per-user
+/// `opensubtitles_api_key` from `app_settings` when set, else the operator
+/// config default, else `None`. Centralized so search, session auto-attach and
+/// the offset/download paths all agree on which key is in effect.
+pub async fn effective_opensubtitles_key(
+    state: &AppState,
+) -> AppResult<(Option<String>, ApiKeySource)> {
+    if let Some(key) = db::settings::get(&state.db, db::settings::OPENSUBTITLES_API_KEY)
         .await?
         .filter(|k| !k.is_empty())
-        .ok_or_else(|| {
-            AppError::BadRequest(
-                "OpenSubtitles API key not configured; set it via PUT /api/v1/settings/app \
-                 (get a free key at https://www.opensubtitles.com/consumers)"
-                    .into(),
-            )
-        })?;
+    {
+        return Ok((Some(key), ApiKeySource::User));
+    }
+    if let Some(key) = state
+        .config
+        .subtitles
+        .opensubtitles_default_api_key
+        .clone()
+        .filter(|k| !k.is_empty())
+    {
+        return Ok((Some(key), ApiKeySource::Default));
+    }
+    Ok((None, ApiKeySource::None))
+}
+
+/// Build an OpenSubtitles client from the effective API key (per-user override,
+/// else operator config default), failing with a helpful 400 when neither is
+/// configured.
+pub async fn opensubtitles_client(state: &AppState) -> AppResult<OpenSubtitlesClient> {
+    let key = effective_opensubtitles_key(state).await?.0.ok_or_else(|| {
+        AppError::BadRequest(
+            "OpenSubtitles API key not configured; set it via PUT /api/v1/settings/app \
+             or an operator default (APP_SUBTITLES__OPENSUBTITLES_DEFAULT_API_KEY) \
+             (get a free key at https://www.opensubtitles.com/consumers)"
+                .into(),
+        )
+    })?;
     Ok(OpenSubtitlesClient::new(
         state.http.clone(),
         state.opensubtitles_base_url.as_ref(),
@@ -211,10 +246,65 @@ pub fn router() -> OpenApiRouter<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::AppConfig;
 
     #[test]
     fn language_parsing_trims_and_lowercases() {
         assert_eq!(parse_languages(" EN , de ,, Fr "), vec!["en", "de", "fr"]);
         assert!(parse_languages("").is_empty());
+    }
+
+    async fn test_state(default_key: Option<&str>) -> AppState {
+        let mut config = AppConfig::default();
+        config.auth.api_key = "unit-test-key".into();
+        config.subtitles.opensubtitles_default_api_key = default_key.map(str::to_string);
+        AppState::for_tests(config).await.expect("test state")
+    }
+
+    #[tokio::test]
+    async fn effective_key_user_wins_over_default() {
+        let state = test_state(Some("default-key")).await;
+        db::settings::set(&state.db, db::settings::OPENSUBTITLES_API_KEY, "user-key")
+            .await
+            .unwrap();
+        let (key, source) = effective_opensubtitles_key(&state).await.unwrap();
+        assert_eq!(key.as_deref(), Some("user-key"));
+        assert_eq!(source, ApiKeySource::User);
+    }
+
+    #[tokio::test]
+    async fn effective_key_falls_back_to_default() {
+        let state = test_state(Some("default-key")).await;
+        let (key, source) = effective_opensubtitles_key(&state).await.unwrap();
+        assert_eq!(key.as_deref(), Some("default-key"));
+        assert_eq!(source, ApiKeySource::Default);
+    }
+
+    #[tokio::test]
+    async fn effective_key_none_when_neither_set() {
+        let state = test_state(None).await;
+        let (key, source) = effective_opensubtitles_key(&state).await.unwrap();
+        assert!(key.is_none());
+        assert_eq!(source, ApiKeySource::None);
+    }
+
+    #[tokio::test]
+    async fn empty_user_key_falls_back_to_default() {
+        let state = test_state(Some("default-key")).await;
+        db::settings::set(&state.db, db::settings::OPENSUBTITLES_API_KEY, "")
+            .await
+            .unwrap();
+        let (key, source) = effective_opensubtitles_key(&state).await.unwrap();
+        assert_eq!(key.as_deref(), Some("default-key"));
+        assert_eq!(source, ApiKeySource::Default);
+    }
+
+    #[tokio::test]
+    async fn client_errors_when_not_configured() {
+        let state = test_state(None).await;
+        match opensubtitles_client(&state).await {
+            Ok(_) => panic!("expected not-configured error"),
+            Err(err) => assert!(matches!(err, AppError::BadRequest(_))),
+        }
     }
 }

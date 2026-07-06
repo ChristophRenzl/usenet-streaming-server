@@ -236,12 +236,25 @@ pub struct AppSettings {
     /// Masked TMDB API key (only the last 4 characters are shown), or `null`
     /// when not configured.
     pub tmdb_api_key: Option<String>,
-    /// Masked OpenSubtitles API key (last 4 characters), or `null` when not
-    /// configured. Subtitles are optional; playback works without it.
+    /// Masked per-user OpenSubtitles API key (last 4 characters), or `null`
+    /// when no per-user key is stored. Subtitles are optional; playback works
+    /// without it. A `null` here does not mean subtitles are unavailable — an
+    /// operator config default may still be in effect (see
+    /// `opensubtitles_api_key_source`).
     pub opensubtitles_api_key: Option<String>,
-    /// Whether an OpenSubtitles API key is configured (convenience flag for
-    /// the dashboard checklist, which treats subtitles as optional).
+    /// Whether an OpenSubtitles API key is effectively configured — true when a
+    /// per-user key is set OR an operator config default exists. Convenience
+    /// flag for the dashboard checklist, which treats subtitles as optional.
     pub opensubtitles_configured: bool,
+    /// Where the effective OpenSubtitles API key comes from: `"user"` (per-user
+    /// key stored via the API), `"default"` (operator-supplied config/env
+    /// default, so users only need username/password), or `"none"`. Lets the UI
+    /// explain the key's origin and make the per-user key optional.
+    pub opensubtitles_api_key_source: String,
+    /// Whether an operator config default OpenSubtitles API key is present
+    /// (`subtitles.opensubtitles_default_api_key`). When true, the per-user key
+    /// is optional and only acts as an override.
+    pub opensubtitles_default_key_active: bool,
     /// OpenSubtitles account username, when configured. Logging in lifts the
     /// anonymous download quota.
     pub opensubtitles_username: Option<String>,
@@ -287,9 +300,28 @@ async fn current_app_settings(state: &AppState) -> AppResult<AppSettings> {
     let tmdb_key = db::settings::get(&state.db, db::settings::TMDB_API_KEY)
         .await?
         .filter(|k| !k.is_empty());
+    // A per-user key is masked and reported directly; whether subtitles are
+    // effectively usable additionally accounts for the operator config default.
     let opensubtitles_key = db::settings::get(&state.db, db::settings::OPENSUBTITLES_API_KEY)
         .await?
         .filter(|k| !k.is_empty());
+    let (_, opensubtitles_key_source) =
+        crate::api::subtitles::effective_opensubtitles_key(state).await?;
+    let opensubtitles_default_key_active = matches!(
+        opensubtitles_key_source,
+        crate::api::subtitles::ApiKeySource::Default
+    ) || state
+        .config
+        .subtitles
+        .opensubtitles_default_api_key
+        .as_deref()
+        .is_some_and(|k| !k.is_empty());
+    let opensubtitles_api_key_source = match opensubtitles_key_source {
+        crate::api::subtitles::ApiKeySource::User => "user",
+        crate::api::subtitles::ApiKeySource::Default => "default",
+        crate::api::subtitles::ApiKeySource::None => "none",
+    }
+    .to_string();
     let opensubtitles_username = db::settings::get(&state.db, db::settings::OPENSUBTITLES_USERNAME)
         .await?
         .filter(|u| !u.is_empty());
@@ -305,8 +337,13 @@ async fn current_app_settings(state: &AppState) -> AppResult<AppSettings> {
     let active_key = override_key.unwrap_or_else(|| state.config.auth.api_key.clone());
     Ok(AppSettings {
         tmdb_api_key: tmdb_key.map(|k| mask_secret(&k)),
-        opensubtitles_configured: opensubtitles_key.is_some(),
+        opensubtitles_configured: !matches!(
+            opensubtitles_key_source,
+            crate::api::subtitles::ApiKeySource::None
+        ),
         opensubtitles_api_key: opensubtitles_key.map(|k| mask_secret(&k)),
+        opensubtitles_api_key_source,
+        opensubtitles_default_key_active,
         opensubtitles_username,
         opensubtitles_password_set,
         api_key: mask_secret(&active_key),

@@ -119,6 +119,29 @@ lifts the anonymous daily download quota. Subtitles are **best-effort and
 non-fatal** — playback works without a key, and any subtitle failure is logged
 and skipped rather than failing the session.
 
+### Configure the API key once at deploy time (the "Jellyfin experience")
+
+OpenSubtitles requires a consumer `Api-Key` on every request, while
+username/password only grant download quota. To avoid making every user paste an
+API key, an **operator can supply a default key once at deploy time** and then
+users only ever manage their OpenSubtitles username/password:
+
+```
+APP_SUBTITLES__OPENSUBTITLES_DEFAULT_API_KEY=your-consumer-key
+```
+
+(equivalently `subtitles.opensubtitles_default_api_key` in the config file — see
+[config.example.toml](config.example.toml)). Effective-key resolution: a
+per-user `opensubtitles_api_key` stored via the API **wins**; otherwise the
+operator default is used; if neither is set, subtitles stay disabled. When the
+default is active the web UI shows *"Using the server's built-in API key"* and
+the per-user key becomes an optional override.
+
+The default key is **operator-supplied only and never bundled** — hardcoding a
+key would violate OpenSubtitles' per-consumer terms and be rate-limited. Get a
+free consumer key at
+[opensubtitles.com/consumers](https://www.opensubtitles.com/consumers).
+
 Subtitles are delivered as **HLS `#EXT-X-MEDIA:TYPE=SUBTITLES` renditions**, so
 tvOS AVPlayer offers them natively in its own subtitle menu (each track is a
 single-segment WebVTT converted from the source SubRip). Three things keep the

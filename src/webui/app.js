@@ -272,7 +272,9 @@ async function renderDashboard(main) {
             !!app.opensubtitles_configured,
             "OpenSubtitles (optional)",
             app.opensubtitles_configured
-              ? "Configured — subtitles are searched and auto-attached."
+              ? app.opensubtitles_default_key_active && app.opensubtitles_api_key_source === "default"
+                ? "Using the server's built-in API key — subtitles are searched and auto-attached."
+                : "Configured — subtitles are searched and auto-attached."
               : "Optional — add a key to enable automatic subtitles.",
             "#/opensubtitles",
             "Subtitles"
@@ -623,19 +625,32 @@ async function renderTmdb(main) {
 
 async function renderOpensubtitles(main) {
   const app = await api("/settings/app");
+  const defaultKeyActive = !!app.opensubtitles_default_key_active;
+  const usingDefault = defaultKeyActive && app.opensubtitles_api_key_source === "default";
+  // With a server-supplied default key, the per-user key is only an override,
+  // so it is optional; otherwise it is required to enable subtitles at all.
+  const keyLabel = defaultKeyActive ? "Override API key (optional)" : "New OpenSubtitles API key";
+  const keyRequired = defaultKeyActive ? "" : "required";
+  const currentKeyLine = app.opensubtitles_api_key
+    ? `Current key: <code>${esc(app.opensubtitles_api_key)}</code>`
+    : usingDefault
+      ? `Using the server's built-in API key. <span class="chip accent">server default active</span>`
+      : `Current key: <span class="chip warn">not set</span>`;
+  const keyHint = defaultKeyActive
+    ? `The server has a built-in OpenSubtitles API key, so you only need a username/password below. Set a key here only to override it with your own consumer key from <a href="https://www.opensubtitles.com/consumers" target="_blank" rel="noopener">opensubtitles.com/consumers</a>.`
+    : `Get a free consumer API key at <a href="https://www.opensubtitles.com/consumers" target="_blank" rel="noopener">opensubtitles.com/consumers</a>.`;
   main.innerHTML = `
     ${pageHead("Subtitles", "OpenSubtitles powers automatic subtitle search and delivery. Optional — playback works without it. When set, the server auto-attaches subtitles at playback start (release-accurate moviehash matching, with fps-drift correction) and offers them natively; a manual offset lets you nudge timing.")}
     <div class="card" style="max-width:560px">
       <h2>API key</h2>
       <p class="muted" style="margin-top:0">
-        Current key: ${app.opensubtitles_api_key ? `<code>${esc(app.opensubtitles_api_key)}</code>` : '<span class="chip warn">not set</span>'}
+        ${currentKeyLine}
       </p>
       <form id="os-key-form">
         <div class="field">
-          <label>New OpenSubtitles API key</label>
-          <input name="key" required autocomplete="off" placeholder="Paste your OpenSubtitles API key">
-          <span class="hint">Get a free consumer API key at
-            <a href="https://www.opensubtitles.com/consumers" target="_blank" rel="noopener">opensubtitles.com/consumers</a>.</span>
+          <label>${keyLabel}</label>
+          <input name="key" ${keyRequired} autocomplete="off" placeholder="${defaultKeyActive ? "Leave blank to use the server's built-in key" : "Paste your OpenSubtitles API key"}">
+          <span class="hint">${keyHint}</span>
         </div>
         <div class="form-actions">
           <button type="submit" class="btn primary">Save key</button>
@@ -643,7 +658,7 @@ async function renderOpensubtitles(main) {
       </form>
     </div>
     <div class="card" style="max-width:560px;margin-top:16px">
-      <h2>Account (optional)</h2>
+      <h2>Account${defaultKeyActive ? "" : " (optional)"}</h2>
       <p class="muted" style="margin-top:0">
         Logging in with an OpenSubtitles account lifts the anonymous daily
         download quota.
@@ -668,10 +683,18 @@ async function renderOpensubtitles(main) {
 
   $("#os-key-form").addEventListener("submit", async (e) => {
     e.preventDefault();
+    const key = e.target.key.value.trim();
+    // With a server default active the field is optional: a blank submit means
+    // "keep using the built-in key", so don't send "" (which would clear an
+    // override). Without a default the input is required, so key is non-empty.
+    if (defaultKeyActive && !key) {
+      toast("Using the server's built-in API key.", "success");
+      return;
+    }
     try {
       await api("/settings/app", {
         method: "PUT",
-        body: JSON.stringify({ opensubtitles_api_key: e.target.key.value.trim() }),
+        body: JSON.stringify({ opensubtitles_api_key: key }),
       });
       toast("OpenSubtitles key saved.", "success");
       navigate();
