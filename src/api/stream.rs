@@ -816,10 +816,15 @@ async fn pump_segment(
             index,
         }
     });
+    // Top-level `free` box; ISO BMFF parsers skip it. Sent as keepalive
+    // while the segment is still being produced — AVPlayer drops the
+    // variant when a segment request delivers no bytes for ~6s.
+    const FREE_BOX: [u8; 8] = [0, 0, 0, 8, b'f', b'r', b'e', b'e'];
+
     let path = session.temp_dir.join(&segment);
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(90);
     let mut file: Option<tokio::fs::File> = None;
-    let mut sent = 0usize;
+    let mut last_bytes = tokio::time::Instant::now();
     let mut buf = vec![0u8; 256 * 1024];
     loop {
         // The player cancels stale loads on scrubs; a closed channel must
@@ -871,7 +876,7 @@ async fn pump_segment(
                     {
                         return; // client went away
                     }
-                    sent += n;
+                    last_bytes = tokio::time::Instant::now();
                     continue; // drain without sleeping
                 }
                 Ok(_) => {
@@ -882,18 +887,14 @@ async fn pump_segment(
                         return;
                     }
                     // If a concurrent restart wiped the file from under us,
-                    // our handle points at a dead inode. Start over when
-                    // nothing went out yet; otherwise the response is
-                    // unsalvageable (mixed generations) — abort and let the
-                    // player retry.
+                    // our handle points at a dead inode. The response is
+                    // unsalvageable once real bytes went out (mixed
+                    // generations) — abort and let the player retry.
                     if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
-                        if sent > 0 {
-                            let _ = tx
-                                .send(Err(std::io::Error::other("segment replaced mid-read")))
-                                .await;
-                            return;
-                        }
-                        file = None;
+                        let _ = tx
+                            .send(Err(std::io::Error::other("segment replaced mid-read")))
+                            .await;
+                        return;
                     }
                 }
                 Err(error) => {
@@ -901,6 +902,18 @@ async fn pump_segment(
                     return;
                 }
             }
+        }
+        // Keep bytes trickling while ffmpeg works (file not created yet or
+        // mid-write pause) so the player's no-data watchdog stays quiet.
+        if last_bytes.elapsed() >= std::time::Duration::from_secs(2) {
+            if tx
+                .send(Ok(bytes::Bytes::from_static(&FREE_BOX)))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            last_bytes = tokio::time::Instant::now();
         }
         if tokio::time::Instant::now() >= deadline {
             let _ = tx
