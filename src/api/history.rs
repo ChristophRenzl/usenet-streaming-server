@@ -33,6 +33,15 @@ pub struct HistoryItem {
     pub watched_at: String,
     /// 0–100, when the duration is known.
     pub percent_watched: Option<f64>,
+    /// Movie or show title, captured at session start (missing on rows
+    /// recorded before metadata capture existed).
+    pub title: Option<String>,
+    pub poster_url: Option<String>,
+    pub backdrop_url: Option<String>,
+    /// Episode title (tv only).
+    pub episode_title: Option<String>,
+    /// Episode still image (tv only).
+    pub still_url: Option<String>,
 }
 
 impl From<HistoryEntry> for HistoryItem {
@@ -52,6 +61,11 @@ impl From<HistoryEntry> for HistoryItem {
             duration_secs: entry.duration_secs,
             watched_at: entry.watched_at,
             percent_watched,
+            title: entry.title,
+            poster_url: entry.poster_url,
+            backdrop_url: entry.backdrop_url,
+            episode_title: entry.episode_title,
+            still_url: entry.still_url,
         }
     }
 }

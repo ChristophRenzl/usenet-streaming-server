@@ -86,7 +86,12 @@ pub async fn create_download(
     .validated()?;
 
     let candidates = resolve_candidates(&state, &target, request.max_resolution).await?;
-    let to_try = pick_candidates(&candidates, request.release_guid.as_deref(), MAX_ATTEMPTS)?;
+    let to_try = pick_candidates(
+        &candidates,
+        request.release_guid.as_deref(),
+        None,
+        MAX_ATTEMPTS,
+    )?;
 
     let mut failures: Vec<String> = Vec::new();
     for candidate in to_try {
