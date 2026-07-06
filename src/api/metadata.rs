@@ -15,7 +15,10 @@ use crate::{
     state::AppState,
     tmdb::{
         client::{ListKind, PagedSearchResults, SearchType, TrendingType, TrendingWindow},
-        models::{Episode, GenreList, MediaType, Movie, SearchResult, Season, TvShow},
+        models::{
+            Collection, Episode, Genre, GenreList, MediaType, Movie, Person, SearchResult, Season,
+            TvShow,
+        },
         TmdbClient,
     },
 };
@@ -223,7 +226,19 @@ pub struct GenresParams {
     pub media_type: MediaType,
 }
 
-/// List the TMDB genres for movies or TV shows.
+/// Enriched genre lists are cached this long: the backdrops come from one
+/// discover call per genre, which would otherwise fan out ~19 TMDB requests
+/// on every app launch for artwork that shifts slowly.
+const GENRE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+
+type GenreCache =
+    std::sync::Mutex<std::collections::HashMap<MediaType, (std::time::Instant, Vec<Genre>)>>;
+static GENRE_CACHE: std::sync::LazyLock<GenreCache> = std::sync::LazyLock::new(Default::default);
+
+/// List the TMDB genres for movies or TV shows, each carrying the backdrop of
+/// its current top discover hit for the genre-browse tiles. Backdrops are
+/// best-effort — a discovery failure yields `backdrop_url: null`, never an
+/// error — and the enriched list is cached for a few hours.
 #[utoipa::path(get, path = "/genres", tag = "metadata",
     params(GenresParams),
     responses(
@@ -235,9 +250,79 @@ pub async fn genres(
     State(state): State<AppState>,
     Query(params): Query<GenresParams>,
 ) -> AppResult<Json<GenreList>> {
+    if let Some((at, cached)) = GENRE_CACHE
+        .lock()
+        .expect("genre cache lock")
+        .get(&params.media_type)
+        .cloned()
+    {
+        if at.elapsed() < GENRE_CACHE_TTL {
+            return Ok(Json(GenreList { genres: cached }));
+        }
+    }
+
     let client = tmdb_client(&state).await?;
-    let genres = client.genres(params.media_type).await?;
+    let mut genres = client.genres(params.media_type).await?;
+    let backdrops = futures::future::join_all(genres.iter().map(|genre| {
+        let client = &client;
+        async move {
+            client
+                .discover(params.media_type, Some(genre.id), None, None)
+                .await
+                .ok()
+                .and_then(|page| {
+                    page.results
+                        .into_iter()
+                        .find_map(|result| result.backdrop_url)
+                })
+        }
+    }))
+    .await;
+    for (genre, backdrop) in genres.iter_mut().zip(backdrops) {
+        genre.backdrop_url = backdrop;
+    }
+
+    GENRE_CACHE.lock().expect("genre cache lock").insert(
+        params.media_type,
+        (std::time::Instant::now(), genres.clone()),
+    );
     Ok(Json(GenreList { genres }))
+}
+
+/// A movie collection ("saga"): its member movies in release order, for the
+/// Collection button on movies that belong to one.
+#[utoipa::path(get, path = "/collections/{id}", tag = "metadata",
+    params(("id" = i64, Path, description = "TMDB collection id")),
+    responses(
+        (status = 200, body = Collection),
+        (status = 400, description = "TMDB API key not configured"),
+        (status = 404, description = "Unknown collection"),
+        (status = 502, description = "TMDB upstream error"),
+    ))]
+pub async fn collection_details(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> AppResult<Json<Collection>> {
+    let client = tmdb_client(&state).await?;
+    Ok(Json(client.collection(id).await?))
+}
+
+/// A person with their movie/TV appearances (most popular first), for the
+/// cast browsing screen.
+#[utoipa::path(get, path = "/person/{id}", tag = "metadata",
+    params(("id" = i64, Path, description = "TMDB person id")),
+    responses(
+        (status = 200, body = Person),
+        (status = 400, description = "TMDB API key not configured"),
+        (status = 404, description = "Unknown person"),
+        (status = 502, description = "TMDB upstream error"),
+    ))]
+pub async fn person_details(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> AppResult<Json<Person>> {
+    let client = tmdb_client(&state).await?;
+    Ok(Json(client.person(id).await?))
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -366,4 +451,6 @@ pub fn router() -> OpenApiRouter<AppState> {
         .routes(routes!(tv_details))
         .routes(routes!(season_details))
         .routes(routes!(episode_details))
+        .routes(routes!(collection_details))
+        .routes(routes!(person_details))
 }

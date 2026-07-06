@@ -12,8 +12,9 @@ use utoipa::ToSchema;
 use crate::error::{AppError, AppResult};
 
 use super::models::{
-    Episode, Genre, MediaType, Movie, RawEpisode, RawGenreList, RawMovieDetails, RawSearchResponse,
-    RawSeasonDetails, RawTvDetails, SearchResult, Season, TvShow,
+    Collection, Episode, Genre, MediaType, Movie, Person, RawCollection, RawEpisode, RawGenreList,
+    RawMovieDetails, RawPerson, RawSearchResponse, RawSeasonDetails, RawTvDetails, SearchResult,
+    Season, TvShow,
 };
 
 /// Search scope for [`TmdbClient::search`].
@@ -271,25 +272,49 @@ impl TmdbClient {
         })
     }
 
-    /// Movie details including the IMDb id and best YouTube trailer key (via
-    /// `append_to_response=external_ids,videos`).
+    /// Movie details including the IMDb id, best YouTube trailer key, cast and
+    /// collection membership (via `append_to_response=external_ids,videos,credits`).
     pub async fn movie_details(&self, tmdb_id: i64) -> AppResult<Movie> {
         let raw: RawMovieDetails = self
             .get_json(
                 &format!("/movie/{tmdb_id}"),
-                &[("append_to_response", "external_ids,videos".to_string())],
+                &[(
+                    "append_to_response",
+                    "external_ids,videos,credits".to_string(),
+                )],
             )
             .await?;
         Ok(raw.into())
     }
 
     /// TV show details including external ids (IMDb/TVDB), the best YouTube
-    /// trailer key and the season list (via `append_to_response=external_ids,videos`).
+    /// trailer key, the season list and cast (via
+    /// `append_to_response=external_ids,videos,credits`).
     pub async fn tv_details(&self, tmdb_id: i64) -> AppResult<TvShow> {
         let raw: RawTvDetails = self
             .get_json(
                 &format!("/tv/{tmdb_id}"),
-                &[("append_to_response", "external_ids,videos".to_string())],
+                &[(
+                    "append_to_response",
+                    "external_ids,videos,credits".to_string(),
+                )],
+            )
+            .await?;
+        Ok(raw.into())
+    }
+
+    /// A movie collection ("saga") with its member movies in release order.
+    pub async fn collection(&self, id: i64) -> AppResult<Collection> {
+        let raw: RawCollection = self.get_json(&format!("/collection/{id}"), &[]).await?;
+        Ok(raw.into())
+    }
+
+    /// A person with their combined movie/TV credits, most popular first.
+    pub async fn person(&self, id: i64) -> AppResult<Person> {
+        let raw: RawPerson = self
+            .get_json(
+                &format!("/person/{id}"),
+                &[("append_to_response", "combined_credits".to_string())],
             )
             .await?;
         Ok(raw.into())

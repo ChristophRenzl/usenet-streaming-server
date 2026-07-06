@@ -39,7 +39,7 @@ async fn releases_endpoint_ranks_indexer_results() {
 
     Mock::given(method("GET"))
         .and(path("/movie/27205"))
-        .and(query_param("append_to_response", "external_ids,videos"))
+        .and(query_param("append_to_response", "external_ids,videos,credits"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "id": 27205,
             "title": "Inception",

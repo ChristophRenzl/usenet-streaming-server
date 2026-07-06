@@ -14,7 +14,7 @@ fn year_of(date: Option<&str>) -> Option<i32> {
 }
 
 /// What kind of media a search hit refers to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum MediaType {
     Movie,
@@ -38,6 +38,11 @@ impl MediaType {
 pub struct Genre {
     pub id: i64,
     pub name: String,
+    /// Backdrop of the genre's current top discover hit, for genre browse
+    /// tiles. Absent in TMDB's own genre list; filled in by the `/genres`
+    /// handler (best-effort, `null` when discovery fails).
+    #[serde(default)]
+    pub backdrop_url: Option<String>,
 }
 
 /// The list of genres for a media type, as returned by `GET /genres`.
@@ -76,6 +81,50 @@ pub struct Movie {
     /// `https://youtube.com/watch?v={key}` or `youtube://{key}`), or `null`
     /// when TMDB has no YouTube trailer/teaser.
     pub trailer_youtube_key: Option<String>,
+    /// The collection ("saga") this movie belongs to, when TMDB groups it into
+    /// one (e.g. "The Lord of the Rings Collection"); fetch its members via
+    /// `GET /collections/{id}`.
+    pub collection: Option<CollectionRef>,
+    /// Top-billed cast (up to 20, TMDB billing order).
+    pub cast: Vec<CastMember>,
+}
+
+/// Reference to the collection a movie belongs to.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CollectionRef {
+    pub id: i64,
+    pub name: String,
+}
+
+/// A movie collection (saga) with its member movies in release order.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct Collection {
+    pub id: i64,
+    pub name: String,
+    pub overview: Option<String>,
+    pub backdrop_url: Option<String>,
+    pub parts: Vec<SearchResult>,
+}
+
+/// One cast member of a movie/show, from TMDB credits.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CastMember {
+    pub tmdb_id: i64,
+    pub name: String,
+    pub character: Option<String>,
+    pub profile_url: Option<String>,
+}
+
+/// A person with their movie/TV appearances (combined credits, most popular
+/// first), for the "other appearances" screen behind a cast photo.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct Person {
+    pub tmdb_id: i64,
+    pub name: String,
+    pub profile_url: Option<String>,
+    pub biography: Option<String>,
+    pub known_for_department: Option<String>,
+    pub appearances: Vec<SearchResult>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -97,6 +146,8 @@ pub struct TvShow {
     /// when TMDB has no YouTube trailer/teaser.
     pub trailer_youtube_key: Option<String>,
     pub seasons: Vec<SeasonSummary>,
+    /// Top-billed cast (up to 20, TMDB billing order).
+    pub cast: Vec<CastMember>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -164,6 +215,9 @@ pub(crate) struct RawSearchItem {
     pub poster_path: Option<String>,
     pub backdrop_path: Option<String>,
     pub vote_average: Option<f64>,
+    /// TMDB popularity, used to order a person's combined credits.
+    #[serde(default)]
+    pub popularity: Option<f64>,
 }
 
 impl RawSearchItem {
@@ -252,6 +306,137 @@ pub(crate) fn best_trailer_youtube_key(videos: &RawVideos) -> Option<String> {
         .and_then(|v| v.key.clone())
 }
 
+/// The `credits` sub-object appended via `append_to_response=credits`.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct RawCredits {
+    #[serde(default)]
+    pub cast: Vec<RawCastMember>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct RawCastMember {
+    pub id: i64,
+    pub name: String,
+    #[serde(default)]
+    pub character: Option<String>,
+    #[serde(default)]
+    pub profile_path: Option<String>,
+    /// TMDB billing order (0 = top billing).
+    #[serde(default)]
+    pub order: Option<i64>,
+}
+
+/// Top-billed cast from an appended credits block: billing order, capped so a
+/// detail response doesn't ship hundreds of one-line extras.
+pub(crate) fn top_cast(credits: Option<RawCredits>) -> Vec<CastMember> {
+    const MAX_CAST: usize = 20;
+    let mut cast = credits.map(|c| c.cast).unwrap_or_default();
+    cast.sort_by_key(|member| member.order.unwrap_or(i64::MAX));
+    cast.truncate(MAX_CAST);
+    cast.into_iter()
+        .map(|member| CastMember {
+            tmdb_id: member.id,
+            name: member.name,
+            character: member.character.filter(|c| !c.is_empty()),
+            profile_url: image_url(member.profile_path.as_deref(), "w185"),
+        })
+        .collect()
+}
+
+/// `belongs_to_collection` on movie details.
+#[derive(Debug, Deserialize)]
+pub(crate) struct RawCollectionRef {
+    pub id: i64,
+    pub name: String,
+}
+
+/// TMDB `/collection/{id}`.
+#[derive(Debug, Deserialize)]
+pub(crate) struct RawCollection {
+    pub id: i64,
+    pub name: String,
+    #[serde(default)]
+    pub overview: Option<String>,
+    #[serde(default)]
+    pub backdrop_path: Option<String>,
+    #[serde(default)]
+    pub parts: Vec<RawSearchItem>,
+}
+
+impl From<RawCollection> for Collection {
+    fn from(raw: RawCollection) -> Self {
+        let mut parts: Vec<SearchResult> = raw
+            .parts
+            .into_iter()
+            // Collection parts are movies; TMDB omits media_type here.
+            .filter_map(|item| item.into_result(Some(MediaType::Movie)))
+            .collect();
+        // Release order reads naturally for a saga; unreleased (year-less)
+        // entries sink to the end.
+        parts.sort_by_key(|part| part.year.unwrap_or(i32::MAX));
+        Collection {
+            id: raw.id,
+            name: raw.name,
+            overview: raw.overview.filter(|o| !o.is_empty()),
+            backdrop_url: image_url(raw.backdrop_path.as_deref(), "w780"),
+            parts,
+        }
+    }
+}
+
+/// TMDB `/person/{id}` with `append_to_response=combined_credits`.
+#[derive(Debug, Deserialize)]
+pub(crate) struct RawPerson {
+    pub id: i64,
+    pub name: String,
+    #[serde(default)]
+    pub biography: Option<String>,
+    #[serde(default)]
+    pub profile_path: Option<String>,
+    #[serde(default)]
+    pub known_for_department: Option<String>,
+    #[serde(default)]
+    pub combined_credits: Option<RawCombinedCredits>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct RawCombinedCredits {
+    #[serde(default)]
+    pub cast: Vec<RawSearchItem>,
+}
+
+impl From<RawPerson> for Person {
+    fn from(raw: RawPerson) -> Self {
+        const MAX_APPEARANCES: usize = 40;
+        let mut credits = raw.combined_credits.unwrap_or_default().cast;
+        // Most popular first, so the screen leads with the works people
+        // actually know the person from.
+        credits.sort_by(|a, b| {
+            b.popularity
+                .unwrap_or(0.0)
+                .total_cmp(&a.popularity.unwrap_or(0.0))
+        });
+        let mut seen = std::collections::HashSet::new();
+        let appearances: Vec<SearchResult> = credits
+            .into_iter()
+            // Combined credits carry media_type; people/others are dropped.
+            .filter_map(|item| item.into_result(None))
+            // A person can have several credit rows on one title (multiple
+            // roles); the grid wants each title once.
+            .filter(|result| seen.insert((result.media_type, result.tmdb_id)))
+            .take(MAX_APPEARANCES)
+            .collect();
+        Person {
+            tmdb_id: raw.id,
+            name: raw.name,
+            profile_url: image_url(raw.profile_path.as_deref(), "w185"),
+            biography: raw.biography.filter(|b| !b.is_empty()),
+            known_for_department: raw.known_for_department,
+            appearances,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct RawMovieDetails {
     pub id: i64,
@@ -267,6 +452,10 @@ pub(crate) struct RawMovieDetails {
     pub external_ids: Option<RawExternalIds>,
     #[serde(default)]
     pub videos: Option<RawVideos>,
+    #[serde(default)]
+    pub belongs_to_collection: Option<RawCollectionRef>,
+    #[serde(default)]
+    pub credits: Option<RawCredits>,
 }
 
 impl From<RawMovieDetails> for Movie {
@@ -290,6 +479,11 @@ impl From<RawMovieDetails> for Movie {
             vote_average: raw.vote_average,
             original_language: raw.original_language,
             trailer_youtube_key,
+            collection: raw.belongs_to_collection.map(|c| CollectionRef {
+                id: c.id,
+                name: c.name,
+            }),
+            cast: top_cast(raw.credits),
         }
     }
 }
@@ -309,6 +503,8 @@ pub(crate) struct RawTvDetails {
     pub videos: Option<RawVideos>,
     #[serde(default)]
     pub seasons: Vec<RawSeasonSummary>,
+    #[serde(default)]
+    pub credits: Option<RawCredits>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -351,6 +547,7 @@ impl From<RawTvDetails> for TvShow {
                     poster_url: image_url(s.poster_path.as_deref(), "w500"),
                 })
                 .collect(),
+            cast: top_cast(raw.credits),
         }
     }
 }
