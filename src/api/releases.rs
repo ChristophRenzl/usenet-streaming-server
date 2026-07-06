@@ -115,7 +115,11 @@ pub async fn resolve_candidates(
     };
 
     let raw = indexer::search_many(&state.http, indexers, &queries).await;
-    let prefs = db::preferences::get(&state.db).await?;
+    // Series can carry their own resolution preferences (e.g. 2160p movies
+    // but 1080p episodes); rank against the pair effective for this media type.
+    let prefs = db::preferences::get(&state.db)
+        .await?
+        .for_media_type(target.media_type == MediaType::Tv);
     let mut ranked = rank(
         raw,
         &prefs,
@@ -345,6 +349,7 @@ mod tests {
             original_language: Some(original_language.into()),
             trailer_youtube_key: None,
             seasons,
+            cast: vec![],
         }
     }
 

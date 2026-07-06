@@ -269,6 +269,8 @@ mod tests {
         Preferences {
             preferred_resolution: Resolution::R1080p,
             max_resolution: Resolution::R2160p,
+            preferred_resolution_tv: None,
+            max_resolution_tv: None,
             preferred_video_codecs: vec!["h264".into(), "hevc".into()],
             preferred_audio_codecs: vec!["aac".into(), "ac3".into(), "eac3".into()],
             max_size_bytes: None,

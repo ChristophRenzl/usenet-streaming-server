@@ -45,6 +45,13 @@ pub async fn put_preferences(
             "preferred_resolution must not exceed max_resolution".into(),
         ));
     }
+    if let (Some(preferred), Some(max)) = (prefs.preferred_resolution_tv, prefs.max_resolution_tv) {
+        if preferred > max {
+            return Err(AppError::BadRequest(
+                "preferred_resolution_tv must not exceed max_resolution_tv".into(),
+            ));
+        }
+    }
     db::preferences::set(&state.db, &prefs).await?;
     Ok(Json(db::preferences::get(&state.db).await?))
 }
