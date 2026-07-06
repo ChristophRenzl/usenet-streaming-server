@@ -45,6 +45,12 @@ use super::subtitles::{download_subtitle, opensubtitles_client};
 
 /// Maximum release candidates tried before giving up.
 pub(crate) const MAX_ATTEMPTS: usize = 5;
+/// Candidates health-checked while looking for a directly-streamable release.
+/// A directly-streamable release is always preferred over one that needs
+/// download-and-repair, so we scan deeper down the ranked list here than the
+/// plain download path does — falling back to repair only once this many
+/// ranked candidates have all turned out non-streamable.
+pub(crate) const MAX_STREAMABLE_SCAN: usize = 15;
 /// Segments STATed per candidate during the pre-flight health check.
 const HEALTH_SAMPLE: usize = 10;
 
@@ -245,11 +251,14 @@ pub async fn create_session(
         target.episode,
     )
     .await?;
+    // Scan deeper for a directly-streamable release before considering repair:
+    // never fall back to download-and-repair while a clean release still exists
+    // further down the ranked list.
     let to_try = pick_candidates(
         &candidates,
         request.release_guid.as_deref(),
         last_release.as_deref(),
-        MAX_ATTEMPTS,
+        MAX_STREAMABLE_SCAN,
     )?;
 
     let mut failures: Vec<String> = Vec::new();
