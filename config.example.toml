@@ -47,3 +47,12 @@ par2_path = "par2"
 # https://www.opensubtitles.com/consumers. Prefer the env var so the key stays
 # out of the repo:  APP_SUBTITLES__OPENSUBTITLES_DEFAULT_API_KEY=your-key
 # opensubtitles_default_api_key = ""
+
+[analysis]
+# fpcalc (chromaprint) binary for best-effort audio-fingerprint intro
+# detection — the automatic "Skip Intro" for TV releases without intro
+# chapters. Installed in the Docker image (libchromaprint-tools); on bare-metal
+# install it (e.g. apt-get install libchromaprint-tools / brew install
+# chromaprint). A missing binary just disables the feature — playback is
+# unaffected.
+fpcalc_path = "fpcalc"

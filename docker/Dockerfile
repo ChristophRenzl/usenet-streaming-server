@@ -14,10 +14,13 @@ COPY . .
 RUN cargo build --release
 
 # Runtime stage — ffmpeg is required for HLS remuxing, par2 for the
-# download-and-repair fallback on partially-available releases.
+# download-and-repair fallback on partially-available releases, and
+# libchromaprint-tools (fpcalc) for best-effort audio-fingerprint intro
+# detection.
 FROM debian:bookworm-slim
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg par2 ca-certificates \
+    && apt-get install -y --no-install-recommends \
+        ffmpeg par2 libchromaprint-tools ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/target/release/usenet-streaming-server /usr/local/bin/
 VOLUME ["/config", "/data"]

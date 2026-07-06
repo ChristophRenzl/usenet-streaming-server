@@ -30,7 +30,7 @@ use crate::{
     state::AppState,
     stream::{
         ffmpeg::{self, SpawnOptions},
-        ffprobe, open_media_source, range,
+        ffprobe, fingerprint, intro, open_media_source, range,
         session::{NewSession, Session, SessionState},
         MediaInfo,
     },
@@ -416,13 +416,123 @@ fn session_response(
             .iter()
             .map(|t| SubtitleTrackInfo::from_track(&session.id, t))
             .collect(),
-        intro_end_secs: info.intro_end_secs,
+        intro_end_secs: session.intro_end_secs(),
         chapters: info
             .chapters
             .iter()
             .map(ChapterInfo::from_chapter)
             .collect(),
     }
+}
+
+/// Best-effort audio-fingerprint intro detection at session start, for TV
+/// episodes with a known season+episode whose probe found *no* chapter-based
+/// intro (chapters always take priority). Cheap and never blocking:
+///
+/// - If a season intro is already cached, apply it to the session **before
+///   this returns** (a quick DB read), so the `CreateSessionResponse` carries
+///   `intro_end_secs`.
+/// - Otherwise spawn a detached background task that fingerprints this
+///   episode's first ~240s of audio over the loopback, stores it, and — if a
+///   sibling episode's fingerprint already exists — runs the comparison. A
+///   detected intro is cached per season and applied to the (still-live)
+///   session, which the client picks up via `GET /stream/{id}` status polling.
+///
+/// Any failure (fpcalc missing, fetch/compare error) is logged and dropped;
+/// `intro_end_secs` simply stays `None`. Needs two episodes of a season played
+/// before detection can complete.
+async fn apply_intro_detection(state: &AppState, session: &Arc<Session>) {
+    // TV only, with a full season+episode identity, and only when chapters did
+    // not already answer it.
+    if session.media_type != MediaType::Tv || session.info().intro_end_secs.is_some() {
+        return;
+    }
+    let (Some(season), Some(episode)) = (session.season, session.episode) else {
+        return;
+    };
+    let tmdb_id = session.tmdb_id;
+
+    // Cache hit: the season's intro is already known — apply synchronously so
+    // the session response carries it, and we're done.
+    match db::fingerprints::season_intro(&state.db, tmdb_id, season).await {
+        Ok(Some(intro)) => {
+            session.set_intro_end_override(intro.intro_end_secs);
+            tracing::debug!(session = %session.id, tmdb_id, season, "applied cached season intro");
+            return;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::debug!(%error, "season-intro lookup failed; skipping intro detection");
+            return;
+        }
+    }
+
+    // No cached intro: fingerprint this episode and compare siblings in a
+    // detached task so the ~240s audio fetch never blocks the response.
+    let state = state.clone();
+    let session = session.clone();
+    tokio::spawn(async move {
+        // Fingerprint this episode's audio over the loopback (best-effort).
+        let url = loopback_url(&state, &session);
+        let points =
+            match fingerprint::fingerprint_url(&state.config.analysis.fpcalc_path, &url).await {
+                Ok(points) => points,
+                Err(error) => {
+                    tracing::debug!(session = %session.id, %error, "fingerprinting episode failed");
+                    return;
+                }
+            };
+        let bytes = fingerprint::to_bytes(&points);
+        if let Err(error) = db::fingerprints::upsert_episode_fingerprint(
+            &state.db, tmdb_id, season, episode, &bytes,
+        )
+        .await
+        {
+            tracing::debug!(%error, "storing episode fingerprint failed");
+            return;
+        }
+
+        // Compare against any already-stored sibling from the same season.
+        let sibling = match db::fingerprints::sibling_fingerprint(
+            &state.db, tmdb_id, season, episode,
+        )
+        .await
+        {
+            Ok(Some(bytes)) => fingerprint::from_bytes(&bytes),
+            Ok(None) => {
+                tracing::debug!(
+                    session = %session.id, tmdb_id, season, episode,
+                    "no sibling fingerprint yet; intro detection needs a second episode"
+                );
+                return;
+            }
+            Err(error) => {
+                tracing::debug!(%error, "loading sibling fingerprint failed");
+                return;
+            }
+        };
+
+        let Some((start_secs, end_secs)) = intro::find_intro(&points, &sibling) else {
+            tracing::debug!(session = %session.id, tmdb_id, season, "no intro detected from fingerprints");
+            return;
+        };
+
+        let intro = db::fingerprints::SeasonIntro {
+            intro_start_secs: start_secs,
+            intro_end_secs: end_secs,
+        };
+        if let Err(error) =
+            db::fingerprints::upsert_season_intro(&state.db, tmdb_id, season, intro).await
+        {
+            tracing::debug!(%error, "storing season intro failed");
+        }
+        session.set_intro_end_override(end_secs);
+        tracing::info!(
+            session = %session.id, tmdb_id, season,
+            intro_end_secs = end_secs,
+            "detected intro via audio fingerprint"
+        );
+    });
 }
 
 /// Best-effort auto-attach of subtitles at session start. Searches
@@ -688,6 +798,11 @@ async fn start_streamable_session(
         }
     }
 
+    // Best-effort intro detection (chapters first, then audio fingerprint):
+    // applies a cached season intro immediately, else fingerprints in the
+    // background. Never blocks or fails the session.
+    apply_intro_detection(state, &session).await;
+
     let meta = fetch_media_meta(
         state,
         target.tmdb_id,
@@ -788,6 +903,10 @@ async fn start_disk_session(
             return Err(error);
         }
     }
+
+    // Best-effort intro detection, as for the streaming path (no-op for movies
+    // or when a chapter intro was already found).
+    apply_intro_detection(state, &session).await;
 
     let meta = fetch_media_meta(state, download.tmdb_id, media_type, season, episode).await;
     db::watch_history::record_session_start(
@@ -949,7 +1068,7 @@ pub async fn session_status(
         segments_ready: count_segments(&session.temp_dir).await,
         resume_position_secs: (session.resume_position_secs > 0.0)
             .then_some(session.resume_position_secs),
-        intro_end_secs: info.intro_end_secs,
+        intro_end_secs: session.intro_end_secs(),
         chapters: info
             .chapters
             .iter()
@@ -1717,6 +1836,101 @@ pub fn router() -> OpenApiRouter<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use async_trait::async_trait;
+    use bytes::Bytes;
+
+    use crate::config::AppConfig;
+    use crate::error::AppResult;
+    use crate::vfs::VirtualFile;
+
+    struct NullFile;
+
+    #[async_trait]
+    impl VirtualFile for NullFile {
+        fn len(&self) -> u64 {
+            0
+        }
+        async fn read_at(&self, _offset: u64, _buf_len: usize) -> AppResult<Bytes> {
+            Ok(Bytes::new())
+        }
+    }
+
+    async fn tv_session(
+        dir: &std::path::Path,
+        tmdb_id: i64,
+        season: u32,
+        episode: u32,
+    ) -> Arc<Session> {
+        Session::create(
+            NewSession {
+                media: Arc::new(NullFile),
+                tmdb_id,
+                media_type: MediaType::Tv,
+                season: Some(season),
+                episode: Some(episode),
+                release_title: "Show.S01E02".into(),
+                inner_file_name: "ep.mkv".into(),
+                resume_position_secs: 0.0,
+            },
+            Some(dir.to_str().unwrap()),
+        )
+        .await
+        .expect("session")
+    }
+
+    /// A cached season intro is applied synchronously on session start (no
+    /// fpcalc needed), so `intro_end_secs()` reflects it before the response is
+    /// built.
+    #[tokio::test]
+    async fn cached_season_intro_is_applied_on_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = AppConfig::default();
+        config.auth.api_key = "k".into();
+        let state = AppState::for_tests(config).await.expect("state");
+
+        // Seed a detected intro for (tmdb 500, season 1).
+        db::fingerprints::upsert_season_intro(
+            &state.db,
+            500,
+            1,
+            db::fingerprints::SeasonIntro {
+                intro_start_secs: 3.0,
+                intro_end_secs: 88.0,
+            },
+        )
+        .await
+        .unwrap();
+
+        // A fresh episode session of that season has no intro yet …
+        let session = tv_session(dir.path(), 500, 1, 2).await;
+        assert_eq!(session.intro_end_secs(), None);
+
+        // … until intro detection applies the cached value (cache path is
+        // synchronous and never touches fpcalc).
+        apply_intro_detection(&state, &session).await;
+        assert_eq!(session.intro_end_secs(), Some(88.0));
+    }
+
+    /// With no cached intro and no sibling fingerprint, detection stores this
+    /// episode's fingerprint but leaves `intro_end_secs` unset (needs a 2nd
+    /// episode). fpcalc is skip-gated: the test only asserts the no-cache path
+    /// does not panic and leaves the intro unset when fingerprinting is a no-op.
+    #[tokio::test]
+    async fn missing_fpcalc_leaves_intro_unset() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = AppConfig::default();
+        config.auth.api_key = "k".into();
+        // A binary that certainly does not exist → fingerprinting fails softly.
+        config.analysis.fpcalc_path = "fpcalc-does-not-exist-xyz".into();
+        let state = AppState::for_tests(config).await.expect("state");
+
+        let session = tv_session(dir.path(), 501, 1, 1).await;
+        apply_intro_detection(&state, &session).await;
+        // The detached task may still be running; give it a moment to fail.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(session.intro_end_secs(), None);
+    }
 
     #[test]
     fn segment_names_are_strictly_validated() {

@@ -33,6 +33,7 @@ pub async fn connect(path: &str) -> anyhow::Result<SqlitePool> {
 }
 
 pub mod downloads;
+pub mod fingerprints;
 pub mod indexers;
 pub mod preferences;
 pub mod providers;

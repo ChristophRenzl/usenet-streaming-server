@@ -189,19 +189,47 @@ auto-attach path. A session's attached tracks are reported in the
 
 ## Streaming: chapters and Skip Intro
 
-ffprobe reads embedded **chapter markers** during session start. When a chapter
-looks like the opening (title matching `intro`/`opening`/`op`/`avant`,
-case-insensitive) and starts within the first ~5 minutes, its end time is
-surfaced as `intro_end_secs` so the client can offer **Skip Intro**. Both the
+Intro detection has two sources, tried in order, and surfaces the result as
+`intro_end_secs` so the client can offer **Skip Intro**. Both the
 `POST /stream/sessions` response and `GET /stream/{id}` status carry:
 
-- `intro_end_secs: Option<f64>` — end (seconds) of the detected intro chapter,
-  or `null`;
+- `intro_end_secs: Option<f64>` — end (seconds) of the detected intro, or
+  `null`;
 - `chapters: [{ start_secs, end_secs, title }]` — all chapter markers in file
   order (empty for the many releases with no chapters).
 
-Most releases have no chapters, so both are commonly `null`/empty — the client
-is expected to fall back to its own Skip-Intro heuristic then.
+**1. Chapters (first source, always wins).** ffprobe reads embedded **chapter
+markers** during session start. When a chapter looks like the opening (title
+matching `intro`/`opening`/`op`/`avant`, case-insensitive) and starts within the
+first ~5 minutes, its end time becomes `intro_end_secs`.
+
+**2. Audio fingerprint (fallback, best-effort).** For TV episodes with *no*
+intro chapter — the common case, especially for anime — the opening is detected
+automatically, Jellyfin-style, from the audio itself:
+
+- Each episode is fingerprinted **as it plays** (chromaprint via `fpcalc` over
+  the first ~240s of audio, read through the same loopback URL ffmpeg uses, so
+  segments are largely already cached — no separate download). The fingerprint
+  is stored per `(show, season, episode)`.
+- Once **two** episodes of a season have been fingerprinted, the shared opening
+  is found as the longest near-identical contiguous run near the start (Hamming
+  distance over sub-fingerprints, searched across alignment offsets). The
+  detected intro is cached per **season** (openings are ~identical across a
+  season).
+- The **first** episode a user plays kicks off fingerprinting in the background
+  (nothing to compare against yet); the **second** completes detection and, if
+  found, the intro appears on the live session — the client picks it up via
+  `GET /stream/{id}` status polling. Every subsequent episode of that season
+  gets its `intro_end_secs` **immediately** from the season cache.
+
+This is entirely best-effort: a missing `fpcalc`, an unreadable stream or a
+failed comparison is logged and ignored, and never blocks or breaks playback —
+`intro_end_secs` simply stays `null`. It needs `fpcalc` (from
+`libchromaprint-tools`; path configurable as `analysis.fpcalc_path`) and at
+least two watched episodes of a season before it can fire.
+
+When both sources come up empty (`intro_end_secs` `null`, `chapters` empty), the
+client is expected to fall back to its own Skip-Intro heuristic.
 
 ## Configuration
 

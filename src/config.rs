@@ -17,6 +17,8 @@ pub struct AppConfig {
     pub streaming: StreamingConfig,
     #[serde(default)]
     pub subtitles: SubtitlesConfig,
+    #[serde(default)]
+    pub analysis: AnalysisConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +64,23 @@ pub struct StreamingConfig {
     pub par2_path: String,
 }
 
+/// Best-effort media-analysis features (audio-fingerprint intro detection).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnalysisConfig {
+    /// `fpcalc` binary (chromaprint) used to fingerprint episode audio for
+    /// intro detection. Default `fpcalc` (on PATH). Intro detection is
+    /// best-effort: a missing binary just leaves `intro_end_secs` unset.
+    pub fpcalc_path: String,
+}
+
+impl Default for AnalysisConfig {
+    fn default() -> Self {
+        Self {
+            fpcalc_path: "fpcalc".into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SubtitlesConfig {
     /// Operator-supplied default OpenSubtitles consumer API key, applied when no
@@ -101,6 +120,7 @@ impl Default for AppConfig {
                 par2_path: "par2".into(),
             },
             subtitles: SubtitlesConfig::default(),
+            analysis: AnalysisConfig::default(),
         }
     }
 }
@@ -171,6 +191,18 @@ mod tests {
                 c.subtitles.opensubtitles_default_api_key.as_deref(),
                 Some("deploy-key")
             );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn analysis_fpcalc_path_defaults_and_overrides() {
+        assert_eq!(AppConfig::default().analysis.fpcalc_path, "fpcalc");
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("config.toml", "[auth]\napi_key = \"from-file\"\n")?;
+            jail.set_env("APP_ANALYSIS__FPCALC_PATH", "/usr/bin/fpcalc");
+            let c = AppConfig::load("config.toml").expect("load");
+            assert_eq!(c.analysis.fpcalc_path, "/usr/bin/fpcalc");
             Ok(())
         });
     }

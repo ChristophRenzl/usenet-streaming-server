@@ -111,6 +111,13 @@ pub struct Session {
     pub created_at: Instant,
     /// Set once after ffprobe ran.
     info: OnceLock<MediaInfo>,
+    /// Fingerprint-detected intro end (seconds), set post-start by the
+    /// background intro-detection task or the cached-season shortcut. Overlays
+    /// the chapter-based `info.intro_end_secs` only when that is `None`
+    /// (chapters always take priority). Behind its own lock so it can be
+    /// updated after `info` (a `OnceLock`) is sealed, and read live by the
+    /// status endpoint the client polls.
+    intro_end_override: Mutex<Option<f64>>,
     state: Mutex<SessionState>,
     last_access: Mutex<Instant>,
     /// `-ss` offset of the currently running ffmpeg (changes on seek).
@@ -177,6 +184,7 @@ impl Session {
             resume_position_secs: params.resume_position_secs,
             created_at: Instant::now(),
             info: OnceLock::new(),
+            intro_end_override: Mutex::new(None),
             state: Mutex::new(SessionState::Starting),
             last_access: Mutex::new(Instant::now()),
             start_offset: Mutex::new(0.0),
@@ -257,6 +265,26 @@ impl Session {
 
     pub fn info(&self) -> MediaInfo {
         self.info.get().cloned().unwrap_or_default()
+    }
+
+    /// The effective intro end (seconds) for "Skip Intro": the chapter-based
+    /// value from the probe when present (it always wins), otherwise the
+    /// fingerprint-detected override, if intro detection produced one.
+    pub fn intro_end_secs(&self) -> Option<f64> {
+        self.info()
+            .intro_end_secs
+            .or_else(|| *self.intro_end_override.lock().expect("intro override lock"))
+    }
+
+    /// Record a fingerprint-detected intro end (seconds). Ignored when the
+    /// probe already found a chapter-based intro, so chapters keep priority.
+    /// Read live by the status endpoint the client polls, so late detection is
+    /// still picked up.
+    pub fn set_intro_end_override(&self, secs: f64) {
+        if self.info().intro_end_secs.is_some() {
+            return;
+        }
+        *self.intro_end_override.lock().expect("intro override lock") = Some(secs);
     }
 
     pub fn state(&self) -> SessionState {

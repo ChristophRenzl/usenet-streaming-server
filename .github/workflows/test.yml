@@ -17,8 +17,8 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Install ffmpeg and par2
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg par2
+      - name: Install ffmpeg, par2 and chromaprint (fpcalc)
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg par2 libchromaprint-tools
       - name: Format
         run: cargo fmt --check
       - name: Clippy

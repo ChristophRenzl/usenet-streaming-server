@@ -4,6 +4,8 @@
 
 pub mod ffmpeg;
 pub mod ffprobe;
+pub mod fingerprint;
+pub mod intro;
 pub mod range;
 pub mod session;
 pub mod source;
