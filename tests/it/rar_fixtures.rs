@@ -7,7 +7,7 @@ use usenet_streaming_server::error::AppError;
 use usenet_streaming_server::rar::{build_archive_map, volume_sort_key, ArchiveMap, ReadAt};
 use usenet_streaming_server::vfs::{DiskFile, RarInnerFile, VirtualFile};
 
-use crate::support::{payload_3mib, TestRng, PAYLOAD_CRC32};
+use crate::support::{ffmpeg_available, payload_3mib, TestRng, PAYLOAD_CRC32};
 
 const PAYLOAD_LEN: u64 = 3 * 1024 * 1024;
 
@@ -168,6 +168,146 @@ async fn compressed_archives_are_rejected() {
     }
 }
 
+// ---- Real-release-shaped RAR5 fixtures ---------------------------------------
+//
+// These mirror the packing of an actual scene release (verified against the
+// real "Dune.Part.2.2024...DarQ-HONE" 16-volume set fetched from Usenet):
+//
+//   * a small companion file (`.jpg`) is stored *first* in volume 1, so the
+//     large media file's data does not start at the top of volume 1 — its
+//     `data_offset` is past both the archive/main headers *and* the whole
+//     companion block. The old fixtures always put the media file first, so
+//     this offset arithmetic was never exercised.
+//   * the media payload is a *real, playable* MKV, so `ffprobe` can actually
+//     validate that the extracted bytes are correctly aligned (the previous
+//     fixtures used random bytes, which ffprobe can never accept).
+//   * the media file spans four store-mode volumes with a QO (quick-open)
+//     service block + end-of-archive trailer after the split data in each
+//     volume — exactly like the real set.
+//
+// See scripts/gen-rar-fixtures.sh for how they are produced.
+
+const REAL_MKV_LEN: u64 = 3_559_360;
+
+fn real_store_volumes() -> [&'static str; 4] {
+    [
+        "rar5-store-multi-real.part1.rar",
+        "rar5-store-multi-real.part2.rar",
+        "rar5-store-multi-real.part3.rar",
+        "rar5-store-multi-real.part4.rar",
+    ]
+}
+
+async fn real_reference_mkv() -> Vec<u8> {
+    std::fs::read(fixture("rar5-store-multi-real.mkv")).expect("read reference mkv")
+}
+
+/// The companion file precedes the media file in volume 1, and the map must
+/// still target the *largest* file (the MKV) with a byte-correct offset that
+/// accounts for the companion block sitting ahead of it.
+#[tokio::test]
+async fn rar5_real_companion_first_maps_media_byte_identical() {
+    let volumes = open_volumes(&real_store_volumes()).await;
+    let map = map_for(&volumes).await.expect("archive map");
+
+    // Largest file wins even though the companion is stored first.
+    assert_eq!(map.inner_file_name, "feature.mkv");
+    assert_eq!(map.unpacked_size, REAL_MKV_LEN);
+    assert!(map.extents.len() > 1, "media must span multiple volumes");
+
+    // The first extent starts *inside* volume 0, past the companion's data —
+    // this is the offset arithmetic the clean fixtures never covered.
+    assert_eq!(map.extents[0].volume_index, 0);
+    assert!(
+        map.extents[0].volume_offset > 8,
+        "media data must not start at the top of volume 1"
+    );
+
+    let reference = real_reference_mkv().await;
+    let vfs: Vec<Arc<dyn VirtualFile>> = volumes
+        .into_iter()
+        .map(|v| v as Arc<dyn VirtualFile>)
+        .collect();
+    let inner = RarInnerFile::new(map, vfs).expect("inner");
+    assert_eq!(inner.len(), REAL_MKV_LEN);
+
+    // Whole-file extraction is byte-identical...
+    let mut extracted = Vec::with_capacity(REAL_MKV_LEN as usize);
+    let mut offset = 0u64;
+    while offset < inner.len() {
+        let chunk = inner.read_at(offset, 512 * 1024).await.expect("read");
+        assert!(!chunk.is_empty());
+        extracted.extend_from_slice(&chunk);
+        offset += chunk.len() as u64;
+    }
+    assert_eq!(extracted, reference);
+
+    // ...and it starts with the EBML/Matroska magic, proving alignment.
+    assert_eq!(&extracted[..4], &[0x1A, 0x45, 0xDF, 0xA3]);
+}
+
+/// Random and boundary-crossing reads over the real media map must match the
+/// reference MKV exactly (guards the per-extent offset math end to end).
+#[tokio::test]
+async fn rar5_real_reads_across_boundaries_are_correct() {
+    let volumes = open_volumes(&real_store_volumes()).await;
+    let map = map_for(&volumes).await.expect("map");
+    let boundaries: Vec<u64> = map
+        .extents
+        .iter()
+        .skip(1)
+        .map(|e| e.unpacked_start)
+        .collect();
+    let reference = real_reference_mkv().await;
+    let inner = RarInnerFile::new(
+        map,
+        volumes
+            .into_iter()
+            .map(|v| v as Arc<dyn VirtualFile>)
+            .collect(),
+    )
+    .expect("inner");
+
+    for boundary in boundaries {
+        let start = boundary.saturating_sub(1000);
+        let len = 2000usize;
+        let chunk = inner.read_at(start, len).await.expect("boundary read");
+        let s = start as usize;
+        let e = (s + len).min(reference.len());
+        assert_eq!(
+            &chunk[..],
+            &reference[s..e],
+            "mismatch at boundary {boundary}"
+        );
+    }
+
+    let mut rng = TestRng::new(0xD00D);
+    for _ in 0..50 {
+        let offset = rng.next_u64() % (REAL_MKV_LEN + 512);
+        let len = (rng.next_u64() % 300_000) as usize;
+        let chunk = inner.read_at(offset, len).await.expect("fuzz read");
+        let s = (offset as usize).min(reference.len());
+        let e = (s + len).min(reference.len());
+        assert_eq!(&chunk[..], &reference[s..e]);
+    }
+}
+
+/// A compressed (`-m3`) multi-volume RAR5 set must be cleanly rejected, not
+/// mis-mapped into garbage bytes.
+#[tokio::test]
+async fn rar5_compressed_multivolume_is_rejected() {
+    let volumes = open_volumes(&[
+        "rar5-compressed-multi.part1.rar",
+        "rar5-compressed-multi.part2.rar",
+        "rar5-compressed-multi.part3.rar",
+    ])
+    .await;
+    match map_for(&volumes).await {
+        Err(AppError::CompressedRarUnsupported) => {}
+        other => panic!("expected CompressedRarUnsupported, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn encrypted_archives_are_rejected() {
     for name in ["rar5-encrypted.rar", "rar4-encrypted.rar"] {
@@ -190,4 +330,71 @@ async fn garbage_input_is_not_a_rar() {
         build_archive_map(&refs).await,
         Err(AppError::InvalidRarArchive(_))
     ));
+}
+
+/// End-to-end proof that the extracted inner file is not just byte-identical
+/// but *media-valid*: serve the [`RarInnerFile`] over the same HTTP range
+/// endpoint ffprobe uses in production and confirm a real `ffprobe` reports a
+/// video stream. This is the check that would have failed if the store-mode
+/// offset mapping were wrong (the previous symptom was "ffprobe exited with
+/// status 1"). Skipped when ffprobe is unavailable.
+#[tokio::test]
+async fn rar5_real_media_is_ffprobe_readable_over_http() {
+    if !ffmpeg_available() {
+        eprintln!("skipping rar5_real_media_is_ffprobe_readable_over_http: ffprobe not found");
+        return;
+    }
+
+    let volumes = open_volumes(&real_store_volumes()).await;
+    let map = map_for(&volumes).await.expect("map");
+    let inner: Arc<dyn VirtualFile> = Arc::new(
+        RarInnerFile::new(
+            map,
+            volumes
+                .into_iter()
+                .map(|v| v as Arc<dyn VirtualFile>)
+                .collect(),
+        )
+        .expect("inner"),
+    );
+
+    // Serve the virtual file over a real loopback HTTP server using the exact
+    // production range handler.
+    use axum::extract::State;
+    use axum::http::HeaderMap;
+    use axum::response::Response;
+    use axum::routing::get;
+
+    async fn serve(State(file): State<Arc<dyn VirtualFile>>, headers: HeaderMap) -> Response {
+        let range = headers
+            .get(axum::http::header::RANGE)
+            .and_then(|v| v.to_str().ok());
+        usenet_streaming_server::stream::range::range_response(file, "feature.mkv", range, |_e| {})
+    }
+
+    let app = axum::Router::new()
+        .route("/vfs", get(serve))
+        .with_state(inner);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+
+    let url = format!("http://{addr}/vfs");
+    let probe = usenet_streaming_server::stream::ffprobe::probe_url("ffprobe", &url)
+        .await
+        .expect("ffprobe must succeed on correctly-mapped store-mode media");
+    assert!(
+        probe.video_codec.is_some(),
+        "ffprobe reported no video stream: {probe:?}"
+    );
+    assert!(
+        probe.duration_secs.unwrap_or(0.0) > 1.0,
+        "ffprobe reported an implausible duration: {probe:?}"
+    );
+
+    server.abort();
 }

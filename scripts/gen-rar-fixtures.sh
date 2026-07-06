@@ -4,6 +4,10 @@
 # Layout produced:
 #   rar5-store.rar               RAR5, store (-m0), payload.bin + small.txt
 #   rar5-store-multi.part1..4.rar  RAR5, store, 1 MiB volumes
+#   rar5-store-multi-real.part1..4.rar  RAR5, store, real-release-shaped:
+#                                companion file first + real playable MKV split
+#                                across 1 MiB volumes (+ committed .mkv/.companion)
+#   rar5-compressed-multi.part1..4.rar  RAR5, -m3, multi-volume (rejection fixture)
 #   rar5-compressed.rar          RAR5, -m5 (rejection fixture)
 #   rar5-encrypted.rar           RAR5, -hp encrypted headers (rejection fixture)
 #   rar4-store.rar               RAR4, store, payload.bin + small.txt
@@ -34,7 +38,10 @@ WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
 mkdir -p "$OUT"
-rm -f "$OUT"/rar4-* "$OUT"/rar5-*
+# Remove generated archives only. The committed real-release media source files
+# (rar5-store-multi-real.mkv / .companion) are preserved unless REGEN_MEDIA is
+# set, because ffmpeg output is not bit-reproducible across versions.
+rm -f "$OUT"/rar4-*.rar "$OUT"/rar4-*.r[0-9][0-9] "$OUT"/rar5-*.rar
 
 # ---- deterministic inputs ----------------------------------------------------
 python3 - "$WORK" <<'PY'
@@ -68,6 +75,43 @@ PY
   "$RAR" a -ma5 -m0 -v1m -ep -idq -y "$OUT/rar5-store-multi.rar" payload.bin small.txt
   "$RAR" a -ma5 -m5 -ep -idq -y "$OUT/rar5-compressed.rar" compressible.bin
   "$RAR" a -ma5 -m0 -hpsecret -ep -idq -y "$OUT/rar5-encrypted.rar" small.txt
+)
+
+# ---- Real-release-shaped RAR5 fixtures ---------------------------------------
+# Mirror an actual scene release: a small companion file stored *first*, then a
+# real, playable MKV split across several store-mode volumes with a QO
+# quick-open service block + end-of-archive trailer (verified against the real
+# 16-volume "Dune.Part.2.2024...DarQ-HONE" set). The MKV lets ffprobe validate
+# byte-alignment; random payloads (used above) can never be probed.
+#
+# The MKV (rar5-store-multi-real.mkv) and companion (.companion) are committed
+# because ffmpeg output is not bit-reproducible across versions. Regenerate them
+# only when FFMPEG is set; otherwise the committed copies are repacked.
+FFMPEG=${FFMPEG:-ffmpeg}
+if [ -n "${REGEN_MEDIA:-}" ] && command -v "$FFMPEG" >/dev/null 2>&1; then
+  "$FFMPEG" -y -v error \
+    -f lavfi -i "testsrc2=duration=60:size=480x360:rate=24" \
+    -f lavfi -i "sine=frequency=440:duration=60" \
+    -map 0:v -map 1:a -c:v libx264 -preset medium -crf 28 -g 24 -pix_fmt yuv420p \
+    -c:a aac -b:a 96k "$OUT/rar5-store-multi-real.mkv"
+  python3 - "$OUT" <<'PY'
+import sys
+out = sys.argv[1]
+open(f"{out}/rar5-store-multi-real.companion", "wb").write(bytes((i * 7) % 256 for i in range(9000)))
+PY
+fi
+(
+  cd "$OUT"
+  cp rar5-store-multi-real.mkv "$WORK/feature.mkv"
+  cp rar5-store-multi-real.companion "$WORK/cover.jpg"
+  cd "$WORK"
+  rm -f "$OUT"/rar5-store-multi-real.part*.rar "$OUT"/rar5-compressed-multi.part*.rar
+  # Companion FIRST, media SECOND (so media data_offset is past the companion).
+  "$RAR" a -ma5 -m0 -v1m -qo+ -ep -idq -y "$OUT/rar5-store-multi-real.rar" cover.jpg feature.mkv
+  # Compressed multi-volume: must be rejected, not mis-mapped. Use a ~1.4 MB
+  # head of the MKV with 512 KiB volumes to keep the rejection fixture compact.
+  head -c 1400000 feature.mkv > head.mkv
+  "$RAR" a -ma5 -m3 -v512k -qo+ -ep -idq -y "$OUT/rar5-compressed-multi.rar" head.mkv
 )
 
 # ---- RAR4 fixtures (python writer, validated with unrar) -----------------------
@@ -165,6 +209,7 @@ PY
 # `unrar t -idq` prints nothing on success; require both exit 0 and no output
 # (some checksum problems are reported with a zero exit status).
 for a in rar5-store.rar rar5-store-multi.part1.rar rar5-compressed.rar \
+         rar5-store-multi-real.part1.rar rar5-compressed-multi.part1.rar \
          rar4-store.rar rar4-store-multi.rar; do
   result=$("$UNRAR" t -y -idq "$OUT/$a" 2>&1) && [ -z "$result" ] \
     || { echo "unrar validation FAILED for $a: $result"; exit 1; }

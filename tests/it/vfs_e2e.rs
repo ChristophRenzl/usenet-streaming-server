@@ -180,6 +180,82 @@ async fn rar_set_end_to_end_reads_byte_identical() {
     fuzz_reads(&inner, &payload, 0x5EED).await;
 }
 
+/// Same as [`rar_set_end_to_end_reads_byte_identical`] but over the
+/// real-release-shaped fixtures: a companion file precedes the media file in
+/// volume 1, the media is a real MKV, and each volume is split into many yEnc
+/// segments (as a real 700+-segment volume would be). Exercises the full
+/// NzbBackedFile -> RAR store map -> RarInnerFile read path on the packing
+/// that actually ships in the wild.
+#[tokio::test]
+async fn real_shaped_rar_set_reads_byte_identical_over_usenet() {
+    let server = MockNntp::start(None).await;
+    let fixture = |name: &str| format!("{}/tests/fixtures/rar/{name}", env!("CARGO_MANIFEST_DIR"));
+
+    let mut files = Vec::new();
+    for part in 1..=4 {
+        let name = format!("rar5-store-multi-real.part{part}.rar");
+        let bytes = std::fs::read(fixture(&name)).expect("read fixture");
+        let inner_name = format!("release.part{part}.rar");
+        // 64 KiB parts -> up to ~16 segments per 1 MiB volume: multi-segment
+        // volumes like the real set (which has ~730 segments per volume).
+        let segments = add_yenc_file(
+            &server,
+            &format!("rv{part}"),
+            &bytes,
+            64 * 1024,
+            &inner_name,
+        );
+        files.push((format!(r#"Rel [{part}/5] - "{inner_name}" yEnc"#), segments));
+    }
+    files.push((
+        r#"Rel [5/5] - "release.par2" yEnc"#.to_string(),
+        vec![("par2@mock".to_string(), 5_000)],
+    ));
+
+    let nzb = parse_nzb(&build_nzb_xml(&files)).expect("parse nzb");
+    let main = select_main(&nzb).expect("select");
+    let MainContent::RarSet(set) = &main else {
+        panic!("expected RAR set, got {main:?}");
+    };
+
+    let pool = NntpPool::with_options(vec![server.provider("p", 0, 8)], fast_options());
+    let cache = test_cache();
+    let mut volumes: Vec<Arc<NzbBackedFile>> = Vec::new();
+    for file_ref in set {
+        volumes.push(Arc::new(
+            NzbBackedFile::open(&nzb.files[file_ref.index], pool.clone(), cache.clone(), 4)
+                .await
+                .expect("open volume"),
+        ));
+    }
+
+    let refs: Vec<&dyn ReadAt> = volumes.iter().map(|v| v.as_ref() as &dyn ReadAt).collect();
+    let map = build_archive_map(&refs).await.expect("archive map");
+    assert_eq!(
+        map.inner_file_name, "feature.mkv",
+        "must target the MKV, not the companion"
+    );
+
+    let reference =
+        std::fs::read(fixture("rar5-store-multi-real.mkv")).expect("read reference mkv");
+    let inner = RarInnerFile::new(
+        map,
+        volumes
+            .iter()
+            .map(|v| v.clone() as Arc<dyn VirtualFile>)
+            .collect(),
+    )
+    .expect("inner file");
+    assert_eq!(inner.len(), reference.len() as u64);
+
+    // The head must be the EBML/Matroska magic (offset alignment across the
+    // companion block + main/archive headers).
+    let head = inner.read_at(0, 4).await.expect("head read");
+    assert_eq!(&head[..], &[0x1A, 0x45, 0xDF, 0xA3]);
+
+    fuzz_reads(&inner, &reference, 0xC0FFEE).await;
+}
+
 #[tokio::test]
 async fn health_check_reports_green_and_red() {
     let server = MockNntp::start(None).await;
