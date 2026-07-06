@@ -16,6 +16,9 @@ pub struct ProbeResult {
     pub video_codec: Option<String>,
     pub audio_codec: Option<String>,
     pub audio_channels: Option<i64>,
+    /// HLS `VIDEO-RANGE` value derived from the color transfer: `PQ`
+    /// (HDR10/DV), `HLG`, or `SDR`.
+    pub video_range: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -35,6 +38,7 @@ struct ProbeStream {
     codec_type: Option<String>,
     codec_name: Option<String>,
     channels: Option<i64>,
+    color_transfer: Option<String>,
 }
 
 /// Run `ffprobe -v quiet -print_format json -show_format -show_streams`
@@ -92,11 +96,13 @@ fn parse_probe(doc: ProbeDoc) -> AppResult<ProbeResult> {
     let mut video_codec = None;
     let mut audio_codec = None;
     let mut audio_channels = None;
+    let mut color_transfer = None;
     for stream in &doc.streams {
         match stream.codec_type.as_deref() {
             Some("video") if !has_video => {
                 has_video = true;
                 video_codec = stream.codec_name.clone();
+                color_transfer = stream.color_transfer.clone();
             }
             Some("audio") if audio_codec.is_none() => {
                 audio_codec = stream.codec_name.clone();
@@ -112,11 +118,19 @@ fn parse_probe(doc: ProbeDoc) -> AppResult<ProbeResult> {
         ));
     }
 
+    let video_range = match color_transfer.as_deref() {
+        Some("smpte2084") => "PQ",
+        Some("arib-std-b67") => "HLG",
+        _ => "SDR",
+    }
+    .to_string();
+
     Ok(ProbeResult {
         duration_secs,
         video_codec,
         audio_codec,
         audio_channels,
+        video_range,
     })
 }
 
@@ -143,6 +157,23 @@ mod tests {
         // First audio stream wins.
         assert_eq!(result.audio_codec.as_deref(), Some("ac3"));
         assert_eq!(result.audio_channels, Some(6));
+        // No color transfer reported → SDR.
+        assert_eq!(result.video_range, "SDR");
+    }
+
+    #[test]
+    fn color_transfer_maps_to_video_range() {
+        for (transfer, expected) in [
+            ("smpte2084", "PQ"),
+            ("arib-std-b67", "HLG"),
+            ("bt709", "SDR"),
+        ] {
+            let doc: ProbeDoc = serde_json::from_str(&format!(
+                r#"{{"streams": [{{"codec_type": "video", "codec_name": "hevc", "color_transfer": "{transfer}"}}], "format": {{}}}}"#,
+            ))
+            .expect("parse");
+            assert_eq!(parse_probe(doc).expect("probe").video_range, expected);
+        }
     }
 
     #[test]

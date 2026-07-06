@@ -324,9 +324,18 @@ async fn segment_names_are_validated_and_playlist_waits() {
         assert_eq!(response.status(), 400, "attempt {attempt} must be rejected");
     }
 
-    // A valid name that does not exist is a plain 404.
-    let response = stack.get(&format!("/api/v1/stream/{id}/init.mp4")).await;
-    assert_eq!(response.status(), 404);
+    // A valid name that does not exist yet answers immediately (AVPlayer
+    // drops variants without a response within 6s) and keeps the body
+    // pending until ffmpeg produces the file.
+    let response = tokio::time::timeout(
+        Duration::from_secs(3),
+        stack.get(&format!("/api/v1/stream/{id}/init.mp4")),
+    )
+    .await
+    .expect("headers must arrive immediately");
+    assert_eq!(response.status(), 200);
+    let body = tokio::time::timeout(Duration::from_secs(1), response.bytes()).await;
+    assert!(body.is_err(), "body must stay pending until produced");
 
     // The media playlist reports "try again" while the session is starting.
     let response = stack.get(&format!("/api/v1/stream/{id}/media.m3u8")).await;
@@ -850,13 +859,21 @@ async fn seek_beyond_frontier_restarts_ffmpeg() {
     stack
         .wait_for_state(&id, &["ended"], Duration::from_secs(45))
         .await;
+    // The served playlist always claims the whole file as VOD…
     let playlist = stack.media_playlist(&id, Duration::from_secs(5)).await;
     assert!(playlist.contains("#EXT-X-ENDLIST"));
-    let produced = extinf_sum(&playlist);
+    let claimed = extinf_sum(&playlist);
     assert!(
-        (2.0..=9.0).contains(&produced),
-        "playlist should cover ~5s (25..30), got {produced}s"
+        (28.0..=32.0).contains(&claimed),
+        "VOD playlist should claim the full ~30s, got {claimed}s"
     );
+    // …and the restarted ffmpeg produced the tail on the global numbering:
+    // 25s snaps down to segment 4 (4 x 6s = 24s).
+    let response = stack
+        .get(&format!("/api/v1/stream/{id}/seg_00004.m4s"))
+        .await;
+    assert_eq!(response.status(), 200, "tail segment after restart");
+    assert!(!response.bytes().await.expect("segment").is_empty());
 
     // A target inside the freshly produced window is a no-op.
     let response = stack
