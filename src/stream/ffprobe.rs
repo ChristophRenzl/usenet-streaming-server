@@ -14,8 +14,14 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 pub struct ProbeResult {
     pub duration_secs: Option<f64>,
     pub video_codec: Option<String>,
+    /// Codec/channels of the FIRST audio stream; use
+    /// [`select_audio_stream`] + `audio_streams` for language-aware picks.
     pub audio_codec: Option<String>,
     pub audio_channels: Option<i64>,
+    /// All audio streams in file order, with their language tags. Dual-
+    /// language releases conventionally put the dub first, so the caller
+    /// picks by language instead of blindly taking stream 0.
+    pub audio_streams: Vec<AudioStream>,
     /// Frames per second of the first video stream, when reported. Used to
     /// correct fps-mismatch drift when attaching external subtitles.
     pub fps: Option<f64>,
@@ -44,6 +50,69 @@ pub struct Chapter {
 /// mid-episode chapter merely named "OP reprise" is not mistaken for the
 /// opening.
 const INTRO_MAX_START_SECS: f64 = 300.0;
+
+/// One audio stream of the probed media.
+#[derive(Debug, Clone, Default)]
+pub struct AudioStream {
+    pub codec: Option<String>,
+    pub channels: Option<i64>,
+    /// The stream's `language` tag as written in the container, usually an
+    /// ISO 639-2 code ("eng", "ger", "jpn"); None when untagged.
+    pub language: Option<String>,
+}
+
+/// Index (among audio streams) of the stream to feed the player: the first
+/// stream whose language tag matches `preferred` (an ISO 639-1 code like
+/// "en"/"de"), else the first stream. Untagged streams never match a
+/// preference — a single untagged stream is simply index 0 via the fallback.
+pub fn select_audio_stream(streams: &[AudioStream], preferred: Option<&str>) -> usize {
+    let Some(preferred) = preferred else { return 0 };
+    streams
+        .iter()
+        .position(|stream| {
+            stream
+                .language
+                .as_deref()
+                .is_some_and(|tag| primary_language_code(tag) == preferred)
+        })
+        .unwrap_or(0)
+}
+
+/// Normalize a container language tag to a lower-case ISO 639-1 code:
+/// "GER"/"deu" → "de", "en-US" → "en". Unknown 3-letter codes pass through
+/// lowercased (they simply won't match any 2-letter preference).
+pub fn primary_language_code(tag: &str) -> String {
+    let primary = tag
+        .split(['-', '_'])
+        .next()
+        .unwrap_or(tag)
+        .trim()
+        .to_lowercase();
+    match primary.as_str() {
+        "eng" => "en",
+        "deu" | "ger" => "de",
+        "fra" | "fre" => "fr",
+        "ita" => "it",
+        "spa" => "es",
+        "nld" | "dut" => "nl",
+        "jpn" => "ja",
+        "kor" => "ko",
+        "hin" => "hi",
+        "rus" => "ru",
+        "por" => "pt",
+        "swe" => "sv",
+        "dan" => "da",
+        "nor" | "nob" => "no",
+        "fin" => "fi",
+        "pol" => "pl",
+        "ces" | "cze" => "cs",
+        "zho" | "chi" => "zh",
+        "ara" => "ar",
+        "tur" => "tr",
+        _ => return primary,
+    }
+    .to_string()
+}
 
 #[derive(Debug, Deserialize)]
 struct ProbeDoc {
@@ -83,6 +152,13 @@ struct ProbeStream {
     avg_frame_rate: Option<String>,
     r_frame_rate: Option<String>,
     color_transfer: Option<String>,
+    #[serde(default)]
+    tags: Option<ProbeTags>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProbeTags {
+    language: Option<String>,
 }
 
 /// Parse an ffprobe rational frame rate (`num/den`, e.g. `24000/1001`) to fps.
@@ -176,8 +252,7 @@ fn parse_probe(doc: ProbeDoc) -> AppResult<ProbeResult> {
 
     let mut has_video = false;
     let mut video_codec = None;
-    let mut audio_codec = None;
-    let mut audio_channels = None;
+    let mut audio_streams = Vec::new();
     let mut fps = None;
     let mut color_transfer = None;
     for stream in &doc.streams {
@@ -189,13 +264,18 @@ fn parse_probe(doc: ProbeDoc) -> AppResult<ProbeResult> {
                     .or_else(|| parse_frame_rate(stream.r_frame_rate.as_deref()));
                 color_transfer = stream.color_transfer.clone();
             }
-            Some("audio") if audio_codec.is_none() => {
-                audio_codec = stream.codec_name.clone();
-                audio_channels = stream.channels;
+            Some("audio") => {
+                audio_streams.push(AudioStream {
+                    codec: stream.codec_name.clone(),
+                    channels: stream.channels,
+                    language: stream.tags.as_ref().and_then(|t| t.language.clone()),
+                });
             }
             _ => {}
         }
     }
+    let audio_codec = audio_streams.first().and_then(|s| s.codec.clone());
+    let audio_channels = audio_streams.first().and_then(|s| s.channels);
 
     if !has_video {
         return Err(AppError::Upstream(
@@ -226,6 +306,7 @@ fn parse_probe(doc: ProbeDoc) -> AppResult<ProbeResult> {
         video_codec,
         audio_codec,
         audio_channels,
+        audio_streams,
         fps,
         video_range,
         chapters,
@@ -281,6 +362,68 @@ mod tests {
         assert!((result.fps.unwrap() - 23.976).abs() < 0.001);
         // No color transfer reported → SDR.
         assert_eq!(result.video_range, "SDR");
+    }
+
+    #[test]
+    fn audio_streams_carry_language_tags() {
+        let doc: ProbeDoc = serde_json::from_str(
+            r#"{
+                "streams": [
+                    {"codec_type": "video", "codec_name": "h264"},
+                    {"codec_type": "audio", "codec_name": "ac3", "channels": 6, "tags": {"language": "ger"}},
+                    {"codec_type": "audio", "codec_name": "eac3", "channels": 6, "tags": {"language": "eng"}},
+                    {"codec_type": "audio", "codec_name": "aac", "channels": 2}
+                ],
+                "format": {}
+            }"#,
+        )
+        .expect("parse");
+        let result = parse_probe(doc).expect("probe");
+        assert_eq!(result.audio_streams.len(), 3);
+        assert_eq!(result.audio_streams[0].language.as_deref(), Some("ger"));
+        assert_eq!(result.audio_streams[1].language.as_deref(), Some("eng"));
+        assert_eq!(result.audio_streams[2].language, None);
+        // Back-compat: the summary fields still describe the first stream.
+        assert_eq!(result.audio_codec.as_deref(), Some("ac3"));
+    }
+
+    #[test]
+    fn audio_selection_prefers_the_requested_language() {
+        let stream = |codec: &str, language: Option<&str>| AudioStream {
+            codec: Some(codec.into()),
+            channels: Some(6),
+            language: language.map(Into::into),
+        };
+        // German-first dual-language release: an English preference picks
+        // the second stream.
+        let dual = [stream("ac3", Some("ger")), stream("eac3", Some("eng"))];
+        assert_eq!(select_audio_stream(&dual, Some("en")), 1);
+        assert_eq!(select_audio_stream(&dual, Some("de")), 0);
+        // Anime with original-language preference resolving to Japanese.
+        let anime = [stream("aac", Some("eng")), stream("aac", Some("jpn"))];
+        assert_eq!(select_audio_stream(&anime, Some("ja")), 1);
+        // No match, no preference or no tags → first stream.
+        assert_eq!(select_audio_stream(&dual, Some("fr")), 0);
+        assert_eq!(select_audio_stream(&dual, None), 0);
+        assert_eq!(select_audio_stream(&[stream("aac", None)], Some("en")), 0);
+        assert_eq!(select_audio_stream(&[], Some("en")), 0);
+    }
+
+    #[test]
+    fn language_tags_normalize_to_two_letter_codes() {
+        for (tag, code) in [
+            ("eng", "en"),
+            ("ENG", "en"),
+            ("ger", "de"),
+            ("deu", "de"),
+            ("jpn", "ja"),
+            ("en-US", "en"),
+            ("de_AT", "de"),
+            ("en", "en"),
+            ("und", "und"),
+        ] {
+            assert_eq!(primary_language_code(tag), code, "tag {tag}");
+        }
     }
 
     #[test]

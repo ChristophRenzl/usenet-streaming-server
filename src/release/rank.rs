@@ -287,6 +287,8 @@ mod tests {
             posted_at: Some(Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap()),
             indexer_id: 1,
             indexer_name: "test".into(),
+            tvdb_id: None,
+            imdb_id: None,
         }
     }
 

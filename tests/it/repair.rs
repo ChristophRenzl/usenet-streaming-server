@@ -108,7 +108,7 @@ async fn verdict_unrecoverable_without_par2() {
 
 // ---- Full-stack repair harness --------------------------------------------------
 
-const RELEASE_TITLE: &str = "Test.Movie.2026.1080p.BluRay.x264-TEST";
+const RELEASE_TITLE: &str = "Inception.2010.1080p.BluRay.x264-TEST";
 
 fn base_config(download_dir: &Path, session_dir: &Path) -> AppConfig {
     let mut config = AppConfig::default();

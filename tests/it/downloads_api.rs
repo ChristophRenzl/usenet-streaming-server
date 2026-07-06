@@ -20,7 +20,7 @@ use crate::support::{
 };
 
 const API_KEY: &str = "test-api-key";
-const RELEASE_TITLE: &str = "Test.Movie.2026.1080p.BluRay.x264-TEST";
+const RELEASE_TITLE: &str = "Inception.2010.1080p.BluRay.x264-TEST";
 
 fn base_config(download_dir: &Path, session_dir: &Path) -> AppConfig {
     let mut config = AppConfig::default();
@@ -376,7 +376,7 @@ async fn completed_downloads_play_from_disk_without_nntp() {
     // App with NO indexers, NO NNTP providers, NO TMDB key configured.
     let download_dir = tempfile::tempdir().expect("download dir");
     let session_dir = tempfile::tempdir().expect("session dir");
-    let stored = download_dir.path().join("Test.Movie.2026.mkv");
+    let stored = download_dir.path().join("Inception.2010.mkv");
     std::fs::copy(&media_path, &stored).expect("copy media into download dir");
 
     let config = base_config(download_dir.path(), session_dir.path());

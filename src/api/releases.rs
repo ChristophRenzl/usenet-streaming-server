@@ -16,6 +16,7 @@ use crate::{
     release::{
         parse::Resolution,
         rank::{rank, RankedRelease},
+        verify,
     },
     state::AppState,
     tmdb::models::{MediaType, TvShow},
@@ -64,19 +65,29 @@ pub async fn resolve_candidates(
     }
 
     let tmdb = tmdb_client(state).await?;
-    let (queries, original_language) = match target.media_type {
+    let (queries, item) = match target.media_type {
         MediaType::Movie => {
             let movie = tmdb.movie_details(target.tmdb_id).await?;
-            let query = match movie.imdb_id {
+            let query = match movie.imdb_id.clone() {
                 Some(imdb_id) => SearchQuery::MovieByImdb { imdb_id },
                 None => SearchQuery::Raw {
                     query: match movie.year {
                         Some(year) => format!("{} {year}", movie.title),
-                        None => movie.title,
+                        None => movie.title.clone(),
                     },
                 },
             };
-            (vec![query], movie.original_language)
+            (
+                vec![query],
+                ItemInfo {
+                    title: movie.title,
+                    year: movie.year,
+                    tvdb_id: None,
+                    imdb_id: movie.imdb_id,
+                    original_language: movie.original_language,
+                    absolute_episode: None,
+                },
+            )
         }
         MediaType::Tv => {
             let (season, episode) = target
@@ -84,19 +95,66 @@ pub async fn resolve_candidates(
                 .zip(target.episode)
                 .expect("validated TV target");
             let show = tmdb.tv_details(target.tmdb_id).await?;
+            // `tv_search_queries` already fans out tvsearch + SxxExx + (for
+            // anime) the absolute-episode-number query. The absolute number
+            // is also kept on `ItemInfo` for candidate verification below.
             let queries = tv_search_queries(&show, season, episode);
-            (queries, show.original_language)
+            let absolute = absolute_episode(&show, season, episode);
+            (
+                queries,
+                ItemInfo {
+                    title: show.title,
+                    year: show.year,
+                    tvdb_id: show.tvdb_id,
+                    imdb_id: show.imdb_id,
+                    original_language: show.original_language,
+                    absolute_episode: absolute,
+                },
+            )
         }
     };
 
     let raw = indexer::search_many(&state.http, indexers, &queries).await;
     let prefs = db::preferences::get(&state.db).await?;
-    Ok(rank(
+    let mut ranked = rank(
         raw,
         &prefs,
         max_resolution,
-        original_language.as_deref(),
-    ))
+        item.original_language.as_deref(),
+    );
+
+    // Reject candidates that contradict the requested title (wrong show,
+    // wrong year, wrong episode). They stay in the list with a reason so
+    // pickers can show them and a manual guid pin can still override.
+    let expected = verify::Expected {
+        title: &item.title,
+        year: item.year,
+        tvdb_id: item.tvdb_id,
+        imdb_id: item.imdb_id.as_deref(),
+        season: target.season,
+        episode: target.episode,
+        absolute_episode: item.absolute_episode,
+    };
+    for candidate in &mut ranked {
+        if candidate.rejected.is_none() {
+            if let Some(reason) = verify::mismatch_reason(&candidate.raw, &expected) {
+                candidate.rejected = Some(reason);
+            }
+        }
+    }
+    // Stable: keeps rank order within the accepted and rejected groups.
+    ranked.sort_by_key(|c| c.rejected.is_some());
+    Ok(ranked)
+}
+
+/// TMDB metadata of the searched item, kept for post-search verification.
+struct ItemInfo {
+    title: String,
+    year: Option<i32>,
+    tvdb_id: Option<i64>,
+    imdb_id: Option<String>,
+    original_language: Option<String>,
+    absolute_episode: Option<u32>,
 }
 
 /// Build the set of indexer search strategies for one TV episode. Their
@@ -368,6 +426,8 @@ mod tests {
                 posted_at: None,
                 indexer_id: 1,
                 indexer_name: "test".into(),
+                tvdb_id: None,
+                imdb_id: None,
             },
             parsed: parse_release_name(title),
             score,

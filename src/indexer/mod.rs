@@ -20,6 +20,12 @@ pub struct RawRelease {
     pub posted_at: Option<DateTime<Utc>>,
     pub indexer_id: i64,
     pub indexer_name: String,
+    /// TVDB id the indexer reports for this release (`newznab:attr tvdbid`),
+    /// used to reject releases that belong to a different show.
+    pub tvdb_id: Option<i64>,
+    /// IMDb id the indexer reports (`newznab:attr imdbid`), digits only
+    /// without the `tt` prefix or leading zeros.
+    pub imdb_id: Option<String>,
 }
 
 /// What to ask the indexers for.
@@ -110,6 +116,8 @@ mod tests {
             posted_at: None,
             indexer_id: 1,
             indexer_name: "test".into(),
+            tvdb_id: None,
+            imdb_id: None,
         }
     }
 
