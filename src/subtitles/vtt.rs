@@ -34,6 +34,14 @@ pub fn decode_subtitle_bytes(bytes: &[u8]) -> String {
     }
 }
 
+/// HLS WebVTT header. The `X-TIMESTAMP-MAP` anchors WebVTT cue time zero to the
+/// program timeline origin (MPEGTS 0). Without it, AVPlayer anchors cues to the
+/// first media segment it loads, so resuming mid-video — where the fMP4 stream
+/// begins at a non-zero PTS via ffmpeg's `-output_ts_offset` — shifts every
+/// subtitle by the resume offset. Anchoring at zero keeps timing correct from
+/// any start position and is a no-op for playback from the beginning.
+const VTT_HEADER: &str = "WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:0,LOCAL:00:00:00.000\n\n";
+
 /// Convert SRT text to a WebVTT document.
 ///
 /// Input is text (already BOM-stripped/decoded, e.g. via
@@ -52,8 +60,8 @@ pub fn srt_to_vtt_scaled(srt: &str, scale: Option<f64>) -> String {
     // Only apply a scale that is finite, positive and actually differs.
     let scale = scale.filter(|s| s.is_finite() && *s > 0.0 && (*s - 1.0).abs() > 0.001);
 
-    let mut out = String::with_capacity(srt.len() + 16);
-    out.push_str("WEBVTT\n\n");
+    let mut out = String::with_capacity(srt.len() + VTT_HEADER.len());
+    out.push_str(VTT_HEADER);
 
     // Whether the previous emitted line was blank, to collapse runs of blank
     // lines that the dropped index lines would otherwise leave behind.
@@ -231,11 +239,25 @@ mod tests {
     fn basic_conversion_adds_header_and_dots() {
         let srt = "1\n00:00:01,000 --> 00:00:04,000\nHello world\n";
         let vtt = srt_to_vtt(srt);
-        assert!(vtt.starts_with("WEBVTT\n\n"));
+        // Header carries the HLS timestamp map (anchors cue 0 to program 0 so
+        // subtitles stay in sync when playback starts mid-video), then a blank
+        // line before the first cue.
+        assert!(vtt.starts_with("WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:0,LOCAL:00:00:00.000\n\n"));
         assert!(vtt.contains("00:00:01.000 --> 00:00:04.000"));
         assert!(vtt.contains("Hello world"));
         // The numeric index line is dropped.
         assert!(!vtt.contains("\n1\n"));
+    }
+
+    #[test]
+    fn shift_preserves_timestamp_map_header() {
+        // A manual offset re-shifts cues from the base VTT; the timestamp-map
+        // anchor is a non-timing line and must survive untouched, or the fix
+        // for mid-video sync would be undone the moment the user nudges timing.
+        let base = srt_to_vtt("1\n00:00:10,000 --> 00:00:12,000\nHi\n");
+        let shifted = shift_vtt(&base, 500);
+        assert!(shifted.contains("X-TIMESTAMP-MAP=MPEGTS:0,LOCAL:00:00:00.000"));
+        assert!(shifted.contains("00:00:10.500 --> 00:00:12.500"));
     }
 
     #[test]
