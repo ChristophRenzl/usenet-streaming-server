@@ -539,23 +539,33 @@ async fn assess_candidate(
     Ok((assessment, nzb, main))
 }
 
-/// Best-effort TMDB metadata for a watch-history row: media title, artwork
-/// and (for tv) the episode title + still. Any failure — missing TMDB key,
-/// upstream error — degrades to empty metadata instead of failing the
-/// session; the history upsert keeps previously stored values (COALESCE).
-async fn fetch_media_meta(
+/// Best-effort TMDB lookup at session start: watch-history metadata (title,
+/// artwork, episode title/still) plus the title's original language for
+/// original-audio selection. Any failure — missing TMDB key, upstream error —
+/// degrades to empty fields instead of failing the session; the history
+/// upsert keeps previously stored values (COALESCE).
+struct MediaLookup {
+    meta: db::watch_history::MediaMeta,
+    original_language: Option<String>,
+}
+
+async fn fetch_media_lookup(
     state: &AppState,
     tmdb_id: i64,
     media_type: MediaType,
     season: Option<u32>,
     episode: Option<u32>,
-) -> db::watch_history::MediaMeta {
+) -> MediaLookup {
     let mut meta = db::watch_history::MediaMeta::default();
+    let mut original_language = None;
     let tmdb = match tmdb_client(state).await {
         Ok(tmdb) => tmdb,
         Err(error) => {
-            tracing::info!(%error, "skipping history metadata (no TMDB client)");
-            return meta;
+            tracing::info!(%error, "skipping media lookup (no TMDB client)");
+            return MediaLookup {
+                meta,
+                original_language,
+            };
         }
     };
     match media_type {
@@ -564,8 +574,9 @@ async fn fetch_media_meta(
                 meta.title = Some(movie.title);
                 meta.poster_url = movie.poster_url;
                 meta.backdrop_url = movie.backdrop_url;
+                original_language = movie.original_language;
             }
-            Err(error) => tracing::info!(tmdb_id, %error, "history metadata lookup failed"),
+            Err(error) => tracing::info!(tmdb_id, %error, "media lookup failed"),
         },
         MediaType::Tv => {
             match tmdb.tv_details(tmdb_id).await {
@@ -573,8 +584,9 @@ async fn fetch_media_meta(
                     meta.title = Some(show.title);
                     meta.poster_url = show.poster_url;
                     meta.backdrop_url = show.backdrop_url;
+                    original_language = show.original_language;
                 }
-                Err(error) => tracing::info!(tmdb_id, %error, "history metadata lookup failed"),
+                Err(error) => tracing::info!(tmdb_id, %error, "media lookup failed"),
             }
             if let Some((season, episode)) = season.zip(episode) {
                 match tmdb.episode_details(tmdb_id, season, episode).await {
@@ -589,7 +601,39 @@ async fn fetch_media_meta(
             }
         }
     }
-    meta
+    MediaLookup {
+        meta,
+        original_language,
+    }
+}
+
+/// The ISO 639-1 audio language playback should prefer, from the stored
+/// `language` preference: `original` resolves to the title's TMDB original
+/// language, a code/name resolves to its code, and anything else falls back
+/// to English (the scene default — matching how ranking treats untagged
+/// releases).
+fn preferred_audio_language(pref: &str, original_language: Option<&str>) -> String {
+    let pref = pref.trim().to_lowercase();
+    let code = match pref.as_str() {
+        "original" => {
+            return original_language
+                .map(ffprobe::primary_language_code)
+                .unwrap_or_else(|| "en".to_string())
+        }
+        "german" => "de",
+        "french" => "fr",
+        "italian" => "it",
+        "spanish" => "es",
+        "dutch" => "nl",
+        "korean" => "ko",
+        "japanese" => "ja",
+        "hindi" => "hi",
+        "russian" => "ru",
+        "english" => "en",
+        other if other.len() == 2 && other.chars().all(|c| c.is_ascii_alphabetic()) => other,
+        _ => "en",
+    };
+    code.to_string()
 }
 
 /// Start a session from an already-grabbed, already-assessed streamable
@@ -638,16 +682,7 @@ async fn start_streamable_session(
     .await?;
     state.sessions.insert(session.clone());
 
-    // From here on, clean up the registered session on failure.
-    match probe_and_spawn(state, &session, supports_hdr).await {
-        Ok(()) => {}
-        Err(error) => {
-            state.sessions.teardown(&session.id).await;
-            return Err(error);
-        }
-    }
-
-    let meta = fetch_media_meta(
+    let lookup = fetch_media_lookup(
         state,
         target.tmdb_id,
         target.media_type,
@@ -655,6 +690,20 @@ async fn start_streamable_session(
         target.episode,
     )
     .await;
+    let audio_language = preferred_audio_language(
+        &db::preferences::get(&state.db).await?.language,
+        lookup.original_language.as_deref(),
+    );
+
+    // From here on, clean up the registered session on failure.
+    match probe_and_spawn(state, &session, supports_hdr, &audio_language).await {
+        Ok(()) => {}
+        Err(error) => {
+            state.sessions.teardown(&session.id).await;
+            return Err(error);
+        }
+    }
+
     db::watch_history::record_session_start(
         &state.db,
         &db::watch_history::SessionStart {
@@ -666,7 +715,7 @@ async fn start_streamable_session(
             indexer_id: Some(candidate.raw.indexer_id),
             nzb_url: &candidate.raw.nzb_url,
             duration_secs: session.info().duration_secs,
-            meta,
+            meta: lookup.meta,
         },
     )
     .await?;
@@ -740,7 +789,13 @@ async fn start_disk_session(
     .await?;
     state.sessions.insert(session.clone());
 
-    match probe_and_spawn(state, &session, supports_hdr).await {
+    let lookup = fetch_media_lookup(state, download.tmdb_id, media_type, season, episode).await;
+    let audio_language = preferred_audio_language(
+        &db::preferences::get(&state.db).await?.language,
+        lookup.original_language.as_deref(),
+    );
+
+    match probe_and_spawn(state, &session, supports_hdr, &audio_language).await {
         Ok(()) => {}
         Err(error) => {
             state.sessions.teardown(&session.id).await;
@@ -748,7 +803,6 @@ async fn start_disk_session(
         }
     }
 
-    let meta = fetch_media_meta(state, download.tmdb_id, media_type, season, episode).await;
     db::watch_history::record_session_start(
         &state.db,
         &db::watch_history::SessionStart {
@@ -760,7 +814,7 @@ async fn start_disk_session(
             indexer_id: None,
             nzb_url: &download.nzb_url,
             duration_secs: session.info().duration_secs,
-            meta,
+            meta: lookup.meta,
         },
     )
     .await?;
@@ -787,6 +841,8 @@ fn synthesized_release(download: &db::downloads::Download) -> RankedRelease {
         posted_at: None,
         indexer_id: 0,
         indexer_name: "local download".into(),
+        tvdb_id: None,
+        imdb_id: None,
     };
     let parsed = parse_release_name(&raw.title);
     RankedRelease {
@@ -808,18 +864,34 @@ async fn probe_and_spawn(
     state: &AppState,
     session: &Arc<Session>,
     supports_hdr: bool,
+    audio_language: &str,
 ) -> AppResult<()> {
     let url = loopback_url(state, session);
     let probe = ffprobe::probe_url(&state.config.streaming.ffprobe_path, &url).await?;
-    let audio_transcoded = ffmpeg::should_transcode_audio(probe.audio_codec.as_deref());
+    // Serve the audio stream matching the preferred language — dual-language
+    // releases put the dub first, so stream 0 is often the wrong track.
+    let audio_stream_index =
+        ffprobe::select_audio_stream(&probe.audio_streams, Some(audio_language));
+    let audio = probe.audio_streams.get(audio_stream_index);
+    let audio_codec = audio.and_then(|s| s.codec.clone());
+    if audio_stream_index != 0 {
+        tracing::info!(
+            session = %session.id,
+            audio_stream_index,
+            language = audio.and_then(|s| s.language.as_deref()).unwrap_or("?"),
+            "selected non-first audio stream by language preference"
+        );
+    }
+    let audio_transcoded = ffmpeg::should_transcode_audio(audio_codec.as_deref());
     // AVPlayer refuses PQ/HLG variants outright on SDR-only outputs, so HDR
     // sources are tone-mapped for clients that declare no HDR support.
     let video_transcoded = !supports_hdr && probe.video_range != "SDR";
     session.set_info(MediaInfo {
         duration_secs: probe.duration_secs,
         video_codec: probe.video_codec.clone(),
-        audio_codec: probe.audio_codec,
+        audio_codec,
         audio_transcoded,
+        audio_stream_index,
         fps: probe.fps,
         video_range: if video_transcoded {
             "SDR".to_string()
@@ -837,6 +909,7 @@ async fn probe_and_spawn(
             transcode_audio: audio_transcoded,
             video_codec: probe.video_codec.as_deref(),
             tonemap_to_sdr: video_transcoded,
+            audio_stream_index,
         },
     )
     .await
@@ -1606,6 +1679,7 @@ async fn restart_ffmpeg(
             transcode_audio: info.audio_transcoded,
             video_codec: info.video_codec.as_deref(),
             tonemap_to_sdr: info.video_transcoded,
+            audio_stream_index: info.audio_stream_index,
         },
     )
     .await?;

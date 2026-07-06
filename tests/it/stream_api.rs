@@ -402,7 +402,7 @@ fn rss_with_release(indexer_base: &str) -> String {
   <channel>
     <title>mock</title>
     <item>
-      <title>Test.Movie.2026.1080p.BluRay.x264-TEST</title>
+      <title>Inception.2010.1080p.BluRay.x264-TEST</title>
       <guid isPermaLink="true">https://indexer.example/details/test-guid</guid>
       <link>{indexer_base}/getnzb/test.nzb</link>
       <pubDate>Wed, 03 Jun 2026 12:30:00 +0000</pubDate>
@@ -582,7 +582,7 @@ impl HlsStack {
                     "id": "sub-en",
                     "attributes": {
                         "language": "en",
-                        "release": "Test.Movie.2026.1080p.BluRay",
+                        "release": "Inception.2010.1080p.BluRay",
                         "download_count": 1234,
                         "hearing_impaired": false,
                         "ai_translated": false,
@@ -693,7 +693,7 @@ async fn hls_full_stack_remuxes_mock_usenet_release() {
     assert!((8.0..12.0).contains(&duration), "duration {duration}");
     assert_eq!(
         created["chosen_release"]["raw"]["title"],
-        "Test.Movie.2026.1080p.BluRay.x264-TEST"
+        "Inception.2010.1080p.BluRay.x264-TEST"
     );
     assert!(!created["candidates"]
         .as_array()
