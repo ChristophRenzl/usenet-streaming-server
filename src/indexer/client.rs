@@ -227,6 +227,22 @@ fn parse_rss(body: &str, indexer: &Indexer) -> AppResult<Vec<RawRelease>> {
                 .guid
                 .and_then(|g| g.value)
                 .unwrap_or_else(|| nzb_url.clone());
+            let attr = |name: &str| {
+                item.attrs
+                    .iter()
+                    .find(|a| a.name == name)
+                    .map(|a| a.value.as_str())
+            };
+            let tvdb_id = attr("tvdbid")
+                .and_then(|v| v.parse().ok())
+                .filter(|id| *id > 0);
+            let imdb_id = attr("imdbid")
+                .map(|v| {
+                    v.trim_start_matches("tt")
+                        .trim_start_matches('0')
+                        .to_string()
+                })
+                .filter(|v| !v.is_empty() && v.chars().all(|c| c.is_ascii_digit()));
             Some(RawRelease {
                 title,
                 guid,
@@ -235,6 +251,8 @@ fn parse_rss(body: &str, indexer: &Indexer) -> AppResult<Vec<RawRelease>> {
                 posted_at,
                 indexer_id: indexer.id,
                 indexer_name: indexer.name.clone(),
+                tvdb_id,
+                imdb_id,
             })
         })
         .collect();

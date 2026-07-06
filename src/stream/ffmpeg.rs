@@ -49,6 +49,10 @@ pub struct SpawnOptions<'a> {
     pub video_codec: Option<&'a str>,
     /// Tone-map HDR video to 1080p SDR H.264 instead of copying.
     pub tonemap_to_sdr: bool,
+    /// Which audio stream (0-based, among audio streams) to serve — picked
+    /// by language preference so dual-language releases don't default to
+    /// the dub that happens to be muxed first.
+    pub audio_stream_index: usize,
 }
 
 /// Spawn ffmpeg writing an fMP4 event playlist into the session's temp dir
@@ -63,7 +67,9 @@ pub async fn spawn_hls(session: &Arc<Session>, options: SpawnOptions<'_>) -> App
         cmd.arg("-ss").arg(format!("{:.3}", options.start_secs));
     }
     cmd.arg("-i").arg(options.input_url);
-    cmd.args(["-map", "0:v:0", "-map", "0:a:0?"]);
+    cmd.args(["-map", "0:v:0"]);
+    cmd.arg("-map")
+        .arg(format!("0:a:{}?", options.audio_stream_index));
     if options.tonemap_to_sdr {
         cmd.args(["-vf", TONEMAP_TO_SDR_FILTER]);
         cmd.args(["-c:v", "libx264", "-preset", "veryfast", "-crf", "21"]);

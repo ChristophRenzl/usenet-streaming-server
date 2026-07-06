@@ -61,6 +61,10 @@ pub struct MediaInfo {
     pub video_codec: Option<String>,
     pub audio_codec: Option<String>,
     pub audio_transcoded: bool,
+    /// Audio stream (0-based, among audio streams) served to the player,
+    /// picked by language preference at session start. Seek restarts must
+    /// keep serving the same stream.
+    pub audio_stream_index: usize,
     /// Frames per second of the video, when ffprobe reported it. Drives the
     /// fps-mismatch subtitle rescale.
     pub fps: Option<f64>,
