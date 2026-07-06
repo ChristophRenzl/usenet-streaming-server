@@ -6,6 +6,7 @@ pub mod metadata;
 pub mod releases;
 pub mod settings;
 pub mod stream;
+pub mod subtitles;
 pub mod system;
 pub mod watchlist;
 pub mod webui;
@@ -57,6 +58,7 @@ impl Modify for SecurityAddon {
         (name = "watchlist", description = "Saved movies/TV shows for later viewing"),
         (name = "releases", description = "Indexer release search and ranking"),
         (name = "streaming", description = "Playback sessions, HLS delivery and raw byte-range access"),
+        (name = "subtitles", description = "OpenSubtitles search and HLS subtitle delivery"),
         (name = "downloads", description = "Server-side download jobs and disk playback"),
         (name = "history", description = "Watch history and resume positions"),
         (name = "settings", description = "Preferences, indexers, providers, app settings"),
@@ -73,6 +75,7 @@ pub fn router(state: AppState) -> Router {
         .merge(watchlist::router())
         .merge(releases::router())
         .merge(stream::router())
+        .merge(subtitles::router())
         .merge(downloads::router())
         .merge(history::router())
         .merge(settings::router())

@@ -236,6 +236,31 @@ pub struct AppSettings {
     /// Masked TMDB API key (only the last 4 characters are shown), or `null`
     /// when not configured.
     pub tmdb_api_key: Option<String>,
+    /// Masked per-user OpenSubtitles API key (last 4 characters), or `null`
+    /// when no per-user key is stored. Subtitles are optional; playback works
+    /// without it. A `null` here does not mean subtitles are unavailable — an
+    /// operator config default may still be in effect (see
+    /// `opensubtitles_api_key_source`).
+    pub opensubtitles_api_key: Option<String>,
+    /// Whether an OpenSubtitles API key is effectively configured — true when a
+    /// per-user key is set OR an operator config default exists. Convenience
+    /// flag for the dashboard checklist, which treats subtitles as optional.
+    pub opensubtitles_configured: bool,
+    /// Where the effective OpenSubtitles API key comes from: `"user"` (per-user
+    /// key stored via the API), `"default"` (operator-supplied config/env
+    /// default, so users only need username/password), or `"none"`. Lets the UI
+    /// explain the key's origin and make the per-user key optional.
+    pub opensubtitles_api_key_source: String,
+    /// Whether an operator config default OpenSubtitles API key is present
+    /// (`subtitles.opensubtitles_default_api_key`). When true, the per-user key
+    /// is optional and only acts as an override.
+    pub opensubtitles_default_key_active: bool,
+    /// OpenSubtitles account username, when configured. Logging in lifts the
+    /// anonymous download quota.
+    pub opensubtitles_username: Option<String>,
+    /// Whether an OpenSubtitles account password is stored (the password
+    /// itself is write-only and never reported back).
+    pub opensubtitles_password_set: bool,
     /// Masked server API key currently in effect: the database override when
     /// one is set, otherwise the bootstrap key from the config file.
     pub api_key: String,
@@ -248,6 +273,14 @@ pub struct AppSettings {
 pub struct AppSettingsInput {
     /// New TMDB API key. Omit to leave unchanged; send `""` to clear.
     pub tmdb_api_key: Option<String>,
+    /// New OpenSubtitles API key. Omit to leave unchanged; send `""` to clear.
+    pub opensubtitles_api_key: Option<String>,
+    /// OpenSubtitles account username (login lifts the download quota). Omit
+    /// to leave unchanged; send `""` to clear.
+    pub opensubtitles_username: Option<String>,
+    /// OpenSubtitles account password. Omit to leave unchanged; send `""` to
+    /// clear. Write-only: it is never reported back.
+    pub opensubtitles_password: Option<String>,
     /// New server API key (at least 16 characters). Stored as an override;
     /// the bootstrap key from the config file / environment remains valid.
     pub api_key: Option<String>,
@@ -267,6 +300,36 @@ async fn current_app_settings(state: &AppState) -> AppResult<AppSettings> {
     let tmdb_key = db::settings::get(&state.db, db::settings::TMDB_API_KEY)
         .await?
         .filter(|k| !k.is_empty());
+    // A per-user key is masked and reported directly; whether subtitles are
+    // effectively usable additionally accounts for the operator config default.
+    let opensubtitles_key = db::settings::get(&state.db, db::settings::OPENSUBTITLES_API_KEY)
+        .await?
+        .filter(|k| !k.is_empty());
+    let (_, opensubtitles_key_source) =
+        crate::api::subtitles::effective_opensubtitles_key(state).await?;
+    let opensubtitles_default_key_active = matches!(
+        opensubtitles_key_source,
+        crate::api::subtitles::ApiKeySource::Default
+    ) || state
+        .config
+        .subtitles
+        .opensubtitles_default_api_key
+        .as_deref()
+        .is_some_and(|k| !k.is_empty());
+    let opensubtitles_api_key_source = match opensubtitles_key_source {
+        crate::api::subtitles::ApiKeySource::User => "user",
+        crate::api::subtitles::ApiKeySource::Default => "default",
+        crate::api::subtitles::ApiKeySource::None => "none",
+    }
+    .to_string();
+    let opensubtitles_username = db::settings::get(&state.db, db::settings::OPENSUBTITLES_USERNAME)
+        .await?
+        .filter(|u| !u.is_empty());
+    let opensubtitles_password_set =
+        db::settings::get(&state.db, db::settings::OPENSUBTITLES_PASSWORD)
+            .await?
+            .filter(|p| !p.is_empty())
+            .is_some();
     let override_key = db::settings::get(&state.db, db::settings::API_KEY_OVERRIDE)
         .await?
         .filter(|k| !k.is_empty());
@@ -274,6 +337,15 @@ async fn current_app_settings(state: &AppState) -> AppResult<AppSettings> {
     let active_key = override_key.unwrap_or_else(|| state.config.auth.api_key.clone());
     Ok(AppSettings {
         tmdb_api_key: tmdb_key.map(|k| mask_secret(&k)),
+        opensubtitles_configured: !matches!(
+            opensubtitles_key_source,
+            crate::api::subtitles::ApiKeySource::None
+        ),
+        opensubtitles_api_key: opensubtitles_key.map(|k| mask_secret(&k)),
+        opensubtitles_api_key_source,
+        opensubtitles_default_key_active,
+        opensubtitles_username,
+        opensubtitles_password_set,
         api_key: mask_secret(&active_key),
         api_key_override_active,
     })
@@ -309,6 +381,28 @@ pub async fn put_app_settings(
     }
     if let Some(key) = input.tmdb_api_key {
         db::settings::set(&state.db, db::settings::TMDB_API_KEY, key.trim()).await?;
+    }
+    let opensubtitles_changed = input.opensubtitles_api_key.is_some()
+        || input.opensubtitles_username.is_some()
+        || input.opensubtitles_password.is_some();
+    if let Some(key) = input.opensubtitles_api_key {
+        db::settings::set(&state.db, db::settings::OPENSUBTITLES_API_KEY, key.trim()).await?;
+    }
+    if let Some(username) = input.opensubtitles_username {
+        db::settings::set(
+            &state.db,
+            db::settings::OPENSUBTITLES_USERNAME,
+            username.trim(),
+        )
+        .await?;
+    }
+    if let Some(password) = input.opensubtitles_password {
+        // Deliberately not trimmed: passwords may legitimately contain spaces.
+        db::settings::set(&state.db, db::settings::OPENSUBTITLES_PASSWORD, &password).await?;
+    }
+    if opensubtitles_changed {
+        // A cached login token may belong to the old key/credentials.
+        state.opensubtitles_token.set(None).await;
     }
     Ok(Json(current_app_settings(&state).await?))
 }

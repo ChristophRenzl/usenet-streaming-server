@@ -35,3 +35,15 @@ ffprobe_path = "ffprobe"
 # available releases. Installed in the Docker image; on bare-metal install
 # `par2` (e.g. apt-get install par2 / brew install par2cmdline).
 par2_path = "par2"
+
+[subtitles]
+# Optional operator-supplied default OpenSubtitles consumer API key. Set this
+# ONCE at deploy time (e.g. on your NAS) so users only ever manage their
+# OpenSubtitles username/password — the "Jellyfin experience". A per-user key
+# stored via the API/web UI takes precedence when present; when neither is set,
+# subtitles stay disabled (playback still works).
+#
+# Operator-supplied only — never bundled. Get a free consumer key at
+# https://www.opensubtitles.com/consumers. Prefer the env var so the key stays
+# out of the repo:  APP_SUBTITLES__OPENSUBTITLES_DEFAULT_API_KEY=your-key
+# opensubtitles_default_api_key = ""

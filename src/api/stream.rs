@@ -34,11 +34,13 @@ use crate::{
         session::{NewSession, Session, SessionState},
         MediaInfo,
     },
+    subtitles::{self, SubtitleTrack},
     tmdb::models::MediaType,
     vfs::DiskFile,
 };
 
 use super::releases::{pick_candidates, resolve_candidates, ReleaseTarget};
+use super::subtitles::{download_subtitle, opensubtitles_client};
 
 /// Maximum release candidates tried before giving up.
 pub(crate) const MAX_ATTEMPTS: usize = 5;
@@ -49,6 +51,17 @@ const PLAYLIST_CONTENT_TYPE: &str = "application/vnd.apple.mpegurl";
 
 static SEGMENT_NAME: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(init\.mp4|seg_\d+\.m4s)$").expect("segment regex"));
+
+/// Strict allowlist for external-subtitle files served from the session dir:
+/// `sub_<lang>_<n>.m3u8` or `.vtt`, where `<lang>` is a lower-case ISO code
+/// with an optional regional suffix (`en`, `ger`, `pt-br`). Fully anchored
+/// with no path separators, `.` or `..`, so the path-traversal guard is not
+/// weakened.
+static SUBTITLE_FILE_NAME: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^sub_[a-z]{2,4}(-[a-z]{2,4})?_\d+\.(m3u8|vtt)$").expect("subtitle file regex")
+});
+
+const VTT_CONTENT_TYPE: &str = "text/vtt";
 
 // ---- Session creation -------------------------------------------------------
 
@@ -79,6 +92,12 @@ pub struct CreateSessionRequest {
     /// above the lower of this and the stored preference max are rejected,
     /// and the best supported resolution ranks first.
     pub max_resolution: Option<Resolution>,
+    /// Optional ISO 639-1 languages (e.g. `["en","de"]`). When set and an
+    /// OpenSubtitles API key is configured, the server best-effort searches
+    /// and attaches the top subtitle per language during session start.
+    /// Subtitle failures are non-fatal — the session still starts without
+    /// subtitles and logs the reason.
+    pub subtitle_languages: Option<Vec<String>>,
     /// Whether the device/display can render HDR (PQ/HLG). When `false`,
     /// HDR sources are tone-mapped to 1080p SDR H.264 instead of
     /// stream-copied. Absent means HDR-capable.
@@ -107,6 +126,9 @@ pub struct CreateSessionResponse {
     pub resume_position_secs: Option<f64>,
     /// Where the media bytes come from: `disk` (finished download) or `nntp`.
     pub source: String,
+    /// External subtitle tracks attached at session start (empty when none
+    /// were requested, none were found, or no OpenSubtitles key is set).
+    pub subtitle_tracks: Vec<SubtitleTrackInfo>,
 }
 
 /// Returned with HTTP 202 when no candidate is streamable but at least one is
@@ -163,6 +185,8 @@ pub async fn create_session(
     State(state): State<AppState>,
     Json(request): Json<CreateSessionRequest>,
 ) -> AppResult<SessionOrRepair> {
+    // Requested subtitle languages (best-effort auto-attach after start).
+    let subtitle_languages = request.subtitle_languages.clone().unwrap_or_default();
     let supports_hdr = request.supports_hdr.unwrap_or(true);
 
     // Direct playback of one specific finished download.
@@ -170,7 +194,7 @@ pub async fn create_session(
         let download = db::downloads::get(&state.db, &download_id.to_string())
             .await?
             .ok_or_else(|| AppError::NotFound(format!("download {download_id}")))?;
-        return start_disk_session(&state, &download, supports_hdr)
+        return start_disk_session(&state, &download, &subtitle_languages, supports_hdr)
             .await
             .map(|s| SessionOrRepair::Session(Box::new(s)));
     }
@@ -202,7 +226,7 @@ pub async fn create_session(
                 continue;
             };
             if tokio::fs::try_exists(path).await.unwrap_or(false) {
-                return start_disk_session(&state, &download, supports_hdr)
+                return start_disk_session(&state, &download, &subtitle_languages, supports_hdr)
                     .await
                     .map(|s| SessionOrRepair::Session(Box::new(s)));
             }
@@ -233,6 +257,8 @@ pub async fn create_session(
                     .await
                 {
                     Ok(session) => {
+                        // Best-effort auto-subtitles: never fails the session.
+                        auto_attach_subtitles(&state, &session, &subtitle_languages).await;
                         return Ok(SessionOrRepair::Session(Box::new(session_response(
                             &session, candidate, candidates, "nntp",
                         ))));
@@ -334,7 +360,114 @@ fn session_response(
         resume_position_secs: (session.resume_position_secs > 0.0)
             .then_some(session.resume_position_secs),
         source: source.to_string(),
+        subtitle_tracks: session
+            .subtitle_tracks()
+            .iter()
+            .map(|t| SubtitleTrackInfo::from_track(&session.id, t))
+            .collect(),
     }
+}
+
+/// Best-effort auto-attach of subtitles at session start. Searches
+/// OpenSubtitles for the session's media in each requested language and
+/// attaches the top result. Never fails the session: a missing key, no
+/// results or an upstream error is logged and skipped.
+///
+/// Two accuracy features ride along:
+///
+/// - the media's OpenSubtitles **moviehash** is computed from its
+///   [`VirtualFile`](crate::vfs::VirtualFile) and passed to the search, so
+///   hash-matched (release-accurate) subtitles are found and ranked first;
+/// - for a chosen subtitle that is *not* hash-matched but reports its own
+///   `fps`, cue times are rescaled by `media_fps / subtitle_fps` to correct
+///   frame-rate drift. Hash-matched subs are assumed correct and left as-is.
+async fn auto_attach_subtitles(state: &AppState, session: &Arc<Session>, languages: &[String]) {
+    if languages.is_empty() {
+        return;
+    }
+    let client = match opensubtitles_client(state).await {
+        Ok(client) => client,
+        Err(error) => {
+            tracing::info!(session = %session.id, %error, "skipping auto-subtitles");
+            return;
+        }
+    };
+
+    // Release-accurate matching: compute the media's moviehash once. Non-fatal.
+    let moviehash = match subtitles::osdb_hash(&session.media).await {
+        Ok(hash) => hash,
+        Err(error) => {
+            tracing::warn!(session = %session.id, %error, "computing moviehash failed");
+            None
+        }
+    };
+    let media_fps = session.info().fps;
+
+    // Episodes key on the show tmdb id + S/E; movies on the tmdb id.
+    let (season, episode) = match session.media_type {
+        MediaType::Tv => (session.season, session.episode),
+        MediaType::Movie => (None, None),
+    };
+
+    for language in languages {
+        let query = subtitles::SubtitleQuery {
+            tmdb_id: session.tmdb_id,
+            season,
+            episode,
+            languages: vec![language.clone()],
+            moviehash: moviehash.clone(),
+        };
+        let top = match client.search(&query).await {
+            Ok(results) => results.into_iter().next(),
+            Err(error) => {
+                tracing::warn!(session = %session.id, %language, %error, "subtitle search failed");
+                continue;
+            }
+        };
+        let Some(result) = top else {
+            tracing::info!(session = %session.id, %language, "no subtitle found");
+            continue;
+        };
+        let srt = match download_subtitle(state, &client, result.file_id).await {
+            Ok(srt) => srt,
+            Err(error) => {
+                tracing::warn!(session = %session.id, %language, %error, "subtitle download failed");
+                continue;
+            }
+        };
+        let fps_scale = fps_rescale(media_fps, result.fps, result.moviehash_match);
+        // The first attached track becomes the default.
+        let make_default = session.subtitle_tracks().is_empty();
+        match subtitles::attach_subtitle(session, language, &srt.text, make_default, fps_scale)
+            .await
+        {
+            Ok(track) => tracing::info!(
+                session = %session.id,
+                language = %track.language,
+                hash_match = result.moviehash_match,
+                fps_scale = ?fps_scale,
+                "attached subtitle"
+            ),
+            Err(error) => {
+                tracing::warn!(session = %session.id, %language, %error, "attaching subtitle failed")
+            }
+        }
+    }
+}
+
+/// The fps rescale factor (`media_fps / subtitle_fps`) to apply to a subtitle,
+/// or `None` when no correction should happen: hash-matched subs are assumed
+/// release-accurate, and a correction only applies when both frame rates are
+/// known and differ meaningfully (> 0.1 fps).
+fn fps_rescale(media_fps: Option<f64>, subtitle_fps: Option<f64>, hash_match: bool) -> Option<f64> {
+    if hash_match {
+        return None;
+    }
+    let (media, sub) = (media_fps?, subtitle_fps?);
+    if !media.is_finite() || !sub.is_finite() || media <= 0.0 || sub <= 0.0 {
+        return None;
+    }
+    ((media - sub).abs() > 0.1).then_some(media / sub)
 }
 
 /// Grab a candidate's NZB, parse it and pick the main content (no health
@@ -468,6 +601,7 @@ async fn start_streamable_session(
 async fn start_disk_session(
     state: &AppState,
     download: &db::downloads::Download,
+    subtitle_languages: &[String],
     supports_hdr: bool,
 ) -> AppResult<CreateSessionResponse> {
     if download.status != "complete" {
@@ -551,6 +685,9 @@ async fn start_disk_session(
     )
     .await?;
 
+    // Best-effort auto-subtitles: never fails the session.
+    auto_attach_subtitles(state, &session, subtitle_languages).await;
+
     Ok(session_response(
         &session,
         synthesized_release(download),
@@ -603,6 +740,7 @@ async fn probe_and_spawn(
         video_codec: probe.video_codec.clone(),
         audio_codec: probe.audio_codec,
         audio_transcoded,
+        fps: probe.fps,
         video_range: if video_transcoded {
             "SDR".to_string()
         } else {
@@ -822,20 +960,17 @@ pub async fn master_playlist(
     session.touch();
     // AVPlayer assumes SDR when VIDEO-RANGE is absent and rejects the stream
     // ("video range specified by playlist is less than actual format
-    // description") once the format description says PQ/HLG.
+    // description") once the format description says PQ/HLG. The builder also
+    // advertises any attached external subtitle renditions; the ?apikey=
+    // suffix is re-embedded into every URI so header-less players keep auth.
     let info = session.info();
     let video_range = if info.video_range.is_empty() {
         "SDR"
     } else {
         &info.video_range
     };
-    let master = format!(
-        "#EXTM3U\n\
-         #EXT-X-VERSION:7\n\
-         #EXT-X-STREAM-INF:BANDWIDTH=20000000,VIDEO-RANGE={video_range}\n\
-         media.m3u8{}\n",
-        auth.uri_suffix()
-    );
+    let master = subtitles::master_playlist(&session.subtitle_tracks(), video_range);
+    let master = playlist_with_suffix(&master, &auth.uri_suffix());
     Ok(([(header::CONTENT_TYPE, PLAYLIST_CONTENT_TYPE)], master).into_response())
 }
 
@@ -882,29 +1017,58 @@ pub async fn media_playlist(
     }
 }
 
-/// One fMP4 file from the session dir: `init.mp4` or `seg_NNNNN.m4s`.
+/// One file from the session dir: `init.mp4`, `seg_NNNNN.m4s`, or an external
+/// subtitle rendition (`sub_<lang>_<n>.m3u8` / `sub_<lang>_<n>.vtt`).
 #[utoipa::path(get, path = "/stream/{session_id}/{segment}", tag = "streaming",
     params(
         ("session_id" = Uuid, Path, description = "Session id"),
-        ("segment" = String, Path, description = "`init.mp4` or `seg_NNNNN.m4s`"),
+        ("segment" = String, Path, description = "`init.mp4`, `seg_NNNNN.m4s`, `sub_<lang>_<n>.m3u8` or `sub_<lang>_<n>.vtt`"),
     ),
     responses(
-        (status = 200, description = "fMP4 init/media segment", content_type = "video/mp4"),
-        (status = 400, description = "Invalid segment name"),
+        (status = 200, description = "fMP4 init/media segment, subtitle playlist or WebVTT"),
+        (status = 400, description = "Invalid file name"),
         (status = 404),
     ))]
 pub async fn hls_segment(
     State(state): State<AppState>,
     Path((session_id, segment)): Path<(Uuid, String)>,
+    Query(auth): Query<ApiKeyParam>,
 ) -> AppResult<Response> {
     let session = get_session(&state, &session_id)?;
     // Strict allowlist: the path parameter must never escape the temp dir.
-    if !SEGMENT_NAME.is_match(&segment) {
+    // Both regexes are fully anchored with no path separators.
+    let content_type = if SEGMENT_NAME.is_match(&segment) {
+        "video/mp4"
+    } else if SUBTITLE_FILE_NAME.is_match(&segment) {
+        if segment.ends_with(".vtt") {
+            VTT_CONTENT_TYPE
+        } else {
+            PLAYLIST_CONTENT_TYPE
+        }
+    } else {
         return Err(AppError::BadRequest(format!(
             "invalid segment name '{segment}'"
         )));
-    }
+    };
     session.touch();
+    // Subtitle renditions are written straight to the session dir (not produced
+    // by ffmpeg), so serve them from disk. The child playlist references the
+    // .vtt by a relative URI, so header-less players need the ?apikey=
+    // re-embedded like the media playlist; the .vtt itself is served as-is.
+    if content_type != "video/mp4" {
+        return match tokio::fs::read(session.temp_dir.join(&segment)).await {
+            Ok(bytes) => {
+                if segment.ends_with(".m3u8") {
+                    let playlist =
+                        playlist_with_suffix(&String::from_utf8_lossy(&bytes), &auth.uri_suffix());
+                    Ok(([(header::CONTENT_TYPE, content_type)], playlist).into_response())
+                } else {
+                    Ok(([(header::CONTENT_TYPE, content_type)], bytes).into_response())
+                }
+            }
+            Err(_) => Err(AppError::NotFound(format!("segment {segment}"))),
+        };
+    }
 
     // Fast path: the segment is already on disk and complete.
     if segment_complete(&session, &segment).await {
@@ -1089,6 +1253,148 @@ async fn pump_segment(
     }
 }
 
+// ---- Subtitle attach ----------------------------------------------------------
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct AttachSubtitleRequest {
+    /// OpenSubtitles `file_id` (from `GET /subtitles/search`).
+    pub file_id: i64,
+    /// ISO 639-1 language code (`en`, `de`, ...) for the track.
+    pub language: String,
+    /// Mark this as the default/auto-selected track (only honoured for the
+    /// first attached track). Defaults to false.
+    #[serde(default)]
+    pub default: bool,
+}
+
+/// One subtitle track surfaced to the client (session responses).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SubtitleTrackInfo {
+    pub language: String,
+    pub name: String,
+    /// Per-subtitle HLS media playlist URL (relative to the API root).
+    pub playlist_url: String,
+    pub default: bool,
+}
+
+impl SubtitleTrackInfo {
+    fn from_track(session_id: &Uuid, track: &SubtitleTrack) -> Self {
+        Self {
+            language: track.language.clone(),
+            name: track.name.clone(),
+            playlist_url: format!("/api/v1/stream/{session_id}/{}", track.playlist_name),
+            default: track.default,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AttachSubtitleResponse {
+    /// The newly attached track.
+    pub track: SubtitleTrackInfo,
+    /// Master playlist URL to (re)load so the new track shows up.
+    pub hls_master_url: String,
+    /// All subtitle tracks now attached to the session.
+    pub subtitle_tracks: Vec<SubtitleTrackInfo>,
+}
+
+/// Attach an OpenSubtitles subtitle to a live session. The subtitle is
+/// downloaded, converted to WebVTT and written into the session as a
+/// single-segment HLS subtitle rendition; the master playlist then advertises
+/// it via `#EXT-X-MEDIA:TYPE=SUBTITLES` so AVPlayer offers it natively.
+/// Reload `hls_master_url` after this call.
+#[utoipa::path(post, path = "/stream/{session_id}/subtitles", tag = "subtitles",
+    params(("session_id" = Uuid, Path, description = "Session id")),
+    request_body = AttachSubtitleRequest,
+    responses(
+        (status = 200, body = AttachSubtitleResponse),
+        (status = 400, description = "Bad language, or OpenSubtitles API key not configured"),
+        (status = 404, description = "Unknown session"),
+        (status = 502, description = "OpenSubtitles upstream error"),
+    ))]
+pub async fn attach_subtitle(
+    State(state): State<AppState>,
+    Path(session_id): Path<Uuid>,
+    Json(request): Json<AttachSubtitleRequest>,
+) -> AppResult<Json<AttachSubtitleResponse>> {
+    let session = get_session(&state, &session_id)?;
+    session.touch();
+    // Validate the language up-front so a bad code fails before any download.
+    let language = subtitles::normalize_language(&request.language)?;
+    let client = opensubtitles_client(&state).await?;
+    let srt = download_subtitle(&state, &client, request.file_id).await?;
+    // Manual attach: the user picked this subtitle explicitly, so no automatic
+    // fps rescale (the standalone search carries no fps/hash signal). Drift, if
+    // any, is corrected via the manual offset endpoint below.
+    let track =
+        subtitles::attach_subtitle(&session, &language, &srt.text, request.default, None).await?;
+
+    let tracks = session.subtitle_tracks();
+    Ok(Json(AttachSubtitleResponse {
+        track: SubtitleTrackInfo::from_track(&session_id, &track),
+        hls_master_url: format!("/api/v1/stream/{session_id}/master.m3u8"),
+        subtitle_tracks: tracks
+            .iter()
+            .map(|t| SubtitleTrackInfo::from_track(&session_id, t))
+            .collect(),
+    }))
+}
+
+// ---- Manual subtitle offset ---------------------------------------------------
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SubtitleOffsetRequest {
+    /// Absolute cumulative offset in milliseconds, relative to the subtitle's
+    /// original timing (positive = later, negative = earlier). Each call
+    /// replaces the previous offset — it is not a delta — so cue times never
+    /// compound. Negative cue times clamp to `0`.
+    pub ms: i64,
+}
+
+/// Nudge an attached subtitle track's timing. The track is addressed by
+/// **language** (the `{language}` path segment, matched case-insensitively on
+/// the primary subtag, e.g. `en` also matches `en-US`); when several subtitles
+/// of the same language are attached, the first/selected one is targeted.
+///
+/// The track's WebVTT is re-emitted from its pristine base timing shifted by
+/// `ms` and written back to the same `.vtt` (the HLS playlist URI is
+/// unchanged), so the player just reloads the rendition. `ms` is absolute, not
+/// a delta, so repeated nudges never accumulate rounding drift.
+#[utoipa::path(post, path = "/stream/{session_id}/subtitles/{language}/offset", tag = "subtitles",
+    params(
+        ("session_id" = Uuid, Path, description = "Session id"),
+        ("language" = String, Path, description = "Track language (primary subtag, e.g. `en`)"),
+    ),
+    request_body = SubtitleOffsetRequest,
+    responses(
+        (status = 200, body = SubtitleTrackInfo, description = "The updated subtitle track"),
+        (status = 404, description = "Unknown session, or no subtitle track with that language"),
+    ))]
+pub async fn offset_subtitle(
+    State(state): State<AppState>,
+    Path((session_id, language)): Path<(Uuid, String)>,
+    Json(request): Json<SubtitleOffsetRequest>,
+) -> AppResult<Json<SubtitleTrackInfo>> {
+    let session = get_session(&state, &session_id)?;
+    session.touch();
+    let track = session
+        .subtitle_track_by_language(&language)
+        .ok_or_else(|| {
+            AppError::NotFound(format!(
+                "subtitle track '{language}' on session {session_id}"
+            ))
+        })?;
+    // Re-shift from the pristine base VTT by the (absolute) offset.
+    let updated = subtitles::set_subtitle_offset(&session, &track.key, request.ms)
+        .await?
+        .ok_or_else(|| {
+            AppError::NotFound(format!(
+                "subtitle track '{language}' on session {session_id}"
+            ))
+        })?;
+    Ok(Json(SubtitleTrackInfo::from_track(&session_id, &updated)))
+}
+
 // ---- Raw byte-range access ----------------------------------------------------
 
 /// The source media file with RFC 7233 single-range support, for players
@@ -1239,13 +1545,21 @@ async fn playlist_seconds(playlist: &FsPath) -> f64 {
         .sum()
 }
 
-/// Delete all files inside the session dir (playlist + segments), keeping
-/// the directory itself.
+/// Delete the video playlist + segments inside the session dir (keeping the
+/// directory itself), but preserve attached external subtitle renditions
+/// (`sub_*.m3u8` / `sub_*.vtt`) so they survive a seek restart.
 async fn wipe_dir(dir: &FsPath) -> AppResult<()> {
     let mut entries = tokio::fs::read_dir(dir)
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("reading session dir: {e}")))?;
     while let Ok(Some(entry)) = entries.next_entry().await {
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| SUBTITLE_FILE_NAME.is_match(name))
+        {
+            continue;
+        }
         if let Err(e) = tokio::fs::remove_file(entry.path()).await {
             tracing::warn!(path = %entry.path().display(), error = %e, "failed to remove file");
         }
@@ -1261,6 +1575,8 @@ pub fn router() -> OpenApiRouter<AppState> {
         .routes(routes!(media_playlist))
         .routes(routes!(raw_media))
         .routes(routes!(seek_session))
+        .routes(routes!(attach_subtitle))
+        .routes(routes!(offset_subtitle))
         .routes(routes!(hls_segment))
 }
 
@@ -1336,6 +1652,20 @@ mod tests {
         };
         assert_eq!(auth.uri_suffix(), "?apikey=k%2Fe%20y%2B%26%3D%3F");
         assert_eq!(ApiKeyParam { apikey: None }.uri_suffix(), "");
+    }
+
+    #[test]
+    fn fps_rescale_rules() {
+        // Hash-matched: never rescale, even with a known fps mismatch.
+        assert_eq!(fps_rescale(Some(23.976), Some(25.0), true), None);
+        // Matching (within 0.1) fps: no rescale.
+        assert_eq!(fps_rescale(Some(23.976), Some(24.0), false), None);
+        // Unknown media or subtitle fps: no rescale.
+        assert_eq!(fps_rescale(None, Some(25.0), false), None);
+        assert_eq!(fps_rescale(Some(23.976), None, false), None);
+        // A genuine mismatch: scale by media/subtitle.
+        let scale = fps_rescale(Some(23.976), Some(25.0), false).expect("rescale");
+        assert!((scale - 23.976 / 25.0).abs() < 1e-9);
     }
 
     #[tokio::test]

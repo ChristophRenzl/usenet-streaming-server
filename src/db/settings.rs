@@ -7,6 +7,18 @@ use crate::error::AppResult;
 /// Key under which the TMDB API key is stored.
 pub const TMDB_API_KEY: &str = "tmdb_api_key";
 
+/// Key under which the OpenSubtitles API key is stored. Optional: subtitles
+/// are a best-effort feature and playback works without it.
+pub const OPENSUBTITLES_API_KEY: &str = "opensubtitles_api_key";
+
+/// Key under which an optional OpenSubtitles account username is stored.
+/// Logging in lifts the anonymous per-IP download quota.
+pub const OPENSUBTITLES_USERNAME: &str = "opensubtitles_username";
+
+/// Key under which the OpenSubtitles account password is stored (paired with
+/// [`OPENSUBTITLES_USERNAME`]).
+pub const OPENSUBTITLES_PASSWORD: &str = "opensubtitles_password";
+
 /// Key under which a rotated server API key is stored. When set, requests may
 /// authenticate with either this value or the bootstrap key from the config
 /// file / environment (the latter stays valid as a recovery path).
