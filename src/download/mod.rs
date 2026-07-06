@@ -4,6 +4,7 @@
 //! recovery.
 
 pub mod name;
+pub mod repair;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -35,6 +36,30 @@ const PROGRESS_BYTES: u64 = 16 * 1024 * 1024;
 pub struct DownloadJob {
     pub nzb: Nzb,
     pub main: MainContent,
+    /// When true, this is a download-and-repair job: fetch every file needed
+    /// to reconstruct the media (data + par2), run par2 repair, then produce
+    /// the media. When false, the plain path streams the main content to disk.
+    pub repair: bool,
+}
+
+impl DownloadJob {
+    /// A plain streaming-copy job (main content only, no par2).
+    pub fn plain(nzb: Nzb, main: MainContent) -> Self {
+        Self {
+            nzb,
+            main,
+            repair: false,
+        }
+    }
+
+    /// A download-and-repair job (all data + par2, then par2 repair).
+    pub fn repair(nzb: Nzb, main: MainContent) -> Self {
+        Self {
+            nzb,
+            main,
+            repair: true,
+        }
+    }
 }
 
 struct RunningJob {
@@ -100,12 +125,28 @@ async fn run(state: AppState, id: Uuid, job: DownloadJob, cancel: CancellationTo
     // `execute` records the partial path here as soon as it exists so the
     // cancellation/failure paths below can always clean it up.
     let partial_slot: Arc<Mutex<Option<PathBuf>>> = Arc::default();
+    // Repair jobs also record a working directory to clean up.
+    let work_slot: Arc<Mutex<Option<PathBuf>>> = Arc::default();
 
     // Cancellation is cooperative inside `execute`: only network waits race
     // against the token. Local file operations always run to completion —
     // dropping a tokio::fs future mid-await would leave its spawn_blocking
     // op running detached, e.g. creating the `.partial` *after* cleanup.
-    let outcome = match execute(&state, &id, &job, &partial_slot, &cancel).await {
+    let result = if job.repair {
+        repair::execute(
+            &state,
+            &id,
+            &job.nzb,
+            &job.main,
+            &work_slot,
+            &partial_slot,
+            &cancel,
+        )
+        .await
+    } else {
+        execute(&state, &id, &job, &partial_slot, &cancel).await
+    };
+    let outcome = match result {
         Ok(false) => Outcome::Cancelled,
         Ok(true) => Outcome::Complete,
         Err(error) => Outcome::Failed(error),
@@ -120,16 +161,29 @@ async fn run(state: AppState, id: Uuid, job: DownloadJob, cancel: CancellationTo
         Outcome::Failed(error) => {
             tracing::warn!(download = %id, %error, "download failed");
             remove_partial(&partial_slot).await;
+            remove_work_dir(&work_slot).await;
             db::downloads::mark_failed(&state.db, &id_text, &error.to_string()).await
         }
         Outcome::Cancelled => {
             tracing::info!(download = %id, "download cancelled");
             remove_partial(&partial_slot).await;
+            remove_work_dir(&work_slot).await;
             db::downloads::mark_cancelled(&state.db, &id_text).await
         }
     };
     if let Err(error) = db_result {
         tracing::error!(download = %id, %error, "failed to record download outcome");
+    }
+}
+
+async fn remove_work_dir(slot: &Mutex<Option<PathBuf>>) {
+    let path = slot.lock().expect("work slot lock").take();
+    if let Some(path) = path {
+        if let Err(error) = tokio::fs::remove_dir_all(&path).await {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(path = %path.display(), %error, "failed to remove repair work dir");
+            }
+        }
     }
 }
 

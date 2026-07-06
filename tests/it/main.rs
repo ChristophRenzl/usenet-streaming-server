@@ -8,5 +8,6 @@ mod history_api;
 mod nntp_client;
 mod provider_endpoint;
 mod rar_fixtures;
+mod repair;
 mod stream_api;
 mod vfs_e2e;

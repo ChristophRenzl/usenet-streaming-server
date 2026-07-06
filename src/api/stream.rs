@@ -19,7 +19,10 @@ use crate::{
     db,
     error::{AppError, AppResult},
     indexer::{client::NewznabClient, RawRelease},
-    nzb::{health_check, main_content_segments, parse_nzb, select_main, MainContent, Nzb},
+    nzb::{
+        assess_release, health_check, main_content_segments, parse_nzb, select_main, HealthVerdict,
+        MainContent, Nzb, RepairAssessment,
+    },
     release::{
         parse::{parse_release_name, Resolution},
         rank::RankedRelease,
@@ -67,6 +70,11 @@ pub struct CreateSessionRequest {
     /// Skip the completed-download shortcut and always stream from Usenet.
     #[serde(default)]
     pub force_nntp: bool,
+    /// Skip the streaming attempt and go straight to a download-and-repair
+    /// job for the best repairable candidate (returns 202 `repairing`). Fails
+    /// with 422 when no candidate is even repairable.
+    #[serde(default)]
+    pub force_repair: bool,
     /// Device capability cap (`480p`, `720p`, `1080p`, `2160p`): releases
     /// above the lower of this and the stored preference max are rejected,
     /// and the best supported resolution ranks first.
@@ -101,21 +109,60 @@ pub struct CreateSessionResponse {
     pub source: String,
 }
 
+/// Returned with HTTP 202 when no candidate is streamable but at least one is
+/// repairable: a download-and-repair job was started. Poll
+/// `GET /downloads/{download_id}` for progress; once it is `complete`, start a
+/// session again (or with `download_id`) to play the repaired file from disk.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RepairingResponse {
+    /// Always `"repairing"` — lets clients distinguish this from a 200 session.
+    pub status: String,
+    /// The download job reconstructing the release via par2.
+    pub download_id: Uuid,
+    /// Title of the release being repaired.
+    pub release_title: String,
+    /// The full ranked candidate list the choice was made from.
+    pub candidates: Vec<RankedRelease>,
+}
+
+/// Either a started playback session (200) or a started repair job (202).
+pub enum SessionOrRepair {
+    Session(Box<CreateSessionResponse>),
+    Repairing(RepairingResponse),
+}
+
+impl IntoResponse for SessionOrRepair {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Session(session) => (StatusCode::OK, Json(*session)).into_response(),
+            Self::Repairing(repair) => (StatusCode::ACCEPTED, Json(repair)).into_response(),
+        }
+    }
+}
+
 /// Start a playback session. Completed downloads are played straight from
-/// disk (unless `force_nntp`); otherwise releases are resolved and the
-/// first healthy streamable candidate is probed and remuxed.
+/// disk (unless `force_nntp`); otherwise releases are resolved and the first
+/// healthy streamable candidate is probed and remuxed.
+///
+/// When no candidate is streamable but at least one is *repairable* (too
+/// damaged to stream, yet recoverable from its par2 recovery files), a
+/// download-and-repair job is started and the endpoint returns **202** with a
+/// [`RepairingResponse`] instead of 422. Poll the download, then start again
+/// once it completes to play the repaired file from disk. Pass `force_repair`
+/// to skip streaming and go straight to repair.
 #[utoipa::path(post, path = "/stream/sessions", tag = "streaming",
     request_body = CreateSessionRequest,
     responses(
-        (status = 200, body = CreateSessionResponse),
+        (status = 200, body = CreateSessionResponse, description = "Playback session started (streaming or disk)"),
+        (status = 202, body = RepairingResponse, description = "No streamable candidate; a download-and-repair job was started"),
         (status = 400, description = "Bad parameters, missing indexers or TMDB key"),
         (status = 404, description = "Unknown TMDB id, release_guid or download_id"),
-        (status = 422, description = "No streamable release found; details list per-candidate reasons"),
+        (status = 422, description = "No streamable or repairable release found; details list per-candidate reasons"),
     ))]
 pub async fn create_session(
     State(state): State<AppState>,
     Json(request): Json<CreateSessionRequest>,
-) -> AppResult<Json<CreateSessionResponse>> {
+) -> AppResult<SessionOrRepair> {
     let supports_hdr = request.supports_hdr.unwrap_or(true);
 
     // Direct playback of one specific finished download.
@@ -125,7 +172,7 @@ pub async fn create_session(
             .ok_or_else(|| AppError::NotFound(format!("download {download_id}")))?;
         return start_disk_session(&state, &download, supports_hdr)
             .await
-            .map(Json);
+            .map(|s| SessionOrRepair::Session(Box::new(s)));
     }
 
     let (tmdb_id, media_type) = request.tmdb_id.zip(request.media_type).ok_or_else(|| {
@@ -157,7 +204,7 @@ pub async fn create_session(
             if tokio::fs::try_exists(path).await.unwrap_or(false) {
                 return start_disk_session(&state, &download, supports_hdr)
                     .await
-                    .map(Json);
+                    .map(|s| SessionOrRepair::Session(Box::new(s)));
             }
         }
     }
@@ -166,20 +213,104 @@ pub async fn create_session(
     let to_try = pick_candidates(&candidates, request.release_guid.as_deref(), MAX_ATTEMPTS)?;
 
     let mut failures: Vec<String> = Vec::new();
+    // Remember the first repairable candidate (in rank order) as the fallback.
+    let mut best_repairable: Option<(RankedRelease, Nzb, MainContent)> = None;
+
     for candidate in to_try {
-        match start_session(&state, &target, &candidate, supports_hdr).await {
-            Ok(session) => {
-                return Ok(Json(session_response(
-                    &session, candidate, candidates, "nntp",
-                )));
-            }
+        // Grab + assess this candidate once.
+        let (assessment, nzb, main) = match assess_candidate(&state, &candidate).await {
+            Ok(triple) => triple,
             Err(error) => {
-                tracing::warn!(release = %candidate.raw.title, %error, "candidate failed, trying next");
+                tracing::warn!(release = %candidate.raw.title, %error, "candidate assessment failed, trying next");
                 failures.push(format!("{}: {error}", candidate.raw.title));
+                continue;
+            }
+        };
+
+        match assessment.verdict {
+            HealthVerdict::Streamable if !request.force_repair => {
+                match start_streamable_session(&state, &target, &candidate, nzb, main, supports_hdr)
+                    .await
+                {
+                    Ok(session) => {
+                        return Ok(SessionOrRepair::Session(Box::new(session_response(
+                            &session, candidate, candidates, "nntp",
+                        ))));
+                    }
+                    Err(error) => {
+                        tracing::warn!(release = %candidate.raw.title, %error, "streamable candidate failed to start, trying next");
+                        failures.push(format!("{}: {error}", candidate.raw.title));
+                    }
+                }
+            }
+            HealthVerdict::Streamable | HealthVerdict::Repairable => {
+                // Either force_repair on a streamable one, or a genuinely
+                // repairable-only candidate. Keep the best (first) as fallback.
+                if best_repairable.is_none() {
+                    best_repairable = Some((candidate.clone(), nzb, main));
+                }
+                failures.push(format!(
+                    "{}: not streamable (repairable, {}/{} sampled missing)",
+                    candidate.raw.title, assessment.health.missing, assessment.health.checked
+                ));
+            }
+            HealthVerdict::Unrecoverable => {
+                failures.push(format!(
+                    "{}: unrecoverable ({}/{} sampled missing, par2 {} bytes)",
+                    candidate.raw.title,
+                    assessment.health.missing,
+                    assessment.health.checked,
+                    assessment.par2_recovery_bytes
+                ));
             }
         }
     }
+
+    // No streamable candidate started. Fall back to download-and-repair.
+    if let Some((candidate, nzb, main)) = best_repairable {
+        let download_id = start_repair_job(&state, &target, &candidate, nzb, main).await?;
+        return Ok(SessionOrRepair::Repairing(RepairingResponse {
+            status: "repairing".into(),
+            download_id,
+            release_title: candidate.raw.title.clone(),
+            candidates,
+        }));
+    }
+
     Err(AppError::NoRelease(failures.join("; ")))
+}
+
+/// Start a download-and-repair job for a repairable candidate and return its
+/// id. The job runs in the background; on completion it marks the row complete
+/// with a file path, and the normal disk-playback path serves it.
+async fn start_repair_job(
+    state: &AppState,
+    target: &ReleaseTarget,
+    candidate: &RankedRelease,
+    nzb: Nzb,
+    main: MainContent,
+) -> AppResult<Uuid> {
+    let id = Uuid::new_v4();
+    db::downloads::insert(
+        &state.db,
+        &db::downloads::NewDownload {
+            id: &id.to_string(),
+            tmdb_id: target.tmdb_id,
+            media_type: target.media_type.as_str(),
+            season: target.season,
+            episode: target.episode,
+            release_title: &candidate.raw.title,
+            nzb_url: &candidate.raw.nzb_url,
+        },
+    )
+    .await?;
+    state.downloads.spawn(
+        state.clone(),
+        id,
+        crate::download::DownloadJob::repair(nzb, main),
+    );
+    tracing::info!(download = %id, release = %candidate.raw.title, "repair job queued from session start");
+    Ok(id)
 }
 
 fn session_response(
@@ -206,9 +337,9 @@ fn session_response(
     }
 }
 
-/// Grab a candidate's NZB, parse it, pick the main content and run the
-/// pre-flight health check. Shared by session creation and download jobs.
-pub(crate) async fn fetch_healthy_release(
+/// Grab a candidate's NZB, parse it and pick the main content (no health
+/// check). Shared by streaming, downloads and repair assessment.
+pub(crate) async fn grab_and_select(
     state: &AppState,
     candidate: &RankedRelease,
 ) -> AppResult<(Nzb, MainContent)> {
@@ -225,7 +356,17 @@ pub(crate) async fn fetch_healthy_release(
         .await?;
     let nzb = parse_nzb(&String::from_utf8_lossy(&nzb_bytes))?;
     let main = select_main(&nzb)?;
+    Ok((nzb, main))
+}
 
+/// Grab a candidate's NZB, parse it, pick the main content and run the
+/// pre-flight health check. Errors unless the release is streamable. Used by
+/// the download-job API (which streams the main content to disk).
+pub(crate) async fn fetch_healthy_release(
+    state: &AppState,
+    candidate: &RankedRelease,
+) -> AppResult<(Nzb, MainContent)> {
+    let (nzb, main) = grab_and_select(state, candidate).await?;
     let segments = main_content_segments(&nzb, &main);
     let health = health_check(&segments, &state.nntp_pool, HEALTH_SAMPLE).await?;
     if !health.ok {
@@ -237,17 +378,29 @@ pub(crate) async fn fetch_healthy_release(
     Ok((nzb, main))
 }
 
-/// Try to start a session from one candidate: NZB grab → parse → health
-/// check → virtual file → ffprobe → ffmpeg. On failure the partially
+/// Grab a candidate and run the full repairability assessment. Returns the
+/// verdict together with the parsed NZB and main content so the caller can
+/// reuse them (to stream or to start a repair job) without a second grab.
+async fn assess_candidate(
+    state: &AppState,
+    candidate: &RankedRelease,
+) -> AppResult<(RepairAssessment, Nzb, MainContent)> {
+    let (nzb, main) = grab_and_select(state, candidate).await?;
+    let assessment = assess_release(&nzb, &main, &state.nntp_pool, HEALTH_SAMPLE).await?;
+    Ok((assessment, nzb, main))
+}
+
+/// Start a session from an already-grabbed, already-assessed streamable
+/// candidate: virtual file → ffprobe → ffmpeg. On failure the partially
 /// registered session is torn down.
-async fn start_session(
+async fn start_streamable_session(
     state: &AppState,
     target: &ReleaseTarget,
     candidate: &RankedRelease,
+    nzb: Nzb,
+    main: MainContent,
     supports_hdr: bool,
 ) -> AppResult<Arc<Session>> {
-    let (nzb, main) = fetch_healthy_release(state, candidate).await?;
-
     let source = open_media_source(
         &nzb,
         &main,
@@ -566,25 +719,6 @@ pub async fn delete_session(
 
 // ---- HLS playlists and segments ----------------------------------------------
 
-/// `?apikey=` on playlist requests. AVPlayer resolves the relative URIs
-/// inside a playlist without the query string, so the key must be written
-/// back into every URI for the follow-up requests to authenticate.
-#[derive(Debug, Deserialize)]
-pub struct PlaylistQuery {
-    apikey: Option<String>,
-}
-
-/// `?apikey=...` (URL-encoded) when a key was presented, `""` otherwise.
-fn apikey_suffix(apikey: Option<&str>) -> String {
-    match apikey {
-        Some(key) => format!(
-            "?apikey={}",
-            form_urlencoded::byte_serialize(key.as_bytes()).collect::<String>()
-        ),
-        None => String::new(),
-    }
-}
-
 /// Complete VOD playlist claiming every segment of the file up front, so
 /// players show the full duration and free scrubbing instead of a "live"
 /// stream that only spans what ffmpeg has produced. Segments that do not
@@ -613,31 +747,59 @@ fn vod_playlist(duration_secs: f64, suffix: &str) -> String {
     out
 }
 
+/// `?apikey=` propagation. Header-less players (AVPlayer) authenticate via
+/// the query parameter, but they resolve child playlist/segment URIs
+/// relative to the parent URL — which drops the query string (RFC 3986).
+/// Since every /api/v1 route requires the key, the playlists must re-embed
+/// the presented key into every URI they reference, or each follow-up
+/// request 401s and playback is a black screen.
+#[derive(Debug, Deserialize)]
+pub struct ApiKeyParam {
+    apikey: Option<String>,
+}
+
+impl ApiKeyParam {
+    /// `?apikey=<encoded>` when the request authenticated by query, else "".
+    /// Header-authenticated clients keep sending the header themselves.
+    fn uri_suffix(&self) -> String {
+        match &self.apikey {
+            Some(key) => format!("?apikey={}", percent_encode_component(key)),
+            None => String::new(),
+        }
+    }
+}
+
+/// RFC 3986 percent-encoding of a query component (unreserved kept as-is).
+fn percent_encode_component(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+static MAP_URI: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"URI="([^"]*)""#).unwrap());
+
 /// Append `suffix` to every URI in an HLS playlist: plain segment lines and
-/// the `URI="..."` attribute of `#EXT-X-MAP` tags.
-fn propagate_apikey(playlist: &str, suffix: &str) -> String {
+/// `URI="..."` attributes (EXT-X-MAP).
+fn playlist_with_suffix(playlist: &str, suffix: &str) -> String {
     if suffix.is_empty() {
         return playlist.to_string();
     }
-    let mut out = String::with_capacity(playlist.len());
+    let mut out = String::with_capacity(playlist.len() + 64);
     for line in playlist.lines() {
-        if line.starts_with("#EXT-X-MAP:") {
-            if let Some(start) = line.find("URI=\"") {
-                let uri_start = start + "URI=\"".len();
-                if let Some(end) = line[uri_start..].find('"') {
-                    out.push_str(&line[..uri_start + end]);
-                    out.push_str(suffix);
-                    out.push_str(&line[uri_start + end..]);
-                    out.push('\n');
-                    continue;
-                }
-            }
+        if line.contains("URI=\"") {
+            out.push_str(&MAP_URI.replace_all(line, |caps: &regex::Captures| {
+                format!("URI=\"{}{}\"", &caps[1], suffix)
+            }));
+        } else if line.starts_with('#') || line.trim().is_empty() {
             out.push_str(line);
-        } else if !line.starts_with('#') && !line.trim().is_empty() {
-            out.push_str(line);
-            out.push_str(suffix);
         } else {
             out.push_str(line);
+            out.push_str(suffix);
         }
         out.push('\n');
     }
@@ -654,7 +816,7 @@ fn propagate_apikey(playlist: &str, suffix: &str) -> String {
 pub async fn master_playlist(
     State(state): State<AppState>,
     Path(session_id): Path<Uuid>,
-    Query(query): Query<PlaylistQuery>,
+    Query(auth): Query<ApiKeyParam>,
 ) -> AppResult<Response> {
     let session = get_session(&state, &session_id)?;
     session.touch();
@@ -672,7 +834,7 @@ pub async fn master_playlist(
          #EXT-X-VERSION:7\n\
          #EXT-X-STREAM-INF:BANDWIDTH=20000000,VIDEO-RANGE={video_range}\n\
          media.m3u8{}\n",
-        apikey_suffix(query.apikey.as_deref())
+        auth.uri_suffix()
     );
     Ok(([(header::CONTENT_TYPE, PLAYLIST_CONTENT_TYPE)], master).into_response())
 }
@@ -689,11 +851,11 @@ pub async fn master_playlist(
 pub async fn media_playlist(
     State(state): State<AppState>,
     Path(session_id): Path<Uuid>,
-    Query(query): Query<PlaylistQuery>,
+    Query(auth): Query<ApiKeyParam>,
 ) -> AppResult<Response> {
     let session = get_session(&state, &session_id)?;
     session.touch();
-    let suffix = apikey_suffix(query.apikey.as_deref());
+    let suffix = auth.uri_suffix();
     // With a known duration the playlist is synthesized as full VOD; the
     // ffmpeg-written playlist only backs sources ffprobe could not time.
     if let Some(duration) = session.info().duration_secs.filter(|d| *d > 0.0) {
@@ -702,7 +864,7 @@ pub async fn media_playlist(
     }
     match tokio::fs::read_to_string(session.playlist_path()).await {
         Ok(text) => {
-            let body = propagate_apikey(&text, &suffix);
+            let body = playlist_with_suffix(&text, &suffix);
             Ok(([(header::CONTENT_TYPE, PLAYLIST_CONTENT_TYPE)], body).into_response())
         }
         Err(_) => match session.state() {
@@ -1149,22 +1311,31 @@ mod tests {
     }
 
     #[test]
-    fn apikey_is_propagated_into_playlist_uris() {
-        let playlist = "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:6.000000,\nseg_00000.m4s\n#EXTINF:4.5,\nseg_00001.m4s\n";
-        let suffix = apikey_suffix(Some("s3cret&x=1"));
-        assert_eq!(suffix, "?apikey=s3cret%26x%3D1");
-        let rewritten = propagate_apikey(playlist, &suffix);
-        assert_eq!(
-            rewritten,
-            "#EXTM3U\n\
-             #EXT-X-MAP:URI=\"init.mp4?apikey=s3cret%26x%3D1\"\n\
-             #EXTINF:6.000000,\n\
-             seg_00000.m4s?apikey=s3cret%26x%3D1\n\
-             #EXTINF:4.5,\n\
-             seg_00001.m4s?apikey=s3cret%26x%3D1\n"
-        );
-        // No key presented: playlist passes through untouched.
-        assert_eq!(propagate_apikey(playlist, ""), playlist);
+    fn playlist_suffix_rewrites_all_uris() {
+        let playlist = "#EXTM3U\n\
+                        #EXT-X-VERSION:7\n\
+                        #EXT-X-MAP:URI=\"init.mp4\"\n\
+                        #EXTINF:6.000000,\n\
+                        seg_00000.m4s\n\
+                        #EXTINF:4.5,\n\
+                        seg_00001.m4s\n";
+        let out = playlist_with_suffix(playlist, "?apikey=se%2Fcret");
+        assert!(out.contains("#EXT-X-MAP:URI=\"init.mp4?apikey=se%2Fcret\""));
+        assert!(out.contains("\nseg_00000.m4s?apikey=se%2Fcret\n"));
+        assert!(out.contains("\nseg_00001.m4s?apikey=se%2Fcret\n"));
+        // comment/tag lines are untouched
+        assert!(out.contains("#EXTINF:6.000000,\n"));
+        // no suffix -> byte-identical playlist
+        assert_eq!(playlist_with_suffix(playlist, ""), playlist);
+    }
+
+    #[test]
+    fn apikey_suffix_is_percent_encoded() {
+        let auth = ApiKeyParam {
+            apikey: Some("k/e y+&=?".into()),
+        };
+        assert_eq!(auth.uri_suffix(), "?apikey=k%2Fe%20y%2B%26%3D%3F");
+        assert_eq!(ApiKeyParam { apikey: None }.uri_suffix(), "");
     }
 
     #[tokio::test]

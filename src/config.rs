@@ -56,6 +56,8 @@ pub struct StreamingConfig {
     pub readahead_segments: usize,
     pub ffmpeg_path: String,
     pub ffprobe_path: String,
+    /// `par2` binary used by the download-and-repair fallback (par2cmdline).
+    pub par2_path: String,
 }
 
 impl Default for AppConfig {
@@ -83,6 +85,7 @@ impl Default for AppConfig {
                 readahead_segments: 16,
                 ffmpeg_path: "ffmpeg".into(),
                 ffprobe_path: "ffprobe".into(),
+                par2_path: "par2".into(),
             },
         }
     }

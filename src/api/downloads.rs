@@ -108,7 +108,7 @@ pub async fn create_download(
                 .await?;
                 state
                     .downloads
-                    .spawn(state.clone(), id, DownloadJob { nzb, main });
+                    .spawn(state.clone(), id, DownloadJob::plain(nzb, main));
                 tracing::info!(download = %id, release = %candidate.raw.title, "download queued");
                 return Ok((StatusCode::ACCEPTED, Json(row.into())));
             }
