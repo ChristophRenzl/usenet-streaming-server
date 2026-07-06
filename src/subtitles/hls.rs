@@ -68,7 +68,7 @@ pub fn subtitle_media_playlist(vtt_name: &str, duration_secs: Option<f64>) -> St
 /// variant pointing at `media.m3u8`) but adds `#EXT-X-MEDIA:TYPE=SUBTITLES`
 /// rows and a `SUBTITLES="subs"` attribute on the variant when any track
 /// exists.
-pub fn master_playlist(tracks: &[SubtitleTrack]) -> String {
+pub fn master_playlist(tracks: &[SubtitleTrack], video_range: &str) -> String {
     let mut out = String::from("#EXTM3U\n#EXT-X-VERSION:7\n");
 
     for track in tracks {
@@ -84,7 +84,11 @@ pub fn master_playlist(tracks: &[SubtitleTrack]) -> String {
         ));
     }
 
-    out.push_str("#EXT-X-STREAM-INF:BANDWIDTH=20000000");
+    // VIDEO-RANGE is required: AVPlayer assumes SDR when it is absent and then
+    // rejects the stream once the format description turns out to be PQ/HLG.
+    out.push_str(&format!(
+        "#EXT-X-STREAM-INF:BANDWIDTH=20000000,VIDEO-RANGE={video_range}"
+    ));
     if !tracks.is_empty() {
         out.push_str(&format!(",SUBTITLES=\"{SUBTITLE_GROUP}\""));
     }
@@ -137,20 +141,24 @@ mod tests {
 
     #[test]
     fn master_without_tracks_matches_plain_variant() {
-        let master = master_playlist(&[]);
-        assert!(master.contains("#EXT-X-STREAM-INF:BANDWIDTH=20000000\nmedia.m3u8\n"));
+        let master = master_playlist(&[], "SDR");
+        assert!(
+            master.contains("#EXT-X-STREAM-INF:BANDWIDTH=20000000,VIDEO-RANGE=SDR\nmedia.m3u8\n")
+        );
         assert!(!master.contains("SUBTITLES"));
     }
 
     #[test]
     fn master_with_tracks_adds_media_and_variant_attribute() {
-        let master = master_playlist(&[track("en", 1, true), track("de", 1, false)]);
+        let master = master_playlist(&[track("en", 1, true), track("de", 1, false)], "PQ");
         assert!(master.contains(
             "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"English\",LANGUAGE=\"en\""
         ));
         assert!(master.contains("DEFAULT=YES"));
         assert!(master.contains("URI=\"sub_en_1.m3u8\""));
         assert!(master.contains("LANGUAGE=\"de\""));
-        assert!(master.contains("#EXT-X-STREAM-INF:BANDWIDTH=20000000,SUBTITLES=\"subs\""));
+        assert!(master.contains("VIDEO-RANGE=PQ"));
+        assert!(master
+            .contains("#EXT-X-STREAM-INF:BANDWIDTH=20000000,VIDEO-RANGE=PQ,SUBTITLES=\"subs\""));
     }
 }

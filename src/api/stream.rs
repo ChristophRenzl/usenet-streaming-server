@@ -98,6 +98,10 @@ pub struct CreateSessionRequest {
     /// Subtitle failures are non-fatal — the session still starts without
     /// subtitles and logs the reason.
     pub subtitle_languages: Option<Vec<String>>,
+    /// Whether the device/display can render HDR (PQ/HLG). When `false`,
+    /// HDR sources are tone-mapped to 1080p SDR H.264 instead of
+    /// stream-copied. Absent means HDR-capable.
+    pub supports_hdr: Option<bool>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -183,13 +187,14 @@ pub async fn create_session(
 ) -> AppResult<SessionOrRepair> {
     // Requested subtitle languages (best-effort auto-attach after start).
     let subtitle_languages = request.subtitle_languages.clone().unwrap_or_default();
+    let supports_hdr = request.supports_hdr.unwrap_or(true);
 
     // Direct playback of one specific finished download.
     if let Some(download_id) = request.download_id {
         let download = db::downloads::get(&state.db, &download_id.to_string())
             .await?
             .ok_or_else(|| AppError::NotFound(format!("download {download_id}")))?;
-        return start_disk_session(&state, &download, &subtitle_languages)
+        return start_disk_session(&state, &download, &subtitle_languages, supports_hdr)
             .await
             .map(|s| SessionOrRepair::Session(Box::new(s)));
     }
@@ -221,7 +226,7 @@ pub async fn create_session(
                 continue;
             };
             if tokio::fs::try_exists(path).await.unwrap_or(false) {
-                return start_disk_session(&state, &download, &subtitle_languages)
+                return start_disk_session(&state, &download, &subtitle_languages, supports_hdr)
                     .await
                     .map(|s| SessionOrRepair::Session(Box::new(s)));
             }
@@ -248,7 +253,9 @@ pub async fn create_session(
 
         match assessment.verdict {
             HealthVerdict::Streamable if !request.force_repair => {
-                match start_streamable_session(&state, &target, &candidate, nzb, main).await {
+                match start_streamable_session(&state, &target, &candidate, nzb, main, supports_hdr)
+                    .await
+                {
                     Ok(session) => {
                         // Best-effort auto-subtitles: never fails the session.
                         auto_attach_subtitles(&state, &session, &subtitle_languages).await;
@@ -525,6 +532,7 @@ async fn start_streamable_session(
     candidate: &RankedRelease,
     nzb: Nzb,
     main: MainContent,
+    supports_hdr: bool,
 ) -> AppResult<Arc<Session>> {
     let source = open_media_source(
         &nzb,
@@ -562,7 +570,7 @@ async fn start_streamable_session(
     state.sessions.insert(session.clone());
 
     // From here on, clean up the registered session on failure.
-    match probe_and_spawn(state, &session).await {
+    match probe_and_spawn(state, &session, supports_hdr).await {
         Ok(()) => {}
         Err(error) => {
             state.sessions.teardown(&session.id).await;
@@ -594,6 +602,7 @@ async fn start_disk_session(
     state: &AppState,
     download: &db::downloads::Download,
     subtitle_languages: &[String],
+    supports_hdr: bool,
 ) -> AppResult<CreateSessionResponse> {
     if download.status != "complete" {
         return Err(AppError::BadRequest(format!(
@@ -653,7 +662,7 @@ async fn start_disk_session(
     .await?;
     state.sessions.insert(session.clone());
 
-    match probe_and_spawn(state, &session).await {
+    match probe_and_spawn(state, &session, supports_hdr).await {
         Ok(()) => {}
         Err(error) => {
             state.sessions.teardown(&session.id).await;
@@ -715,16 +724,29 @@ fn loopback_url(state: &AppState, session: &Session) -> String {
     )
 }
 
-async fn probe_and_spawn(state: &AppState, session: &Arc<Session>) -> AppResult<()> {
+async fn probe_and_spawn(
+    state: &AppState,
+    session: &Arc<Session>,
+    supports_hdr: bool,
+) -> AppResult<()> {
     let url = loopback_url(state, session);
     let probe = ffprobe::probe_url(&state.config.streaming.ffprobe_path, &url).await?;
     let audio_transcoded = ffmpeg::should_transcode_audio(probe.audio_codec.as_deref());
+    // AVPlayer refuses PQ/HLG variants outright on SDR-only outputs, so HDR
+    // sources are tone-mapped for clients that declare no HDR support.
+    let video_transcoded = !supports_hdr && probe.video_range != "SDR";
     session.set_info(MediaInfo {
         duration_secs: probe.duration_secs,
-        video_codec: probe.video_codec,
+        video_codec: probe.video_codec.clone(),
         audio_codec: probe.audio_codec,
         audio_transcoded,
         fps: probe.fps,
+        video_range: if video_transcoded {
+            "SDR".to_string()
+        } else {
+            probe.video_range
+        },
+        video_transcoded,
     });
     ffmpeg::spawn_hls(
         session,
@@ -733,6 +755,8 @@ async fn probe_and_spawn(state: &AppState, session: &Arc<Session>) -> AppResult<
             input_url: &url,
             start_secs: 0.0,
             transcode_audio: audio_transcoded,
+            video_codec: probe.video_codec.as_deref(),
+            tonemap_to_sdr: video_transcoded,
         },
     )
     .await
@@ -751,6 +775,8 @@ pub struct SessionStatus {
     pub video_codec: Option<String>,
     pub audio_codec: Option<String>,
     pub audio_transcoded: bool,
+    /// True when the video is tone-mapped to SDR for this session.
+    pub video_transcoded: bool,
     pub container: String,
     pub release_title: String,
     pub inner_file_name: String,
@@ -788,6 +814,7 @@ pub async fn session_status(
         video_codec: info.video_codec,
         audio_codec: info.audio_codec,
         audio_transcoded: info.audio_transcoded,
+        video_transcoded: info.video_transcoded,
         container: session.container.clone(),
         release_title: session.release_title.clone(),
         inner_file_name: session.inner_file_name.clone(),
@@ -829,6 +856,34 @@ pub async fn delete_session(
 }
 
 // ---- HLS playlists and segments ----------------------------------------------
+
+/// Complete VOD playlist claiming every segment of the file up front, so
+/// players show the full duration and free scrubbing instead of a "live"
+/// stream that only spans what ffmpeg has produced. Segments that do not
+/// exist yet are made on demand by `hls_segment`.
+fn vod_playlist(duration_secs: f64, suffix: &str) -> String {
+    let seg = ffmpeg::SEGMENT_SECONDS;
+    let count = (duration_secs / seg).ceil().max(1.0) as usize;
+    let mut out = format!(
+        "#EXTM3U\n\
+         #EXT-X-VERSION:7\n\
+         #EXT-X-TARGETDURATION:{}\n\
+         #EXT-X-MEDIA-SEQUENCE:0\n\
+         #EXT-X-PLAYLIST-TYPE:VOD\n\
+         #EXT-X-MAP:URI=\"init.mp4{suffix}\"\n",
+        seg.ceil() as u64 + 1
+    );
+    for i in 0..count {
+        let len = if i + 1 == count {
+            (duration_secs - seg * i as f64).max(0.001)
+        } else {
+            seg
+        };
+        out.push_str(&format!("#EXTINF:{len:.6},\nseg_{i:05}.m4s{suffix}\n"));
+    }
+    out.push_str("#EXT-X-ENDLIST\n");
+    out
+}
 
 /// `?apikey=` propagation. Header-less players (AVPlayer) authenticate via
 /// the query parameter, but they resolve child playlist/segment URIs
@@ -903,9 +958,18 @@ pub async fn master_playlist(
 ) -> AppResult<Response> {
     let session = get_session(&state, &session_id)?;
     session.touch();
-    // Advertise any attached external subtitle renditions; the ?apikey=
+    // AVPlayer assumes SDR when VIDEO-RANGE is absent and rejects the stream
+    // ("video range specified by playlist is less than actual format
+    // description") once the format description says PQ/HLG. The builder also
+    // advertises any attached external subtitle renditions; the ?apikey=
     // suffix is re-embedded into every URI so header-less players keep auth.
-    let master = subtitles::master_playlist(&session.subtitle_tracks());
+    let info = session.info();
+    let video_range = if info.video_range.is_empty() {
+        "SDR"
+    } else {
+        &info.video_range
+    };
+    let master = subtitles::master_playlist(&session.subtitle_tracks(), video_range);
     let master = playlist_with_suffix(&master, &auth.uri_suffix());
     Ok(([(header::CONTENT_TYPE, PLAYLIST_CONTENT_TYPE)], master).into_response())
 }
@@ -926,11 +990,17 @@ pub async fn media_playlist(
 ) -> AppResult<Response> {
     let session = get_session(&state, &session_id)?;
     session.touch();
-    match tokio::fs::read(session.playlist_path()).await {
-        Ok(bytes) => {
-            let playlist =
-                playlist_with_suffix(&String::from_utf8_lossy(&bytes), &auth.uri_suffix());
-            Ok(([(header::CONTENT_TYPE, PLAYLIST_CONTENT_TYPE)], playlist).into_response())
+    let suffix = auth.uri_suffix();
+    // With a known duration the playlist is synthesized as full VOD; the
+    // ffmpeg-written playlist only backs sources ffprobe could not time.
+    if let Some(duration) = session.info().duration_secs.filter(|d| *d > 0.0) {
+        let body = vod_playlist(duration, &suffix);
+        return Ok(([(header::CONTENT_TYPE, PLAYLIST_CONTENT_TYPE)], body).into_response());
+    }
+    match tokio::fs::read_to_string(session.playlist_path()).await {
+        Ok(text) => {
+            let body = playlist_with_suffix(&text, &suffix);
+            Ok(([(header::CONTENT_TYPE, PLAYLIST_CONTENT_TYPE)], body).into_response())
         }
         Err(_) => match session.state() {
             SessionState::Starting => Ok((
@@ -981,20 +1051,205 @@ pub async fn hls_segment(
         )));
     };
     session.touch();
-    match tokio::fs::read(session.temp_dir.join(&segment)).await {
-        Ok(bytes) => {
-            // Subtitle child playlists reference the .vtt by a relative URI;
-            // header-less players need the ?apikey= re-embedded like the media
-            // playlist does. The .vtt itself and fMP4 files are served as-is.
-            if segment.ends_with(".m3u8") {
-                let playlist =
-                    playlist_with_suffix(&String::from_utf8_lossy(&bytes), &auth.uri_suffix());
-                Ok(([(header::CONTENT_TYPE, content_type)], playlist).into_response())
-            } else {
-                Ok(([(header::CONTENT_TYPE, content_type)], bytes).into_response())
+    // Subtitle renditions are written straight to the session dir (not produced
+    // by ffmpeg), so serve them from disk. The child playlist references the
+    // .vtt by a relative URI, so header-less players need the ?apikey=
+    // re-embedded like the media playlist; the .vtt itself is served as-is.
+    if content_type != "video/mp4" {
+        return match tokio::fs::read(session.temp_dir.join(&segment)).await {
+            Ok(bytes) => {
+                if segment.ends_with(".m3u8") {
+                    let playlist =
+                        playlist_with_suffix(&String::from_utf8_lossy(&bytes), &auth.uri_suffix());
+                    Ok(([(header::CONTENT_TYPE, content_type)], playlist).into_response())
+                } else {
+                    Ok(([(header::CONTENT_TYPE, content_type)], bytes).into_response())
+                }
+            }
+            Err(_) => Err(AppError::NotFound(format!("segment {segment}"))),
+        };
+    }
+
+    // Fast path: the segment is already on disk and complete.
+    if segment_complete(&session, &segment).await {
+        if let Ok(bytes) = tokio::fs::read(session.temp_dir.join(&segment)).await {
+            return Ok(([(header::CONTENT_TYPE, "video/mp4")], bytes).into_response());
+        }
+    }
+
+    // The VOD playlist promises every segment; the missing ones are made on
+    // demand. AVPlayer drops the variant when a segment request has not
+    // delivered DATA within ~6s, so the body tails the file while ffmpeg is
+    // still writing it, and ffmpeg is restarted right at the requested
+    // segment when it is not about to be produced anyway.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(4);
+    // Detached so an aborted HTTP request cannot cancel a restart halfway
+    // through; the pump notices the closed channel on its next send.
+    tokio::spawn(pump_segment(state, session, segment, tx));
+    let body = axum::body::Body::from_stream(futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    }));
+    Ok(([(header::CONTENT_TYPE, "video/mp4")], body).into_response())
+}
+
+/// Complete once ffmpeg lists it in its own playlist (updated by atomic
+/// rename after each finished segment). init.mp4 is written whole at
+/// startup.
+async fn segment_complete(session: &Arc<Session>, segment: &str) -> bool {
+    if segment == "init.mp4" {
+        return tokio::fs::try_exists(session.temp_dir.join(segment))
+            .await
+            .unwrap_or(false);
+    }
+    tokio::fs::read_to_string(session.playlist_path())
+        .await
+        .unwrap_or_default()
+        .contains(segment)
+}
+
+/// Feed `segment` to the player: wait for ffmpeg to create the file
+/// (restarting it at the segment's own timestamp when it is not close to
+/// being produced), then stream the file's bytes as they are written. The
+/// stream ends when the segment is listed complete in ffmpeg's playlist.
+async fn pump_segment(
+    state: AppState,
+    session: Arc<Session>,
+    segment: String,
+    tx: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+) {
+    use tokio::io::AsyncReadExt;
+
+    /// Deregisters the in-flight request however the pump exits.
+    struct RequestGuard {
+        session: Arc<Session>,
+        index: u64,
+    }
+    impl Drop for RequestGuard {
+        fn drop(&mut self) {
+            self.session.end_segment_request(self.index);
+        }
+    }
+
+    let seg = ffmpeg::SEGMENT_SECONDS;
+    let index: Option<u64> = segment
+        .strip_prefix("seg_")
+        .and_then(|rest| rest.strip_suffix(".m4s"))
+        .and_then(|digits| digits.parse().ok());
+    let _guard = index.map(|index| {
+        session.begin_segment_request(index);
+        RequestGuard {
+            session: session.clone(),
+            index,
+        }
+    });
+    // Top-level `free` box; ISO BMFF parsers skip it. Sent as keepalive
+    // while the segment is still being produced — AVPlayer drops the
+    // variant when a segment request delivers no bytes for ~6s.
+    const FREE_BOX: [u8; 8] = [0, 0, 0, 8, b'f', b'r', b'e', b'e'];
+
+    let path = session.temp_dir.join(&segment);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(90);
+    let mut file: Option<tokio::fs::File> = None;
+    let mut last_bytes = tokio::time::Instant::now();
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        // The player cancels stale loads on scrubs; a closed channel must
+        // free the min-outstanding slot instead of steering restarts.
+        if tx.is_closed() {
+            return;
+        }
+        // Long waits are legitimate here; don't let the reaper kill the
+        // session under a player that is merely buffering.
+        session.touch();
+        if let SessionState::Failed(message) = session.state() {
+            let _ = tx.send(Err(std::io::Error::other(message))).await;
+            return;
+        }
+        if file.is_none() {
+            if let Some(index) = index {
+                let window_start = session.start_offset();
+                let window_end = window_start + playlist_seconds(&session.playlist_path()).await;
+                let target = index as f64 * seg;
+                // A segment at most two ahead of the live edge arrives on
+                // its own within the player's patience; anything else —
+                // behind the window (files wiped) or further ahead than
+                // ffmpeg can reach in a few seconds — needs a restart at
+                // this segment so its bytes start flowing immediately. The
+                // player fetches an ascending burst in parallel, so ONLY
+                // the lowest outstanding request may restart; everyone
+                // above waits for the sweep to reach them — otherwise the
+                // burst degenerates into restarts wiping each other.
+                let outside = target + seg <= window_start || target > window_end + 2.0 * seg;
+                if outside
+                    && session.min_requested() == Some(index)
+                    && session.since_spawn() >= std::time::Duration::from_secs(3)
+                {
+                    if let Err(error) = restart_ffmpeg(&state, &session, target).await {
+                        let _ = tx.send(Err(std::io::Error::other(error.to_string()))).await;
+                        return;
+                    }
+                }
+            }
+            file = tokio::fs::File::open(&path).await.ok();
+        }
+        if let Some(f) = file.as_mut() {
+            match f.read(&mut buf).await {
+                Ok(n) if n > 0 => {
+                    if tx
+                        .send(Ok(bytes::Bytes::copy_from_slice(&buf[..n])))
+                        .await
+                        .is_err()
+                    {
+                        return; // client went away
+                    }
+                    last_bytes = tokio::time::Instant::now();
+                    continue; // drain without sleeping
+                }
+                Ok(_) => {
+                    // At the current end of file: done when ffmpeg closed
+                    // the segment (listed in its playlist), otherwise more
+                    // bytes are coming.
+                    if segment_complete(&session, &segment).await {
+                        return;
+                    }
+                    // If a concurrent restart wiped the file from under us,
+                    // our handle points at a dead inode. The response is
+                    // unsalvageable once real bytes went out (mixed
+                    // generations) — abort and let the player retry.
+                    if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
+                        let _ = tx
+                            .send(Err(std::io::Error::other("segment replaced mid-read")))
+                            .await;
+                        return;
+                    }
+                }
+                Err(error) => {
+                    let _ = tx.send(Err(error)).await;
+                    return;
+                }
             }
         }
-        Err(_) => Err(AppError::NotFound(format!("segment {segment}"))),
+        // Keep bytes trickling while ffmpeg works (file not created yet or
+        // mid-write pause) so the player's no-data watchdog stays quiet.
+        if last_bytes.elapsed() >= std::time::Duration::from_secs(2) {
+            if tx
+                .send(Ok(bytes::Bytes::from_static(&FREE_BOX)))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            last_bytes = tokio::time::Instant::now();
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let _ = tx
+                .send(Err(std::io::Error::other(format!(
+                    "segment {segment} was not produced in time"
+                ))))
+                .await;
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
 }
 
@@ -1220,16 +1475,39 @@ pub async fn seek_session(
         return Err(AppError::BadRequest("time_secs must be finite".into()));
     };
 
-    // Serialize with other seeks/teardown so kill+wipe+respawn is atomic.
-    let _control = session.control.lock().await;
-
     let start = session.start_offset();
     let produced = playlist_seconds(&session.playlist_path()).await;
     if target >= start && target <= start + produced {
         return Ok(Json(SeekResponse { restarted: false }));
     }
 
-    tracing::info!(session = %session.id, target, "seek outside produced window; restarting ffmpeg");
+    restart_ffmpeg(&state, &session, target).await?;
+    Ok(Json(SeekResponse { restarted: true }))
+}
+
+/// Kill ffmpeg, wipe the produced segments and respawn at `target_secs`
+/// (snapped down to a segment boundary so numbering and timestamps stay on
+/// the global VOD timeline).
+async fn restart_ffmpeg(
+    state: &AppState,
+    session: &Arc<Session>,
+    target_secs: f64,
+) -> AppResult<()> {
+    // Serialize with other seeks/teardown so kill+wipe+respawn is atomic.
+    let _control = session.control.lock().await;
+
+    let target = (target_secs.max(0.0) / ffmpeg::SEGMENT_SECONDS).floor() * ffmpeg::SEGMENT_SECONDS;
+    // A clustered scrub fires several out-of-window requests; whoever got
+    // the lock first has already restarted for this area — don't wipe its
+    // output again.
+    if session.since_spawn() < std::time::Duration::from_secs(3) {
+        let window_start = session.start_offset();
+        let window_end = window_start + playlist_seconds(&session.playlist_path()).await;
+        if target >= window_start && target <= window_end + 2.0 * ffmpeg::SEGMENT_SECONDS {
+            return Ok(());
+        }
+    }
+    tracing::info!(session = %session.id, target, "restarting ffmpeg outside produced window");
     session.kill_ffmpeg().await;
     session.bump_generation();
     wipe_dir(&session.temp_dir).await?;
@@ -1237,19 +1515,22 @@ pub async fn seek_session(
     session.set_state(SessionState::Starting);
     session.clear_stderr();
 
-    let url = loopback_url(&state, &session);
+    let url = loopback_url(state, session);
+    let info = session.info();
     ffmpeg::spawn_hls(
-        &session,
+        session,
         SpawnOptions {
             ffmpeg_path: &state.config.streaming.ffmpeg_path,
             input_url: &url,
             start_secs: target,
-            transcode_audio: session.info().audio_transcoded,
+            transcode_audio: info.audio_transcoded,
+            video_codec: info.video_codec.as_deref(),
+            tonemap_to_sdr: info.video_transcoded,
         },
     )
     .await?;
-
-    Ok(Json(SeekResponse { restarted: true }))
+    session.mark_spawned();
+    Ok(())
 }
 
 /// Sum of `#EXTINF` durations in the playlist; 0 when absent/unreadable.
@@ -1323,6 +1604,26 @@ mod tests {
         ] {
             assert!(!SEGMENT_NAME.is_match(bad), "should reject {bad}");
         }
+    }
+
+    #[test]
+    fn vod_playlist_covers_the_whole_duration() {
+        let playlist = vod_playlist(13.5, "?apikey=k");
+        assert_eq!(
+            playlist,
+            "#EXTM3U\n\
+             #EXT-X-VERSION:7\n\
+             #EXT-X-TARGETDURATION:7\n\
+             #EXT-X-MEDIA-SEQUENCE:0\n\
+             #EXT-X-PLAYLIST-TYPE:VOD\n\
+             #EXT-X-MAP:URI=\"init.mp4?apikey=k\"\n\
+             #EXTINF:6.000000,\nseg_00000.m4s?apikey=k\n\
+             #EXTINF:6.000000,\nseg_00001.m4s?apikey=k\n\
+             #EXTINF:1.500000,\nseg_00002.m4s?apikey=k\n\
+             #EXT-X-ENDLIST\n"
+        );
+        // Sub-segment durations still yield one segment.
+        assert!(vod_playlist(0.5, "").contains("seg_00000.m4s\n"));
     }
 
     #[test]

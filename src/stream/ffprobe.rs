@@ -19,6 +19,9 @@ pub struct ProbeResult {
     /// Frames per second of the first video stream, when reported. Used to
     /// correct fps-mismatch drift when attaching external subtitles.
     pub fps: Option<f64>,
+    /// HLS `VIDEO-RANGE` value derived from the color transfer: `PQ`
+    /// (HDR10/DV), `HLG`, or `SDR`.
+    pub video_range: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -42,6 +45,7 @@ struct ProbeStream {
     /// preferred (real average); `r_frame_rate` is the fallback base rate.
     avg_frame_rate: Option<String>,
     r_frame_rate: Option<String>,
+    color_transfer: Option<String>,
 }
 
 /// Parse an ffprobe rational frame rate (`num/den`, e.g. `24000/1001`) to fps.
@@ -114,6 +118,7 @@ fn parse_probe(doc: ProbeDoc) -> AppResult<ProbeResult> {
     let mut audio_codec = None;
     let mut audio_channels = None;
     let mut fps = None;
+    let mut color_transfer = None;
     for stream in &doc.streams {
         match stream.codec_type.as_deref() {
             Some("video") if !has_video => {
@@ -121,6 +126,7 @@ fn parse_probe(doc: ProbeDoc) -> AppResult<ProbeResult> {
                 video_codec = stream.codec_name.clone();
                 fps = parse_frame_rate(stream.avg_frame_rate.as_deref())
                     .or_else(|| parse_frame_rate(stream.r_frame_rate.as_deref()));
+                color_transfer = stream.color_transfer.clone();
             }
             Some("audio") if audio_codec.is_none() => {
                 audio_codec = stream.codec_name.clone();
@@ -136,12 +142,20 @@ fn parse_probe(doc: ProbeDoc) -> AppResult<ProbeResult> {
         ));
     }
 
+    let video_range = match color_transfer.as_deref() {
+        Some("smpte2084") => "PQ",
+        Some("arib-std-b67") => "HLG",
+        _ => "SDR",
+    }
+    .to_string();
+
     Ok(ProbeResult {
         duration_secs,
         video_codec,
         audio_codec,
         audio_channels,
         fps,
+        video_range,
     })
 }
 
@@ -170,6 +184,8 @@ mod tests {
         assert_eq!(result.audio_channels, Some(6));
         // 24000/1001 ~= 23.976 fps.
         assert!((result.fps.unwrap() - 23.976).abs() < 0.001);
+        // No color transfer reported → SDR.
+        assert_eq!(result.video_range, "SDR");
     }
 
     #[test]
@@ -191,6 +207,21 @@ mod tests {
         .expect("parse");
         let result = parse_probe(doc).expect("probe");
         assert!((result.fps.unwrap() - 25.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn color_transfer_maps_to_video_range() {
+        for (transfer, expected) in [
+            ("smpte2084", "PQ"),
+            ("arib-std-b67", "HLG"),
+            ("bt709", "SDR"),
+        ] {
+            let doc: ProbeDoc = serde_json::from_str(&format!(
+                r#"{{"streams": [{{"codec_type": "video", "codec_name": "hevc", "color_transfer": "{transfer}"}}], "format": {{}}}}"#,
+            ))
+            .expect("parse");
+            assert_eq!(parse_probe(doc).expect("probe").video_range, expected);
+        }
     }
 
     #[test]

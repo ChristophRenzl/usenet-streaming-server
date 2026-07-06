@@ -41,6 +41,7 @@ dashmap = "6.2"
 tempfile = "3.27"
 clap = { version = "4.6", features = ["derive"] }
 rand = "0.9"
+form_urlencoded = "1.2.2"
 
 [dev-dependencies]
 figment = { version = "0.10", features = ["toml", "env", "test"] }
