@@ -17,8 +17,12 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Install ffmpeg, par2 and chromaprint
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg par2 libchromaprint-tools
+      - name: Install ffmpeg and par2
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg par2
+      # fpcalc is optional: every fpcalc-dependent test is skip-gated, so a
+      # runner image whose sources lack the package must not fail the job.
+      - name: Install chromaprint (best-effort)
+        run: sudo apt-get install -y libchromaprint-tools || echo "libchromaprint-tools unavailable; fpcalc-gated tests run without it"
       - name: Format
         run: cargo fmt --check
       - name: Clippy
