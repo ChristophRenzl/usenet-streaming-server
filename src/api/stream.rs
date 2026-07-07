@@ -343,8 +343,6 @@ pub async fn create_session(
                 .await
                 {
                     Ok(session) => {
-                        // Best-effort auto-subtitles: never fails the session.
-                        auto_attach_subtitles(&state, &session, &subtitle_languages).await;
                         return Ok(SessionOrRepair::Session(Box::new(session_response(
                             &session, candidate, candidates, "nntp",
                         ))));
@@ -570,140 +568,154 @@ async fn apply_intro_detection(state: &AppState, session: &Arc<Session>) {
     });
 }
 
-/// Best-effort auto-attach of subtitles at session start. Searches
-/// OpenSubtitles for the session's media in each requested language and
-/// attaches the top result. Never fails the session: a missing key, no
-/// results or an upstream error is logged and skipped.
-///
-/// Two accuracy features ride along:
-///
-/// - the media's OpenSubtitles **moviehash** is computed from its
-///   [`VirtualFile`](crate::vfs::VirtualFile) and passed to the search, so
-///   hash-matched (release-accurate) subtitles are found and ranked first;
-/// - for a chosen subtitle that is *not* hash-matched but reports its own
-///   `fps`, cue times are rescaled by `media_fps / subtitle_fps` to correct
-///   frame-rate drift. Hash-matched subs are assumed correct and left as-is.
-async fn auto_attach_subtitles(state: &AppState, session: &Arc<Session>, languages: &[String]) {
+// Best-effort auto-attach of subtitles at session start, split in two so the
+// slow half can overlap the probe/ffmpeg spawn. Never fails the session: a
+// missing key, no results or an upstream error is logged and skipped.
+//
+// Two accuracy features ride along:
+//
+// - the media's OpenSubtitles **moviehash** is computed from its
+//   [`VirtualFile`](crate::vfs::VirtualFile) and passed to the search, so
+//   hash-matched (release-accurate) subtitles are found and ranked first;
+// - for a chosen subtitle that is *not* hash-matched but reports its own
+//   `fps`, cue times are rescaled by `media_fps / subtitle_fps` to correct
+//   frame-rate drift. Hash-matched subs are assumed correct and left as-is.
+
+/// One subtitle fetched and ready to attach: everything slow (the moviehash
+/// reads, OpenSubtitles search + download) already happened.
+struct PrefetchedSubtitle {
+    language: String,
+    srt_text: String,
+    subtitle_fps: Option<f64>,
+    hash_match: bool,
+}
+
+/// The slow half of subtitle auto-attach: moviehash + OpenSubtitles search +
+/// download per language. Only reads the virtual file — never the session —
+/// so callers run it concurrently with the probe/ffmpeg spawn instead of
+/// adding it to the session-start critical path. Best-effort: any failure is
+/// logged and that language is skipped.
+#[allow(clippy::too_many_arguments)]
+async fn prefetch_subtitles(
+    state: AppState,
+    media: Arc<dyn crate::vfs::VirtualFile>,
+    session_id: Uuid,
+    tmdb_id: i64,
+    media_type: MediaType,
+    season: Option<u32>,
+    episode: Option<u32>,
+    languages: Vec<String>,
+) -> Vec<PrefetchedSubtitle> {
     if languages.is_empty() {
-        return;
+        return Vec::new();
     }
-    // Provider chain: embedded tracks were registered at spawn; OpenSubtitles
-    // is the primary external source; SubDL fills in when OpenSubtitles cannot
-    // deliver (quota exhausted, no result, download error).
+    // Provider chain: embedded tracks attach at spawn (checked at attach
+    // time); OpenSubtitles is the primary external source; SubDL fills in
+    // when OpenSubtitles cannot deliver (quota exhausted, no result,
+    // download error).
+    let state = &state;
     let os_client = match opensubtitles_client(state).await {
         Ok(client) => Some(client),
         Err(error) => {
-            tracing::info!(session = %session.id, %error, "OpenSubtitles unavailable");
+            tracing::info!(session = %session_id, %error, "OpenSubtitles unavailable");
             None
         }
     };
     let subdl = super::subtitles::subdl_client(state).await;
     if os_client.is_none() && subdl.is_none() {
-        return;
+        return Vec::new();
     }
 
     // Release-accurate matching: compute the media's moviehash once. Non-fatal.
-    let moviehash = match subtitles::osdb_hash(&session.media).await {
+    let moviehash = match subtitles::osdb_hash(&media).await {
         Ok(hash) => hash,
         Err(error) => {
-            tracing::warn!(session = %session.id, %error, "computing moviehash failed");
+            tracing::warn!(session = %session_id, %error, "computing moviehash failed");
             None
         }
     };
-    let media_fps = session.info().fps;
 
     // Episodes key on the show tmdb id + S/E; movies on the tmdb id.
-    let (season, episode) = match session.media_type {
-        MediaType::Tv => (session.season, session.episode),
+    let (season, episode) = match media_type {
+        MediaType::Tv => (season, episode),
         MediaType::Movie => (None, None),
     };
 
-    for language in languages {
-        // Covered by an embedded track already — no external download needed.
-        if session.subtitle_track_by_language(language).is_some() {
-            continue;
-        }
+    // Note: embedded-track coverage cannot be checked here — it is only
+    // known once the probe ran, and this prefetch deliberately overlaps the
+    // probe. The embedded-first skip happens at attach time instead; a
+    // prefetch for a covered language is wasted work the download cache
+    // absorbs on repeats.
+    let mut prefetched = Vec::new();
+    for language in &languages {
         let query = subtitles::SubtitleQuery {
-            tmdb_id: session.tmdb_id,
+            tmdb_id,
             season,
             episode,
             languages: vec![language.clone()],
             moviehash: moviehash.clone(),
         };
+        let mut subtitle = None;
         if let Some(client) = &os_client {
-            if try_opensubtitles(state, session, client, &query, language, media_fps).await {
-                continue;
+            subtitle = prefetch_opensubtitles(state, client, &query, session_id, language).await;
+        }
+        if subtitle.is_none() {
+            if let Some(client) = &subdl {
+                subtitle = prefetch_subdl(state, client, &query, session_id, language).await;
             }
         }
-        if let Some(subdl) = &subdl {
-            try_subdl(state, session, subdl, &query, language).await;
-        }
+        prefetched.extend(subtitle);
     }
+    prefetched
 }
 
-/// One OpenSubtitles attempt for one language: search → download (cached) →
-/// attach. Returns whether a track was attached.
-async fn try_opensubtitles(
+/// One OpenSubtitles attempt for one language: search → download (cached).
+async fn prefetch_opensubtitles(
     state: &AppState,
-    session: &Arc<Session>,
     client: &crate::subtitles::OpenSubtitlesClient,
     query: &subtitles::SubtitleQuery,
+    session_id: Uuid,
     language: &str,
-    media_fps: Option<f64>,
-) -> bool {
+) -> Option<PrefetchedSubtitle> {
     let top = match client.search(query).await {
         Ok(results) => results.into_iter().next(),
         Err(error) => {
-            tracing::warn!(session = %session.id, %language, %error, "subtitle search failed");
-            return false;
+            tracing::warn!(session = %session_id, %language, %error, "subtitle search failed");
+            return None;
         }
     };
     let Some(result) = top else {
-        tracing::info!(session = %session.id, %language, "no OpenSubtitles result");
-        return false;
+        tracing::info!(session = %session_id, %language, "no OpenSubtitles result");
+        return None;
     };
-    let srt = match download_subtitle(state, client, result.file_id).await {
-        Ok(srt) => srt,
+    match download_subtitle(state, client, result.file_id).await {
+        Ok(srt) => Some(PrefetchedSubtitle {
+            language: language.to_string(),
+            srt_text: srt.text,
+            subtitle_fps: result.fps,
+            hash_match: result.moviehash_match,
+        }),
         Err(error) => {
-            tracing::warn!(session = %session.id, %language, %error, "subtitle download failed");
-            return false;
-        }
-    };
-    let fps_scale = fps_rescale(media_fps, result.fps, result.moviehash_match);
-    // The first attached track becomes the default.
-    let make_default = session.subtitle_tracks().is_empty();
-    match subtitles::attach_subtitle(session, language, &srt.text, make_default, fps_scale).await {
-        Ok(track) => {
-            tracing::info!(
-                session = %session.id,
-                language = %track.language,
-                hash_match = result.moviehash_match,
-                fps_scale = ?fps_scale,
-                "attached subtitle"
-            );
-            true
-        }
-        Err(error) => {
-            tracing::warn!(session = %session.id, %language, %error, "attaching subtitle failed");
-            false
+            tracing::warn!(session = %session_id, %language, %error, "subtitle download failed");
+            None
         }
     }
 }
 
-/// One SubDL fallback attempt for one language: search → download (cached
-/// under a synthetic key) → attach. Best-effort; only logs on failure.
-async fn try_subdl(
+/// One SubDL fallback attempt for one language: search → download, cached
+/// under a synthetic key so repeats are free like OpenSubtitles downloads.
+async fn prefetch_subdl(
     state: &AppState,
-    session: &Arc<Session>,
     client: &crate::subtitles::subdl::SubdlClient,
     query: &subtitles::SubtitleQuery,
+    session_id: Uuid,
     language: &str,
-) {
+) -> Option<PrefetchedSubtitle> {
     let results = match client.search(query, language).await {
         Ok(results) => results,
         Err(error) => {
-            tracing::warn!(session = %session.id, %language, %error, "SubDL search failed");
-            return;
+            tracing::warn!(session = %session_id, %language, %error, "SubDL search failed");
+            return None;
         }
     };
     // Prefer a non-SDH hit, like the embedded-stream selection does.
@@ -712,8 +724,8 @@ async fn try_subdl(
         .find(|r| !r.hearing_impaired)
         .or_else(|| results.first())
     else {
-        tracing::info!(session = %session.id, %language, "no SubDL result");
-        return;
+        tracing::info!(session = %session_id, %language, "no SubDL result");
+        return None;
     };
     let cache_key = db::subtitle_cache::synthetic_key(&result.url);
     let srt = match db::subtitle_cache::get(&state.db, cache_key).await {
@@ -726,21 +738,72 @@ async fn try_subdl(
                 text
             }
             Err(error) => {
-                tracing::warn!(session = %session.id, %language, %error, "SubDL download failed");
-                return;
+                tracing::warn!(session = %session_id, %language, %error, "SubDL download failed");
+                return None;
             }
         },
     };
-    let make_default = session.subtitle_tracks().is_empty();
-    match subtitles::attach_subtitle(session, language, &srt, make_default, None).await {
-        Ok(track) => tracing::info!(
-            session = %session.id,
-            language = %track.language,
-            release = result.release_name.as_deref().unwrap_or("?"),
-            "attached SubDL subtitle"
-        ),
-        Err(error) => {
-            tracing::warn!(session = %session.id, %language, %error, "attaching SubDL subtitle failed")
+    tracing::info!(
+        session = %session_id,
+        %language,
+        release = result.release_name.as_deref().unwrap_or("?"),
+        "prefetched SubDL subtitle"
+    );
+    Some(PrefetchedSubtitle {
+        language: language.to_string(),
+        srt_text: srt,
+        subtitle_fps: None,
+        hash_match: false,
+    })
+}
+
+/// The fast half of subtitle auto-attach: the fps-rescale decision (needs the
+/// probe's media fps, so it must run after the probe finished) and writing
+/// the WebVTT rendition into the session dir. Best-effort, like the prefetch.
+async fn attach_prefetched_subtitles(session: &Arc<Session>, prefetched: Vec<PrefetchedSubtitle>) {
+    let media_fps = session.info().fps;
+    for subtitle in prefetched {
+        // Embedded-subtitles-first: probe_and_spawn attached release-accurate
+        // embedded tracks for the requested languages; an external download
+        // for a language that is already covered is dropped here.
+        if session
+            .subtitle_track_by_language(&subtitle.language)
+            .is_some()
+        {
+            tracing::debug!(
+                session = %session.id,
+                language = %subtitle.language,
+                "embedded track covers language; dropping external subtitle"
+            );
+            continue;
+        }
+        let fps_scale = fps_rescale(media_fps, subtitle.subtitle_fps, subtitle.hash_match);
+        // The first attached track becomes the default.
+        let make_default = session.subtitle_tracks().is_empty();
+        match subtitles::attach_subtitle(
+            session,
+            &subtitle.language,
+            &subtitle.srt_text,
+            make_default,
+            fps_scale,
+        )
+        .await
+        {
+            Ok(track) => tracing::info!(
+                session = %session.id,
+                language = %track.language,
+                hash_match = subtitle.hash_match,
+                fps_scale = ?fps_scale,
+                "attached subtitle"
+            ),
+            Err(error) => {
+                tracing::warn!(
+                    session = %session.id,
+                    language = %subtitle.language,
+                    %error,
+                    "attaching subtitle failed"
+                )
+            }
         }
     }
 }
@@ -911,8 +974,10 @@ fn preferred_audio_language(pref: &str, original_language: Option<&str>) -> Stri
 }
 
 /// Start a session from an already-grabbed, already-assessed streamable
-/// candidate: virtual file → ffprobe → ffmpeg. On failure the partially
-/// registered session is torn down.
+/// candidate: virtual file → ffprobe → ffmpeg, with the subtitle prefetch
+/// riding along concurrently. On failure the partially registered session is
+/// torn down.
+#[allow(clippy::too_many_arguments)]
 async fn start_streamable_session(
     state: &AppState,
     target: &ReleaseTarget,
@@ -970,7 +1035,22 @@ async fn start_streamable_session(
         lookup.original_language.as_deref(),
     );
 
-    // From here on, clean up the registered session on failure.
+    // From here on, clean up the registered session on failure. The subtitle
+    // prefetch (moviehash reads + OpenSubtitles) only touches the virtual
+    // file, so it runs as its own task overlapping the probe/ffmpeg spawn
+    // instead of adding its seconds to the critical path; attaching needs
+    // the probed fps (and the embedded-track coverage) and happens right
+    // after.
+    let prefetch = tokio::spawn(prefetch_subtitles(
+        state.clone(),
+        session.media.clone(),
+        session.id,
+        target.tmdb_id,
+        target.media_type,
+        target.season,
+        target.episode,
+        subtitle_languages.to_vec(),
+    ));
     match probe_and_spawn(
         state,
         &session,
@@ -982,10 +1062,12 @@ async fn start_streamable_session(
     {
         Ok(()) => {}
         Err(error) => {
+            prefetch.abort();
             state.sessions.teardown(&session.id).await;
             return Err(error);
         }
     }
+    attach_prefetched_subtitles(&session, prefetch.await.unwrap_or_default()).await;
 
     // Best-effort intro detection (chapters first, then audio fingerprint):
     // applies a cached season intro immediately, else fingerprints in the
@@ -1086,6 +1168,17 @@ async fn start_disk_session(
         lookup.original_language.as_deref(),
     );
 
+    // Subtitle prefetch overlaps the probe/ffmpeg spawn, as in the NNTP path.
+    let prefetch = tokio::spawn(prefetch_subtitles(
+        state.clone(),
+        session.media.clone(),
+        session.id,
+        download.tmdb_id,
+        media_type,
+        season,
+        episode,
+        subtitle_languages.to_vec(),
+    ));
     match probe_and_spawn(
         state,
         &session,
@@ -1097,10 +1190,12 @@ async fn start_disk_session(
     {
         Ok(()) => {}
         Err(error) => {
+            prefetch.abort();
             state.sessions.teardown(&session.id).await;
             return Err(error);
         }
     }
+    attach_prefetched_subtitles(&session, prefetch.await.unwrap_or_default()).await;
 
     // Best-effort intro detection, as for the streaming path (no-op for movies
     // or when a chapter intro was already found).
@@ -1124,9 +1219,6 @@ async fn start_disk_session(
 
     // Best-effort Trakt scrobble; a Trakt problem never affects playback.
     super::trakt::spawn_scrobble(state, &session, crate::trakt::ScrobbleAction::Start);
-
-    // Best-effort auto-subtitles: never fails the session.
-    auto_attach_subtitles(state, &session, subtitle_languages).await;
 
     Ok(session_response(
         &session,

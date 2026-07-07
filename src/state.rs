@@ -15,6 +15,9 @@ pub struct AppState {
     pub http: reqwest::Client,
     /// TMDB API base URL; overridable so tests can point at a mock server.
     pub tmdb_base_url: Arc<str>,
+    /// Shared TTL cache for TMDB detail lookups: session start re-fetches
+    /// what browsing (or the ranking step moments earlier) already pulled.
+    pub tmdb_details_cache: tmdb::DetailsCache,
     /// OpenSubtitles API base URL; overridable so tests can point at a mock
     /// server.
     pub opensubtitles_base_url: Arc<str>,
@@ -73,6 +76,7 @@ impl AppState {
             db,
             http: build_http_client()?,
             tmdb_base_url: tmdb::DEFAULT_BASE_URL.into(),
+            tmdb_details_cache: tmdb::DetailsCache::default(),
             opensubtitles_base_url: subtitles::DEFAULT_BASE_URL.into(),
             opensubtitles_token: subtitles::TokenCache::default(),
             nntp_pool,

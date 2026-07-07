@@ -62,14 +62,28 @@ pub fn compare_volume_names(a: &str, b: &str) -> Ordering {
 
 /// Parse every volume of an ordered RAR set and build the byte mapping for
 /// the largest inner file. Volumes must already be in natural order.
+///
+/// Header parsing here is serial; the streaming path parses volumes
+/// concurrently itself (header walking over NNTP is 1-2 round trips per
+/// volume) and assembles the map via [`build_archive_map_from_entries`].
 pub async fn build_archive_map(volumes: &[&dyn ReadAt]) -> AppResult<ArchiveMap> {
-    if volumes.is_empty() {
-        return Err(malformed("empty RAR volume set"));
-    }
-
     let mut per_volume: Vec<Vec<FileEntry>> = Vec::with_capacity(volumes.len());
     for volume in volumes {
         per_volume.push(parse_volume(*volume).await?);
+    }
+    let lens: Vec<u64> = volumes.iter().map(|v| v.len()).collect();
+    build_archive_map_from_entries(per_volume, &lens)
+}
+
+/// Assemble the [`ArchiveMap`] from already-parsed per-volume header entries
+/// (in natural volume order) and the corresponding volume byte lengths.
+/// Pure — all I/O happened during parsing.
+pub fn build_archive_map_from_entries(
+    per_volume: Vec<Vec<FileEntry>>,
+    volume_lens: &[u64],
+) -> AppResult<ArchiveMap> {
+    if per_volume.is_empty() {
+        return Err(malformed("empty RAR volume set"));
     }
 
     // Target: the largest unpacked non-directory file anywhere in the set.
@@ -117,7 +131,7 @@ pub async fn build_archive_map(volumes: &[&dyn ReadAt]) -> AppResult<ArchiveMap>
             .data_offset
             .checked_add(entry.packed_size)
             .ok_or_else(|| malformed("data area overflows"))?;
-        if end > volumes[*volume_index].len() {
+        if end > volume_lens.get(*volume_index).copied().unwrap_or(0) {
             return Err(malformed(format!(
                 "volume {volume_index}: data area extends past end of volume"
             )));
