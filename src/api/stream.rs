@@ -109,6 +109,11 @@ pub struct CreateSessionRequest {
     /// HDR sources are tone-mapped to 1080p SDR H.264 instead of
     /// stream-copied. Absent means HDR-capable.
     pub supports_hdr: Option<bool>,
+    /// When `true`, ignore the stored blocked terms so pre-release/low-quality
+    /// rips (CAM/TS/…) are candidates — the "allow pre-release" retry for a
+    /// brand-new title with no proper release yet.
+    #[serde(default)]
+    pub ignore_blocked_terms: bool,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -266,7 +271,13 @@ pub async fn create_session(
         }
     }
 
-    let candidates = resolve_candidates(&state, &target, request.max_resolution).await?;
+    let candidates = resolve_candidates(
+        &state,
+        &target,
+        request.max_resolution,
+        request.ignore_blocked_terms,
+    )
+    .await?;
     // Prefer the release this item was last watched with, so resuming from
     // history continues in the exact same release when it is still available.
     let last_release = db::watch_history::last_release_title(

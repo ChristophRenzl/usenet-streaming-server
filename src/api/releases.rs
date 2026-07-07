@@ -56,6 +56,7 @@ pub async fn resolve_candidates(
     state: &AppState,
     target: &ReleaseTarget,
     max_resolution: Option<Resolution>,
+    ignore_blocked_terms: bool,
 ) -> AppResult<Vec<RankedRelease>> {
     let indexers = db::indexers::list_enabled(&state.db).await?;
     if indexers.is_empty() {
@@ -117,9 +118,14 @@ pub async fn resolve_candidates(
     let raw = indexer::search_many(&state.http, indexers, &queries).await;
     // Series can carry their own resolution preferences (e.g. 2160p movies
     // but 1080p episodes); rank against the pair effective for this media type.
-    let prefs = db::preferences::get(&state.db)
+    let mut prefs = db::preferences::get(&state.db)
         .await?
         .for_media_type(target.media_type == MediaType::Tv);
+    // Pre-release escape hatch: drop the blocked terms so CAM/TS/HDCAM rips are
+    // no longer rejected — for brand-new titles whose only releases are those.
+    if ignore_blocked_terms {
+        prefs.blocked_terms.clear();
+    }
     let mut ranked = rank(
         raw,
         &prefs,
@@ -283,6 +289,10 @@ pub struct ReleasesParams {
     /// above the lower of this and the stored preference max are rejected,
     /// and the best supported resolution ranks first.
     pub max_resolution: Option<Resolution>,
+    /// When `true`, ignore the stored blocked terms so pre-release/low-quality
+    /// rips (CAM/TS/…) are not rejected — the "allow pre-release" escape hatch.
+    #[serde(default)]
+    pub ignore_blocked_terms: bool,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -310,7 +320,13 @@ pub async fn find_releases(
         episode: params.episode,
     }
     .validated()?;
-    let candidates = resolve_candidates(&state, &target, params.max_resolution).await?;
+    let candidates = resolve_candidates(
+        &state,
+        &target,
+        params.max_resolution,
+        params.ignore_blocked_terms,
+    )
+    .await?;
     Ok(Json(ReleasesResponse { candidates }))
 }
 

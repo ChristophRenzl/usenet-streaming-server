@@ -38,6 +38,10 @@ pub struct CreateDownloadRequest {
     /// above the lower of this and the stored preference max are rejected,
     /// and the best supported resolution ranks first.
     pub max_resolution: Option<Resolution>,
+    /// When `true`, ignore the stored blocked terms so pre-release/low-quality
+    /// rips (CAM/TS/…) are candidates.
+    #[serde(default)]
+    pub ignore_blocked_terms: bool,
 }
 
 /// A download row plus the computed completion percentage.
@@ -85,7 +89,13 @@ pub async fn create_download(
     }
     .validated()?;
 
-    let candidates = resolve_candidates(&state, &target, request.max_resolution).await?;
+    let candidates = resolve_candidates(
+        &state,
+        &target,
+        request.max_resolution,
+        request.ignore_blocked_terms,
+    )
+    .await?;
     let to_try = pick_candidates(
         &candidates,
         request.release_guid.as_deref(),
