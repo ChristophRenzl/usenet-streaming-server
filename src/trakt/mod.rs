@@ -264,6 +264,203 @@ impl TraktClient {
         }
         Ok(())
     }
+
+    /// Add or remove one item from the Trakt watch history — how manual
+    /// watched/unwatched marks propagate (the Jellyfin-plugin behavior).
+    pub async fn history_write(
+        &self,
+        item: ScrobbleItem,
+        add: bool,
+        access_token: &str,
+    ) -> AppResult<()> {
+        let path = if add {
+            "/sync/history"
+        } else {
+            "/sync/history/remove"
+        };
+        let response = self
+            .http
+            .post(format!("{}{path}", self.base_url))
+            .bearer_auth(access_token)
+            .header("trakt-api-version", "2")
+            .header("trakt-api-key", self.client_id.clone())
+            .json(&history_body(item))
+            .send()
+            .await
+            .map_err(|e| {
+                AppError::Upstream(format!("Trakt request failed: {}", e.without_url()))
+            })?;
+        if !response.status().is_success() {
+            return Err(AppError::Upstream(format!(
+                "Trakt history write failed: HTTP {}",
+                response.status()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Everything the account has watched: movies with their last-watched
+    /// timestamps.
+    pub async fn watched_movies(&self, access_token: &str) -> AppResult<Vec<WatchedMovie>> {
+        let raw: Vec<RawWatchedMovie> = self
+            .get_synced("/sync/watched/movies", access_token)
+            .await?;
+        Ok(raw
+            .into_iter()
+            .filter_map(|m| {
+                Some(WatchedMovie {
+                    tmdb_id: m.movie.ids.tmdb?,
+                    last_watched_at: m.last_watched_at,
+                })
+            })
+            .collect())
+    }
+
+    /// Everything the account has watched: shows with per-episode
+    /// last-watched timestamps.
+    pub async fn watched_shows(&self, access_token: &str) -> AppResult<Vec<WatchedShow>> {
+        let raw: Vec<RawWatchedShow> = self.get_synced("/sync/watched/shows", access_token).await?;
+        Ok(raw
+            .into_iter()
+            .filter_map(|s| {
+                Some(WatchedShow {
+                    tmdb_id: s.show.ids.tmdb?,
+                    seasons: s
+                        .seasons
+                        .into_iter()
+                        .map(|season| WatchedSeason {
+                            number: season.number,
+                            episodes: season
+                                .episodes
+                                .into_iter()
+                                .map(|e| WatchedEpisode {
+                                    number: e.number,
+                                    last_watched_at: e.last_watched_at,
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                })
+            })
+            .collect())
+    }
+
+    async fn get_synced<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        access_token: &str,
+    ) -> AppResult<T> {
+        let response = self
+            .http
+            .get(format!("{}{path}", self.base_url))
+            .bearer_auth(access_token)
+            .header("trakt-api-version", "2")
+            .header("trakt-api-key", self.client_id.clone())
+            .send()
+            .await
+            .map_err(|e| {
+                AppError::Upstream(format!("Trakt request failed: {}", e.without_url()))
+            })?;
+        if !response.status().is_success() {
+            return Err(AppError::Upstream(format!(
+                "Trakt {path} failed: HTTP {}",
+                response.status()
+            )));
+        }
+        response
+            .json()
+            .await
+            .map_err(|e| AppError::Upstream(format!("Trakt decode failed: {}", e.without_url())))
+    }
+}
+
+/// The JSON body for a history add/remove of one item.
+pub fn history_body(item: ScrobbleItem) -> Value {
+    match item {
+        ScrobbleItem::Movie { tmdb_id } => json!({
+            "movies": [{ "ids": { "tmdb": tmdb_id } }],
+        }),
+        ScrobbleItem::Episode {
+            show_tmdb_id,
+            season,
+            episode,
+        } => json!({
+            "shows": [{
+                "ids": { "tmdb": show_tmdb_id },
+                "seasons": [{
+                    "number": season,
+                    "episodes": [{ "number": episode }],
+                }],
+            }],
+        }),
+    }
+}
+
+/// One watched movie from `/sync/watched/movies`.
+#[derive(Debug, Clone)]
+pub struct WatchedMovie {
+    pub tmdb_id: i64,
+    pub last_watched_at: Option<String>,
+}
+
+/// One watched show from `/sync/watched/shows`.
+#[derive(Debug, Clone)]
+pub struct WatchedShow {
+    pub tmdb_id: i64,
+    pub seasons: Vec<WatchedSeason>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WatchedSeason {
+    pub number: u32,
+    pub episodes: Vec<WatchedEpisode>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WatchedEpisode {
+    pub number: u32,
+    pub last_watched_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawIds {
+    tmdb: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawWatchedMovie {
+    last_watched_at: Option<String>,
+    movie: RawMovieRef,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawMovieRef {
+    ids: RawIds,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawWatchedShow {
+    show: RawShowRef,
+    #[serde(default)]
+    seasons: Vec<RawWatchedSeason>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawShowRef {
+    ids: RawIds,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawWatchedSeason {
+    number: u32,
+    #[serde(default)]
+    episodes: Vec<RawWatchedEpisode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawWatchedEpisode {
+    number: u32,
+    last_watched_at: Option<String>,
 }
 
 #[cfg(test)]

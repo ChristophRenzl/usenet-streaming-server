@@ -222,6 +222,81 @@ pub async fn upsert_position(
         .ok_or_else(|| crate::error::AppError::Internal(anyhow::anyhow!("row vanished on upsert")))
 }
 
+/// Mark an item watched from a remote sync (Trakt import).
+///
+/// Rows that are already effectively finished are left untouched (returns
+/// false); rows with real progress get `position = duration`; missing rows
+/// are inserted with the 1/1 "watched without playing" sentinel. `watched_at`
+/// is the remote timestamp (normalized RFC3339), so Continue Watching's
+/// ordering reflects when it was actually watched — not when it synced.
+pub async fn mark_watched_remote(
+    pool: &SqlitePool,
+    tmdb_id: i64,
+    media_type: &str,
+    season: Option<u32>,
+    episode: Option<u32>,
+    watched_at: Option<&str>,
+) -> AppResult<bool> {
+    // "2024-01-01T20:15:00.000Z" -> "2024-01-01 20:15:00" (the table's format).
+    let normalized = watched_at.map(|w| {
+        w.replace('T', " ")
+            .trim_end_matches('Z')
+            .split('.')
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    });
+
+    let existing: Option<(i64, f64, Option<f64>)> = sqlx::query_as(
+        "SELECT id, position_secs, duration_secs FROM watch_history
+         WHERE user_id = 1 AND tmdb_id = ? AND media_type = ?
+           AND season IS ? AND episode IS ?",
+    )
+    .bind(tmdb_id)
+    .bind(media_type)
+    .bind(season)
+    .bind(episode)
+    .fetch_optional(pool)
+    .await?;
+
+    match existing {
+        Some((_, position, Some(duration))) if duration > 0.0 && position >= duration * 0.95 => {
+            Ok(false) // already watched locally — nothing to do.
+        }
+        Some((id, _, duration)) => {
+            let target = duration.filter(|d| *d > 0.0).unwrap_or(1.0);
+            sqlx::query(
+                "UPDATE watch_history
+                 SET position_secs = ?, duration_secs = COALESCE(duration_secs, 1.0),
+                     watched_at = COALESCE(?, watched_at)
+                 WHERE id = ?",
+            )
+            .bind(target)
+            .bind(&normalized)
+            .bind(id)
+            .execute(pool)
+            .await?;
+            Ok(true)
+        }
+        None => {
+            sqlx::query(
+                "INSERT INTO watch_history
+                     (user_id, tmdb_id, media_type, season, episode,
+                      position_secs, duration_secs, watched_at)
+                 VALUES (1, ?, ?, ?, ?, 1.0, 1.0, COALESCE(?, datetime('now')))",
+            )
+            .bind(tmdb_id)
+            .bind(media_type)
+            .bind(season)
+            .bind(episode)
+            .bind(&normalized)
+            .execute(pool)
+            .await?;
+            Ok(true)
+        }
+    }
+}
+
 /// Delete one history row. Returns false when the id is unknown.
 pub async fn delete(pool: &SqlitePool, id: i64) -> AppResult<bool> {
     let result = sqlx::query("DELETE FROM watch_history WHERE user_id = 1 AND id = ?")

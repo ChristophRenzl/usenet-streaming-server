@@ -156,6 +156,117 @@ async fn scrobble(
     client.scrobble(action, item, progress, &token).await
 }
 
+/// Fire-and-forget add/remove of one item in the Trakt watch history —
+/// how manual watched/unwatched marks propagate (Jellyfin-plugin behavior).
+pub fn spawn_history_write(state: &AppState, item: ScrobbleItem, add: bool) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        let result: AppResult<()> = async {
+            let Some(client) = configured_client(&state).await? else {
+                return Ok(());
+            };
+            let Some(token) = valid_access_token(&state, &client).await? else {
+                return Ok(());
+            };
+            client.history_write(item, add, &token).await
+        }
+        .await;
+        if let Err(error) = result {
+            tracing::debug!(%error, "trakt history write failed");
+        }
+    });
+}
+
+/// Import the Trakt watch history into the local one (movies + episodes):
+/// anything watched on Trakt becomes a finished local history row, so
+/// watched badges / up-next / resume reflect what was watched on other
+/// platforms. Returns (movies_marked, episodes_marked); a no-op when Trakt
+/// isn't configured/linked.
+pub async fn sync_watched_from_trakt(state: &AppState) -> AppResult<(u64, u64)> {
+    let Some(client) = configured_client(state).await? else {
+        return Ok((0, 0));
+    };
+    let Some(token) = valid_access_token(state, &client).await? else {
+        return Ok((0, 0));
+    };
+
+    let mut movies_marked = 0u64;
+    for movie in client.watched_movies(&token).await? {
+        if db::watch_history::mark_watched_remote(
+            &state.db,
+            movie.tmdb_id,
+            "movie",
+            None,
+            None,
+            movie.last_watched_at.as_deref(),
+        )
+        .await?
+        {
+            movies_marked += 1;
+        }
+    }
+
+    let mut episodes_marked = 0u64;
+    for show in client.watched_shows(&token).await? {
+        for season in &show.seasons {
+            for episode in &season.episodes {
+                if db::watch_history::mark_watched_remote(
+                    &state.db,
+                    show.tmdb_id,
+                    "tv",
+                    Some(season.number),
+                    Some(episode.number),
+                    episode.last_watched_at.as_deref(),
+                )
+                .await?
+                {
+                    episodes_marked += 1;
+                }
+            }
+        }
+    }
+
+    if movies_marked > 0 || episodes_marked > 0 {
+        tracing::info!(
+            movies_marked,
+            episodes_marked,
+            "trakt watched-history import"
+        );
+    }
+    Ok((movies_marked, episodes_marked))
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TraktSyncResponse {
+    /// Movies newly marked watched locally.
+    pub movies_marked: u64,
+    /// Episodes newly marked watched locally.
+    pub episodes_marked: u64,
+}
+
+/// Pull the Trakt watch history into the local one now (also runs
+/// automatically after linking and periodically in the background).
+#[utoipa::path(post, path = "/trakt/sync", tag = "settings",
+    responses(
+        (status = 200, body = TraktSyncResponse),
+        (status = 400, description = "Trakt not configured/linked"),
+        (status = 502, description = "Trakt upstream error"),
+    ))]
+pub async fn trakt_sync(State(state): State<AppState>) -> AppResult<Json<TraktSyncResponse>> {
+    let linked = db::settings::get(&state.db, db::settings::TRAKT_ACCESS_TOKEN)
+        .await?
+        .filter(|v| !v.is_empty())
+        .is_some();
+    if !linked {
+        return Err(AppError::BadRequest("Trakt is not linked".into()));
+    }
+    let (movies_marked, episodes_marked) = sync_watched_from_trakt(&state).await?;
+    Ok(Json(TraktSyncResponse {
+        movies_marked,
+        episodes_marked,
+    }))
+}
+
 // ---- Linking endpoints ------------------------------------------------------
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -277,6 +388,15 @@ pub async fn trakt_link_poll(
     let status = match client.poll_device_token(&request.device_code).await? {
         DevicePoll::Linked(tokens) => {
             store_tokens(&state, &tokens).await?;
+            // Freshly linked: pull the account's watched history in the
+            // background so badges show up without waiting for the periodic
+            // sync.
+            let state = state.clone();
+            tokio::spawn(async move {
+                if let Err(error) = sync_watched_from_trakt(&state).await {
+                    tracing::debug!(%error, "post-link trakt sync failed");
+                }
+            });
             "linked"
         }
         DevicePoll::Pending => "pending",
@@ -304,4 +424,5 @@ pub fn router() -> OpenApiRouter<AppState> {
         .routes(routes!(trakt_status))
         .routes(routes!(trakt_link, trakt_unlink))
         .routes(routes!(trakt_link_poll))
+        .routes(routes!(trakt_sync))
 }

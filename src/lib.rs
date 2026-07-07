@@ -42,6 +42,23 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
     let state = AppState::new(config)
         .await?
         .with_loopback_base(&format!("http://127.0.0.1:{}", loopback_addr.port()));
+
+    // Periodic Trakt watched-history import (Jellyfin-plugin behavior):
+    // shortly after boot, then every 6 hours. No-op unless Trakt is linked;
+    // failures only log.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+            loop {
+                if let Err(error) = api::trakt::sync_watched_from_trakt(&state).await {
+                    tracing::debug!(%error, "periodic trakt sync failed");
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(6 * 60 * 60)).await;
+            }
+        });
+    }
+
     let app = api::router(state);
     // ConnectInfo is required by the loopback guard on /internal/vfs.
     let make = app.into_make_service_with_connect_info::<SocketAddr>();

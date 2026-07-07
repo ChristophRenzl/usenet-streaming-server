@@ -130,6 +130,22 @@ pub async fn update_history(
         },
     )
     .await?;
+    // A finished position (the manual "mark watched") propagates to Trakt's
+    // watch history, best-effort — like the Jellyfin plugin.
+    if let Some(item) = trakt_item(
+        request.tmdb_id,
+        request.media_type,
+        request.season,
+        request.episode,
+    ) {
+        let finished = entry
+            .duration_secs
+            .filter(|d| *d > 0.0)
+            .is_some_and(|d| entry.position_secs >= d * 0.95);
+        if finished {
+            super::trakt::spawn_history_write(&state, item, true);
+        }
+    }
     Ok(Json(entry.into()))
 }
 
@@ -141,10 +157,52 @@ pub async fn delete_history(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> AppResult<StatusCode> {
+    // Grab the row first: unwatching something that was finished also
+    // removes it from the Trakt history (best-effort), mirroring the add.
+    let entry = db::watch_history::get(&state.db, id).await?;
     if db::watch_history::delete(&state.db, id).await? {
+        if let Some(entry) = entry {
+            let finished = entry
+                .duration_secs
+                .filter(|d| *d > 0.0)
+                .is_some_and(|d| entry.position_secs >= d * 0.95);
+            let media_type = if entry.media_type == "tv" {
+                MediaType::Tv
+            } else {
+                MediaType::Movie
+            };
+            if finished {
+                if let Some(item) = trakt_item(
+                    entry.tmdb_id,
+                    media_type,
+                    entry.season.map(|s| s as u32),
+                    entry.episode.map(|e| e as u32),
+                ) {
+                    super::trakt::spawn_history_write(&state, item, false);
+                }
+            }
+        }
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(AppError::NotFound(format!("history entry {id}")))
+    }
+}
+
+/// The Trakt reference for a history item; None for a tv row without both
+/// season and episode numbers.
+fn trakt_item(
+    tmdb_id: i64,
+    media_type: MediaType,
+    season: Option<u32>,
+    episode: Option<u32>,
+) -> Option<crate::trakt::ScrobbleItem> {
+    match media_type {
+        MediaType::Movie => Some(crate::trakt::ScrobbleItem::Movie { tmdb_id }),
+        MediaType::Tv => Some(crate::trakt::ScrobbleItem::Episode {
+            show_tmdb_id: tmdb_id,
+            season: season?,
+            episode: episode?,
+        }),
     }
 }
 
