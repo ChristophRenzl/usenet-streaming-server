@@ -13,7 +13,9 @@ use bytes::Bytes;
 
 use crate::error::{AppError, AppResult};
 
-pub use volumes::{build_archive_map, detect_format, parse_volume, volume_sort_key};
+pub use volumes::{
+    build_archive_map, build_archive_map_from_entries, detect_format, parse_volume, volume_sort_key,
+};
 
 /// Random-access byte source a RAR volume is parsed from. Implemented for
 /// in-memory buffers, disk files and NZB-backed virtual files.

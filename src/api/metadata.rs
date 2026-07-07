@@ -34,11 +34,10 @@ pub async fn tmdb_client(state: &AppState) -> AppResult<TmdbClient> {
                 "TMDB API key not configured; set it via PUT /api/v1/settings/app".into(),
             )
         })?;
-    Ok(TmdbClient::new(
-        state.http.clone(),
-        state.tmdb_base_url.as_ref(),
-        key,
-    ))
+    Ok(
+        TmdbClient::new(state.http.clone(), state.tmdb_base_url.as_ref(), key)
+            .with_details_cache(state.tmdb_details_cache.clone()),
+    )
 }
 
 #[derive(Debug, Deserialize, IntoParams)]

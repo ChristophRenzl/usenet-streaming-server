@@ -5,6 +5,10 @@
 //! must never appear in logs — error messages are built from status codes,
 //! not URLs.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -80,10 +84,49 @@ pub struct PagedSearchResults {
     pub total_pages: i64,
 }
 
+/// Shared TTL cache for TMDB *detail* lookups (movie/tv/season/episode).
+/// Detail payloads change rarely, and session start re-fetches exactly what
+/// the browsing UI (or the ranking step moments earlier) already pulled — a
+/// short TTL removes those repeat upstream round trips from every play
+/// without staleness a user could notice. Cheap to clone; lives on
+/// [`AppState`](crate::state::AppState) so the per-request clients share it.
+#[derive(Clone, Default)]
+pub struct DetailsCache {
+    entries: Arc<Mutex<HashMap<String, (Instant, serde_json::Value)>>>,
+}
+
+/// How long a cached detail payload is served before re-fetching.
+const DETAILS_TTL: Duration = Duration::from_secs(600);
+/// Hard cap on cached payloads; expired entries are dropped first, then the
+/// whole map (simple and rare — 512 titles of browsing within the TTL).
+const DETAILS_CAP: usize = 512;
+
+impl DetailsCache {
+    fn get(&self, key: &str) -> Option<serde_json::Value> {
+        let entries = self.entries.lock().expect("tmdb cache lock");
+        entries
+            .get(key)
+            .filter(|(at, _)| at.elapsed() < DETAILS_TTL)
+            .map(|(_, value)| value.clone())
+    }
+
+    fn put(&self, key: String, value: serde_json::Value) {
+        let mut entries = self.entries.lock().expect("tmdb cache lock");
+        if entries.len() >= DETAILS_CAP {
+            entries.retain(|_, (at, _)| at.elapsed() < DETAILS_TTL);
+            if entries.len() >= DETAILS_CAP {
+                entries.clear();
+            }
+        }
+        entries.insert(key, (Instant::now(), value));
+    }
+}
+
 pub struct TmdbClient {
     http: reqwest::Client,
     base_url: String,
     api_key: String,
+    details_cache: Option<DetailsCache>,
 }
 
 impl TmdbClient {
@@ -96,7 +139,14 @@ impl TmdbClient {
             http,
             base_url: base_url.into().trim_end_matches('/').to_string(),
             api_key: api_key.into(),
+            details_cache: None,
         }
+    }
+
+    /// Serve detail lookups (movie/tv/season/episode) through `cache`.
+    pub fn with_details_cache(mut self, cache: DetailsCache) -> Self {
+        self.details_cache = Some(cache);
+        self
     }
 
     async fn get_json<T: DeserializeOwned>(
@@ -124,6 +174,30 @@ impl TmdbClient {
         response.json().await.map_err(|e| {
             AppError::Upstream(format!("TMDB response decode failed: {}", e.without_url()))
         })
+    }
+
+    /// [`get_json`](Self::get_json) with the details cache in front (when one
+    /// is attached). The raw JSON payload is cached so one entry serves any
+    /// deserialization target.
+    async fn get_json_cached<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        params: &[(&str, String)],
+    ) -> AppResult<T> {
+        let Some(cache) = &self.details_cache else {
+            return self.get_json(path, params).await;
+        };
+        let key = format!("{path}?{params:?}");
+        let value = match cache.get(&key) {
+            Some(value) => value,
+            None => {
+                let value: serde_json::Value = self.get_json(path, params).await?;
+                cache.put(key, value.clone());
+                value
+            }
+        };
+        serde_json::from_value(value)
+            .map_err(|e| AppError::Upstream(format!("TMDB response decode failed: {e}")))
     }
 
     /// Search movies/TV. `year` narrows movie (release year) and TV (first air
@@ -276,7 +350,7 @@ impl TmdbClient {
     /// collection membership (via `append_to_response=external_ids,videos,credits`).
     pub async fn movie_details(&self, tmdb_id: i64) -> AppResult<Movie> {
         let raw: RawMovieDetails = self
-            .get_json(
+            .get_json_cached(
                 &format!("/movie/{tmdb_id}"),
                 &[(
                     "append_to_response",
@@ -292,7 +366,7 @@ impl TmdbClient {
     /// `append_to_response=external_ids,videos,credits`).
     pub async fn tv_details(&self, tmdb_id: i64) -> AppResult<TvShow> {
         let raw: RawTvDetails = self
-            .get_json(
+            .get_json_cached(
                 &format!("/tv/{tmdb_id}"),
                 &[(
                     "append_to_response",
@@ -341,7 +415,7 @@ impl TmdbClient {
 
     pub async fn season_details(&self, tmdb_id: i64, season: u32) -> AppResult<Season> {
         let raw: RawSeasonDetails = self
-            .get_json(&format!("/tv/{tmdb_id}/season/{season}"), &[])
+            .get_json_cached(&format!("/tv/{tmdb_id}/season/{season}"), &[])
             .await?;
         Ok(raw.into())
     }
@@ -353,7 +427,7 @@ impl TmdbClient {
         episode: u32,
     ) -> AppResult<Episode> {
         let raw: RawEpisode = self
-            .get_json(
+            .get_json_cached(
                 &format!("/tv/{tmdb_id}/season/{season}/episode/{episode}"),
                 &[],
             )
