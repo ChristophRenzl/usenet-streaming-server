@@ -509,3 +509,51 @@ async fn discover_passes_genre_page_and_sort() {
     assert_eq!(paged.results[0].media_type, MediaType::Tv);
     assert_eq!(paged.results[0].title, "Breaking Bad");
 }
+
+#[tokio::test]
+async fn details_cache_serves_repeat_lookups_without_refetching() {
+    use usenet_streaming_server::tmdb::DetailsCache;
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/movie/27205"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 27205,
+            "title": "Inception",
+            "release_date": "2010-07-15",
+            "external_ids": { "imdb_id": "tt1375666" }
+        })))
+        // The cache must absorb the second and third lookup.
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let cache = DetailsCache::default();
+    for _ in 0..3 {
+        // Fresh client each time, like the per-request construction in the
+        // API layer — the cache is the shared piece.
+        let client = client(&server).with_details_cache(cache.clone());
+        let movie = client.movie_details(27205).await.expect("details");
+        assert_eq!(movie.title, "Inception");
+        assert_eq!(movie.imdb_id.as_deref(), Some("tt1375666"));
+    }
+}
+
+#[tokio::test]
+async fn uncached_client_fetches_every_time() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/movie/27205"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 27205,
+            "title": "Inception",
+            "release_date": "2010-07-15"
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    for _ in 0..2 {
+        client(&server).movie_details(27205).await.expect("details");
+    }
+}

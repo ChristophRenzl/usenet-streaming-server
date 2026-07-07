@@ -31,7 +31,10 @@ impl Default for PoolOptions {
     fn default() -> Self {
         Self {
             timeouts: NntpTimeouts::default(),
-            idle_ttl: Duration::from_secs(60),
+            // Long enough that browsing a detail page and then pressing Play
+            // (or pausing and resuming) reuses warm connections instead of
+            // paying TCP+TLS+AUTH again on every session start.
+            idle_ttl: Duration::from_secs(300),
             reap_interval: Duration::from_secs(15),
         }
     }

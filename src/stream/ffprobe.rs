@@ -255,6 +255,15 @@ pub async fn probe_url(ffprobe_path: &str, url: &str) -> AppResult<ProbeResult> 
         .args([
             "-v",
             "error",
+            // Every probed byte is an NNTP article fetch behind the loopback.
+            // Codec parameters, stream metadata, chapters and the MKV
+            // duration all live near the head of the file; the defaults
+            // would pull ~5s of decoded stream data (tens of MB for a
+            // high-bitrate release) before answering.
+            "-probesize",
+            "12M",
+            "-analyzeduration",
+            "2500000",
             "-print_format",
             "json",
             "-show_format",
