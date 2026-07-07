@@ -546,11 +546,20 @@ mod tests {
             Some("avc1.4D4028")
         );
         // Unknown combinations stay unmapped rather than guessed.
-        assert_eq!(rfc6381_video_codec(Some("hevc"), Some("Main 10"), None), None);
-        assert_eq!(rfc6381_video_codec(Some("av1"), Some("Main"), Some(8)), None);
+        assert_eq!(
+            rfc6381_video_codec(Some("hevc"), Some("Main 10"), None),
+            None
+        );
+        assert_eq!(
+            rfc6381_video_codec(Some("av1"), Some("Main"), Some(8)),
+            None
+        );
         assert_eq!(rfc6381_video_codec(None, Some("High"), Some(41)), None);
 
-        assert_eq!(rfc6381_audio_codec(Some("aac")).as_deref(), Some("mp4a.40.2"));
+        assert_eq!(
+            rfc6381_audio_codec(Some("aac")).as_deref(),
+            Some("mp4a.40.2")
+        );
         assert_eq!(rfc6381_audio_codec(Some("ac3")).as_deref(), Some("ac-3"));
         assert_eq!(rfc6381_audio_codec(Some("eac3")).as_deref(), Some("ec-3"));
         assert_eq!(rfc6381_audio_codec(Some("truehd")), None);

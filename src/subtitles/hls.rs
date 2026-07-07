@@ -185,7 +185,10 @@ mod tests {
 
     #[test]
     fn master_with_tracks_adds_media_and_variant_attribute() {
-        let master = master_playlist(&[track("en", 1, true), track("de", 1, false)], &variant("PQ"));
+        let master = master_playlist(
+            &[track("en", 1, true), track("de", 1, false)],
+            &variant("PQ"),
+        );
         assert!(master.contains(
             "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"English\",LANGUAGE=\"en\""
         ));
