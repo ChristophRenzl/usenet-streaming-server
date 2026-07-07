@@ -61,6 +61,31 @@ pub struct SpawnOptions<'a> {
 /// it.
 pub async fn spawn_hls(session: &Arc<Session>, options: SpawnOptions<'_>) -> AppResult<()> {
     let dir = &session.temp_dir;
+    let mut cmd = build_command(&options, dir);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    let mut child = cmd.spawn().map_err(|e| {
+        AppError::Internal(anyhow::anyhow!(
+            "spawning ffmpeg ({}): {e}",
+            options.ffmpeg_path
+        ))
+    })?;
+    let stderr = child.stderr.take().expect("ffmpeg stderr piped");
+
+    let generation = session.generation();
+    *session.child.lock().await = Some(child);
+
+    tokio::spawn(watch_ready(session.clone(), generation));
+    tokio::spawn(monitor(session.clone(), generation, stderr));
+    Ok(())
+}
+
+/// The full ffmpeg invocation for [`spawn_hls`] (separate so tests can
+/// inspect the argument list without spawning anything).
+fn build_command(options: &SpawnOptions<'_>, dir: &Path) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(options.ffmpeg_path);
     cmd.args(["-nostdin", "-y", "-seekable", "1"]);
     if options.start_secs > 0.0 {
@@ -91,9 +116,19 @@ pub async fn spawn_hls(session: &Arc<Session>, options: SpawnOptions<'_>) -> App
     }
     if options.transcode_audio {
         cmd.args(["-c:a", "aac", "-b:a", "192k", "-ac", "2"]);
+        // Imperfect sources (jittery timestamps, gaps where the decoder
+        // skipped damaged frames) otherwise slide the re-encoded audio
+        // earlier over time — progressive lip-sync drift. async=1 locks the
+        // audio to its timestamps by padding silence into gaps / trimming
+        // overlaps instead of packing frames back-to-back.
+        cmd.args(["-af", "aresample=async=1:min_hard_comp=0.100:first_pts=0"]);
     } else {
         cmd.args(["-c:a", "copy"]);
     }
+    // One file-wide shift (instead of the muxer-dependent default) so the
+    // audio/video relative offset provably survives the negative-timestamp
+    // fixup — also across `-ss` seek restarts.
+    cmd.args(["-avoid_negative_ts", "make_zero"]);
     cmd.args([
         "-f",
         "hls",
@@ -117,25 +152,7 @@ pub async fn spawn_hls(session: &Arc<Session>, options: SpawnOptions<'_>) -> App
     cmd.arg("-hls_segment_filename");
     cmd.arg(dir.join("seg_%05d.m4s"));
     cmd.arg(dir.join("media.m3u8"));
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-
-    let mut child = cmd.spawn().map_err(|e| {
-        AppError::Internal(anyhow::anyhow!(
-            "spawning ffmpeg ({}): {e}",
-            options.ffmpeg_path
-        ))
-    })?;
-    let stderr = child.stderr.take().expect("ffmpeg stderr piped");
-
-    let generation = session.generation();
-    *session.child.lock().await = Some(child);
-
-    tokio::spawn(watch_ready(session.clone(), generation));
-    tokio::spawn(monitor(session.clone(), generation, stderr));
-    Ok(())
+    cmd
 }
 
 /// Flip Starting -> Ready as soon as the media playlist appears.
@@ -228,6 +245,59 @@ mod tests {
         assert!(should_transcode_audio(Some("truehd")));
         assert!(should_transcode_audio(Some("flac")));
         assert!(should_transcode_audio(Some("mp3")));
+    }
+
+    fn args(options: &SpawnOptions<'_>) -> Vec<String> {
+        build_command(options, Path::new("/tmp/session"))
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn base_options(transcode_audio: bool) -> SpawnOptions<'static> {
+        SpawnOptions {
+            ffmpeg_path: "ffmpeg",
+            input_url: "http://127.0.0.1/vfs",
+            start_secs: 0.0,
+            transcode_audio,
+            video_codec: Some("h264"),
+            tonemap_to_sdr: false,
+            audio_stream_index: 0,
+        }
+    }
+
+    /// Two consecutive arguments (a flag and its value).
+    fn has_pair(args: &[String], flag: &str, value: &str) -> bool {
+        args.windows(2).any(|w| w[0] == flag && w[1] == value)
+    }
+
+    #[test]
+    fn audio_transcode_locks_audio_to_timestamps() {
+        let args = args(&SpawnOptions {
+            transcode_audio: true,
+            ..base_options(true)
+        });
+        assert!(has_pair(
+            &args,
+            "-af",
+            "aresample=async=1:min_hard_comp=0.100:first_pts=0"
+        ));
+    }
+
+    #[test]
+    fn audio_copy_has_no_audio_filter() {
+        let args = args(&base_options(false));
+        assert!(!args.iter().any(|a| a == "-af"));
+        assert!(has_pair(&args, "-c:a", "copy"));
+    }
+
+    #[test]
+    fn negative_timestamp_fixup_is_one_shared_shift() {
+        for transcode_audio in [false, true] {
+            let args = args(&base_options(transcode_audio));
+            assert!(has_pair(&args, "-avoid_negative_ts", "make_zero"));
+        }
     }
 
     #[tokio::test]
