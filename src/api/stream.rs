@@ -263,6 +263,11 @@ pub async fn create_session(
             let Some(path) = download.file_path.as_deref() else {
                 continue;
             };
+            // A completed download of a release later marked as bad must not
+            // short-circuit back to the same file.
+            if db::release_blacklist::contains(&state.db, &download.release_title).await? {
+                continue;
+            }
             if tokio::fs::try_exists(path).await.unwrap_or(false) {
                 return start_disk_session(&state, &download, &subtitle_languages, supports_hdr)
                     .await
@@ -1798,6 +1803,64 @@ pub async fn offset_subtitle(
     Ok(Json(SubtitleTrackInfo::from_track(&session_id, &updated)))
 }
 
+// ---- Bad-release blacklist ------------------------------------------------------
+
+#[derive(Debug, Default, Deserialize, ToSchema)]
+pub struct BlacklistReleaseRequest {
+    /// Optional free-text reason (e.g. `audio out of sync`), kept for the
+    /// blacklist listing.
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct BlacklistReleaseResponse {
+    /// The release title that was blacklisted.
+    pub release_title: String,
+    /// False when the title was already on the blacklist.
+    pub created: bool,
+}
+
+/// Mark the session's release as bad: its title goes on the release
+/// blacklist, so automatic selection rejects it from now on (a manual
+/// guid pin still overrides). The session keeps playing — after this call
+/// the client typically reports its position, ends the session and starts
+/// a new one, which then resolves to the next-best release and resumes.
+#[utoipa::path(post, path = "/stream/{session_id}/blacklist", tag = "streaming",
+    params(("session_id" = Uuid, Path, description = "Session id")),
+    request_body(content = BlacklistReleaseRequest, description = "Optional reason"),
+    responses((status = 200, body = BlacklistReleaseResponse), (status = 404)))]
+pub async fn blacklist_session_release(
+    State(state): State<AppState>,
+    Path(session_id): Path<Uuid>,
+    request: Option<Json<BlacklistReleaseRequest>>,
+) -> AppResult<Json<BlacklistReleaseResponse>> {
+    let session = get_session(&state, &session_id)?;
+    session.touch();
+    let reason = request.and_then(|Json(r)| r.reason);
+    let created = db::release_blacklist::add(
+        &state.db,
+        &db::release_blacklist::NewBlacklistedRelease {
+            title: &session.release_title,
+            tmdb_id: Some(session.tmdb_id),
+            media_type: Some(session.media_type.as_str()),
+            season: session.season,
+            episode: session.episode,
+            reason: reason.as_deref(),
+        },
+    )
+    .await?;
+    tracing::info!(
+        session = %session.id,
+        release = %session.release_title,
+        created,
+        "release marked as bad"
+    );
+    Ok(Json(BlacklistReleaseResponse {
+        release_title: session.release_title.clone(),
+        created,
+    }))
+}
+
 // ---- Raw byte-range access ----------------------------------------------------
 
 /// The source media file with RFC 7233 single-range support, for players
@@ -1979,6 +2042,7 @@ pub fn router() -> OpenApiRouter<AppState> {
         .routes(routes!(media_playlist))
         .routes(routes!(raw_media))
         .routes(routes!(seek_session))
+        .routes(routes!(blacklist_session_release))
         .routes(routes!(attach_subtitle))
         .routes(routes!(offset_subtitle))
         .routes(routes!(hls_segment))

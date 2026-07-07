@@ -102,6 +102,88 @@ impl DiskStack {
     }
 }
 
+// ---- Bad-release blacklist ----------------------------------------------------
+
+#[tokio::test]
+async fn blacklisting_a_session_release_is_idempotent_and_manageable() {
+    let stack = disk_stack(|_| {}).await;
+    let session = stack.insert_session(b"payload", "movie.mkv").await;
+    let blacklist_url = format!("{}/api/v1/stream/{}/blacklist", stack.base, session.id);
+
+    // First flag records the entry (with the optional reason)...
+    let first: Value = stack
+        .client
+        .post(&blacklist_url)
+        .header("x-api-key", API_KEY)
+        .json(&json!({ "reason": "audio out of sync" }))
+        .send()
+        .await
+        .expect("POST blacklist")
+        .json()
+        .await
+        .expect("blacklist json");
+    assert_eq!(first["release_title"], "Disk.Test.Release");
+    assert_eq!(first["created"], true);
+
+    // ...a repeat flag (and a body-less POST) is a no-op.
+    let again: Value = stack
+        .client
+        .post(&blacklist_url)
+        .header("x-api-key", API_KEY)
+        .send()
+        .await
+        .expect("POST blacklist again")
+        .json()
+        .await
+        .expect("blacklist json");
+    assert_eq!(again["created"], false);
+
+    // The management listing shows it; deleting un-blacklists exactly once.
+    let listed: Value = stack
+        .get("/api/v1/releases/blacklist")
+        .await
+        .json()
+        .await
+        .expect("listing json");
+    let entries = listed["entries"].as_array().expect("entries array");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["title"], "Disk.Test.Release");
+    assert_eq!(entries[0]["reason"], "audio out of sync");
+
+    let id = entries[0]["id"].as_i64().expect("entry id");
+    let delete_url = format!("{}/api/v1/releases/blacklist/{id}", stack.base);
+    let deleted = stack
+        .client
+        .delete(&delete_url)
+        .header("x-api-key", API_KEY)
+        .send()
+        .await
+        .expect("DELETE entry");
+    assert_eq!(deleted.status(), 204);
+    let missing = stack
+        .client
+        .delete(&delete_url)
+        .header("x-api-key", API_KEY)
+        .send()
+        .await
+        .expect("DELETE entry again");
+    assert_eq!(missing.status(), 404);
+
+    // Unknown sessions cannot blacklist anything.
+    let unknown = stack
+        .client
+        .post(format!(
+            "{}/api/v1/stream/{}/blacklist",
+            stack.base,
+            Uuid::new_v4()
+        ))
+        .header("x-api-key", API_KEY)
+        .send()
+        .await
+        .expect("POST unknown session");
+    assert_eq!(unknown.status(), 404);
+}
+
 // ---- Raw range semantics ------------------------------------------------------
 
 #[tokio::test]

@@ -152,9 +152,32 @@ pub async fn resolve_candidates(
             }
         }
     }
+    // Releases the user marked as bad are rejected too, so automatic
+    // selection skips them; they stay listed (with the reason) and a manual
+    // guid pin still overrides — like every other rejection.
+    apply_blacklist(
+        &mut ranked,
+        &db::release_blacklist::titles(&state.db).await?,
+    );
     // Stable: keeps rank order within the accepted and rejected groups.
     ranked.sort_by_key(|c| c.rejected.is_some());
     Ok(ranked)
+}
+
+/// Reject candidates whose title was blacklisted ("marked as bad" from the
+/// player). Earlier rejection reasons win; blacklisting only fills in.
+fn apply_blacklist(
+    candidates: &mut [RankedRelease],
+    blacklisted: &std::collections::HashSet<String>,
+) {
+    if blacklisted.is_empty() {
+        return;
+    }
+    for candidate in candidates {
+        if candidate.rejected.is_none() && blacklisted.contains(&candidate.raw.title) {
+            candidate.rejected = Some("marked as bad".into());
+        }
+    }
 }
 
 /// TMDB metadata of the searched item, kept for post-search verification.
@@ -330,8 +353,40 @@ pub async fn find_releases(
     Ok(Json(ReleasesResponse { candidates }))
 }
 
+#[derive(Debug, Serialize, ToSchema)]
+pub struct BlacklistResponse {
+    pub entries: Vec<db::release_blacklist::BlacklistedRelease>,
+}
+
+/// All blacklisted releases ("marked as bad"), newest first.
+#[utoipa::path(get, path = "/releases/blacklist", tag = "releases",
+    responses((status = 200, body = BlacklistResponse)))]
+pub async fn list_blacklist(State(state): State<AppState>) -> AppResult<Json<BlacklistResponse>> {
+    Ok(Json(BlacklistResponse {
+        entries: db::release_blacklist::list(&state.db).await?,
+    }))
+}
+
+/// Un-blacklist one release so automatic selection may pick it again.
+#[utoipa::path(delete, path = "/releases/blacklist/{id}", tag = "releases",
+    params(("id" = i64, Path, description = "Blacklist entry id")),
+    responses((status = 204), (status = 404)))]
+pub async fn delete_blacklist_entry(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> AppResult<axum::http::StatusCode> {
+    if db::release_blacklist::delete(&state.db, id).await? {
+        Ok(axum::http::StatusCode::NO_CONTENT)
+    } else {
+        Err(AppError::NotFound(format!("blacklist entry {id}")))
+    }
+}
+
 pub fn router() -> OpenApiRouter<AppState> {
-    OpenApiRouter::new().routes(routes!(find_releases))
+    OpenApiRouter::new()
+        .routes(routes!(find_releases))
+        .routes(routes!(list_blacklist))
+        .routes(routes!(delete_blacklist_entry))
 }
 
 #[cfg(test)]
@@ -492,6 +547,30 @@ mod tests {
             let titles: Vec<&str> = picked.iter().map(|c| c.raw.title.as_str()).collect();
             assert_eq!(titles, ["A", "C"]);
         }
+    }
+
+    #[test]
+    fn blacklist_rejects_by_title_without_overwriting_reasons() {
+        let mut candidates = vec![
+            candidate("A", 30, None),
+            candidate("B", 20, Some("blocked term")),
+            candidate("C", 10, None),
+        ];
+        let blacklisted: std::collections::HashSet<String> =
+            ["A".to_string(), "B".to_string()].into();
+        apply_blacklist(&mut candidates, &blacklisted);
+        assert_eq!(candidates[0].rejected.as_deref(), Some("marked as bad"));
+        // An earlier rejection reason is kept.
+        assert_eq!(candidates[1].rejected.as_deref(), Some("blocked term"));
+        assert_eq!(candidates[2].rejected, None);
+
+        // Automatic selection now skips the blacklisted title...
+        let picked = pick_candidates(&candidates, None, None, 5).unwrap();
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].raw.title, "C");
+        // ...but a manual guid pin still overrides.
+        let pinned = pick_candidates(&candidates, Some("guid-A"), None, 5).unwrap();
+        assert_eq!(pinned[0].raw.title, "A");
     }
 
     #[test]
