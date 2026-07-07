@@ -10,12 +10,12 @@ pub mod vtt;
 use std::sync::Arc;
 
 pub use hash::osdb_hash;
+pub use hls::{embedded_subtitle_playlist, embedded_window_name, EMBEDDED_WINDOW_SECS};
 pub use hls::{master_playlist, subtitle_media_playlist, SubtitleTrack, SUBTITLE_GROUP};
 pub use opensubtitles::{
     is_token_rejected, DownloadLink, OpenSubtitlesClient, SubtitleDownload, SubtitleQuery,
     SubtitleResult,
 };
-pub use hls::{embedded_subtitle_playlist, embedded_window_name, EMBEDDED_WINDOW_SECS};
 pub use vtt::{decode_subtitle_bytes, shift_vtt, srt_to_vtt, srt_to_vtt_scaled, window_vtt};
 
 use crate::error::{AppError, AppResult};

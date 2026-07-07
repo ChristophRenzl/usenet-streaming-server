@@ -70,9 +70,8 @@ static SUBTITLE_FILE_NAME: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Embedded-subtitle rendition playlist (`sub_emb_en.m3u8`), written at
 /// session start with fixed windows listed upfront.
-static EMBEDDED_SUB_PLAYLIST: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^sub_emb_[a-z]{2,3}\.m3u8$").expect("embedded playlist regex")
-});
+static EMBEDDED_SUB_PLAYLIST: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^sub_emb_[a-z]{2,3}\.m3u8$").expect("embedded playlist regex"));
 
 /// One embedded-subtitle window (`sub_emb_en_w0004.vtt`), sliced on demand
 /// from the growing extraction fragments.
@@ -883,8 +882,14 @@ async fn start_streamable_session(
     );
 
     // From here on, clean up the registered session on failure.
-    match probe_and_spawn(state, &session, supports_hdr, &audio_language, subtitle_languages)
-        .await
+    match probe_and_spawn(
+        state,
+        &session,
+        supports_hdr,
+        &audio_language,
+        subtitle_languages,
+    )
+    .await
     {
         Ok(()) => {}
         Err(error) => {
@@ -992,8 +997,14 @@ async fn start_disk_session(
         lookup.original_language.as_deref(),
     );
 
-    match probe_and_spawn(state, &session, supports_hdr, &audio_language, subtitle_languages)
-        .await
+    match probe_and_spawn(
+        state,
+        &session,
+        supports_hdr,
+        &audio_language,
+        subtitle_languages,
+    )
+    .await
     {
         Ok(()) => {}
         Err(error) => {

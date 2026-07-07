@@ -16,12 +16,11 @@ const MAX_ROWS: i64 = 1000;
 /// The cached subtitle text for a file id, updating its recency. `None` on a
 /// cache miss.
 pub async fn get(pool: &SqlitePool, file_id: i64) -> AppResult<Option<String>> {
-    let row: Option<(String,)> =
-        sqlx::query_as("SELECT srt FROM subtitle_cache WHERE file_id = ?")
-            .bind(file_id)
-            .fetch_optional(pool)
-            .await
-            .map_err(AppError::Database)?;
+    let row: Option<(String,)> = sqlx::query_as("SELECT srt FROM subtitle_cache WHERE file_id = ?")
+        .bind(file_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(AppError::Database)?;
     if row.is_some() {
         sqlx::query("UPDATE subtitle_cache SET last_used_at = datetime('now') WHERE file_id = ?")
             .bind(file_id)

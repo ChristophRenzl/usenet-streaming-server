@@ -24,22 +24,31 @@ use crate::{
 
 /// A configured client from the stored app credentials, or None when the
 /// user hasn't set any yet.
+/// Default Trakt API app: the public credentials the open-source Jellyfin
+/// Trakt plugin ships in its source (every Jellyfin install shares that app —
+/// that is why the plugin never asks for a client id). Linking therefore
+/// works out of the box; storing your own app credentials via
+/// POST /trakt/link overrides them.
+const DEFAULT_TRAKT_CLIENT_ID: &str =
+    "bfdd2e032c30c35b368f97ef4ec81587b899bcb028b91a1d4ba5589a4b6a7267";
+const DEFAULT_TRAKT_CLIENT_SECRET: &str =
+    "bf9fce37cf45c1de91da009e7ac6fca905a35d7a718bf65a52f92199073a2503";
+
 async fn configured_client(state: &AppState) -> AppResult<Option<TraktClient>> {
     let id = db::settings::get(&state.db, db::settings::TRAKT_CLIENT_ID)
         .await?
-        .filter(|v| !v.is_empty());
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| DEFAULT_TRAKT_CLIENT_ID.to_string());
     let secret = db::settings::get(&state.db, db::settings::TRAKT_CLIENT_SECRET)
         .await?
-        .filter(|v| !v.is_empty());
-    Ok(match (id, secret) {
-        (Some(id), Some(secret)) => Some(TraktClient::new(
-            state.http.clone(),
-            DEFAULT_BASE_URL,
-            id,
-            secret,
-        )),
-        _ => None,
-    })
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| DEFAULT_TRAKT_CLIENT_SECRET.to_string());
+    Ok(Some(TraktClient::new(
+        state.http.clone(),
+        DEFAULT_BASE_URL,
+        id,
+        secret,
+    )))
 }
 
 /// The stored access token, refreshed (and re-stored) when it expires within

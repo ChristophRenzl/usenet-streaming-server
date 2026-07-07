@@ -168,9 +168,10 @@ fn parse_cues(vtt: &str) -> Vec<Cue> {
             Some((ts, tail)) => (ts, Some(tail.to_string())),
             None => (rest, None),
         };
-        let (Some(start_secs), Some(end_secs)) =
-            (parse_timestamp(start_raw.trim_end()), parse_timestamp(end_raw))
-        else {
+        let (Some(start_secs), Some(end_secs)) = (
+            parse_timestamp(start_raw.trim_end()),
+            parse_timestamp(end_raw),
+        ) else {
             continue;
         };
         let mut payload = String::new();

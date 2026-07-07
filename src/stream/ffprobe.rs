@@ -78,7 +78,8 @@ pub struct EmbeddedSubtitle {
 
 /// Codecs ffmpeg can convert to WebVTT as text. Bitmap subtitle formats
 /// (`hdmv_pgs_subtitle`, `dvd_subtitle`) are deliberately absent.
-const TEXT_SUBTITLE_CODECS: &[&str] = &["subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text"];
+const TEXT_SUBTITLE_CODECS: &[&str] =
+    &["subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text"];
 
 /// The best embedded subtitle stream for a requested language: prefers a
 /// full track over forced/SDH variants, and only ever matches on an explicit
@@ -669,7 +670,10 @@ mod tests {
         // PGS (bitmap) is excluded; language tags normalize to 639-1.
         assert_eq!(
             langs,
-            vec![(2, Some("en".to_string()), false), (4, Some("de".to_string()), true)]
+            vec![
+                (2, Some("en".to_string()), false),
+                (4, Some("de".to_string()), true)
+            ]
         );
     }
 
@@ -694,11 +698,20 @@ mod tests {
             Some("avc1.4D4028")
         );
         // Unknown combinations stay unmapped rather than guessed.
-        assert_eq!(rfc6381_video_codec(Some("hevc"), Some("Main 10"), None), None);
-        assert_eq!(rfc6381_video_codec(Some("av1"), Some("Main"), Some(8)), None);
+        assert_eq!(
+            rfc6381_video_codec(Some("hevc"), Some("Main 10"), None),
+            None
+        );
+        assert_eq!(
+            rfc6381_video_codec(Some("av1"), Some("Main"), Some(8)),
+            None
+        );
         assert_eq!(rfc6381_video_codec(None, Some("High"), Some(41)), None);
 
-        assert_eq!(rfc6381_audio_codec(Some("aac")).as_deref(), Some("mp4a.40.2"));
+        assert_eq!(
+            rfc6381_audio_codec(Some("aac")).as_deref(),
+            Some("mp4a.40.2")
+        );
         assert_eq!(rfc6381_audio_codec(Some("ac3")).as_deref(), Some("ac-3"));
         assert_eq!(rfc6381_audio_codec(Some("eac3")).as_deref(), Some("ec-3"));
         assert_eq!(rfc6381_audio_codec(Some("truehd")), None);
