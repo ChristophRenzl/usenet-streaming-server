@@ -50,7 +50,15 @@ pub fn rank(
         })
         .collect();
 
-    ranked.sort_by(|a, b| {
+    sort_candidates(&mut ranked);
+    ranked
+}
+
+/// Deterministic candidate order: accepted before rejected, then score
+/// descending, recency, title. Re-applied by the resolution pipeline after
+/// post-search verification adjusts rejections and scores.
+pub fn sort_candidates(candidates: &mut [RankedRelease]) {
+    candidates.sort_by(|a, b| {
         a.rejected
             .is_some()
             .cmp(&b.rejected.is_some())
@@ -58,7 +66,6 @@ pub fn rank(
             .then_with(|| b.raw.posted_at.cmp(&a.raw.posted_at))
             .then_with(|| a.raw.title.cmp(&b.raw.title))
     });
-    ranked
 }
 
 /// A copy of the preferences clamped to the device cap for scoring:
@@ -165,15 +172,37 @@ fn language_score(languages: &[String], target: &LanguageTarget) -> i64 {
     }
 }
 
+/// Split a release name (or a preference term) into lowercase tokens, the
+/// same way the attribute parser does.
+fn tokenize(text: &str) -> Vec<String> {
+    text.to_lowercase()
+        .split(['.', ' ', '-', '_', '[', ']', '(', ')'])
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Whole-token match of a preference term against a release name. Terms are
+/// tokenized too, so `WEB-DL` matches `WEB.DL`. Plain substring matching
+/// would misfire badly: blocking "TS" (telesync) must not reject the release
+/// group "Ki**ts**une".
+fn term_matches(title_tokens: &[String], term: &str) -> bool {
+    let term_tokens = tokenize(term);
+    !term_tokens.is_empty()
+        && title_tokens
+            .windows(term_tokens.len())
+            .any(|w| w == term_tokens.as_slice())
+}
+
 fn rejection_reason(
     raw: &RawRelease,
     parsed: &ParsedRelease,
     prefs: &Preferences,
     device_cap: Option<Resolution>,
 ) -> Option<String> {
-    let title_lower = raw.title.to_lowercase();
+    let title_tokens = tokenize(&raw.title);
     for term in prefs.blocked_terms.iter().filter(|t| !t.is_empty()) {
-        if title_lower.contains(&term.to_lowercase()) {
+        if term_matches(&title_tokens, term) {
             return Some(format!("blocked term '{term}'"));
         }
     }
@@ -208,10 +237,14 @@ fn score(
 
     // Resolution: exact preferred match wins big; otherwise penalize by
     // distance so 1080p-preferred ranks 720p above 480p and above 2160p only
-    // by distance, not absolute pixel count.
+    // by distance, not absolute pixel count. The per-tier penalty exceeds
+    // the maximum source+codec+audio bonus (500+300+150), so the preferred
+    // resolution always outranks fancier releases at other resolutions —
+    // anime fansub names often carry no source/codec markers at all and
+    // must not lose to a 720p WEB-DL for that.
     score += match parsed.resolution {
         Some(res) if res == prefs.preferred_resolution => 1000,
-        Some(res) => 1000 - 300 * (res.tier() - prefs.preferred_resolution.tier()).abs(),
+        Some(res) => 1000 - 1000 * (res.tier() - prefs.preferred_resolution.tier()).abs(),
         None => 100,
     };
 
@@ -237,9 +270,9 @@ fn score(
         None => 0,
     };
 
-    let title_lower = raw.title.to_lowercase();
+    let title_tokens = tokenize(&raw.title);
     for term in prefs.allowed_terms.iter().filter(|t| !t.is_empty()) {
-        if title_lower.contains(&term.to_lowercase()) {
+        if term_matches(&title_tokens, term) {
             score += 200;
         }
     }
@@ -595,6 +628,70 @@ mod tests {
             None,
         );
         assert!(ranked[0].rejected.is_some());
+    }
+
+    #[test]
+    fn blocked_term_matches_whole_tokens_only() {
+        // Blocked term "TS" (telesync) must not reject the release group
+        // "Kitsune" via substring match.
+        let mut p = prefs();
+        p.blocked_terms = vec!["TS".into()];
+        let ranked = rank(
+            vec![
+                release("One.Piece.S17E028.Rebeccas.Sword.1080p.CR.WEB-DL.DDP2.0.H.264-Kitsune"),
+                release("Movie.2026.1080p.TS.x264-BAD"),
+            ],
+            &p,
+            None,
+            None,
+        );
+        let kitsune = ranked
+            .iter()
+            .find(|r| r.raw.title.contains("Kitsune"))
+            .unwrap();
+        assert_eq!(kitsune.rejected, None, "Kitsune must not match 'TS'");
+        let ts = ranked
+            .iter()
+            .find(|r| r.raw.title.contains(".TS."))
+            .unwrap();
+        assert!(ts.rejected.as_deref().unwrap().contains("blocked term"));
+    }
+
+    #[test]
+    fn multi_token_terms_match_across_separators() {
+        let mut p = prefs();
+        p.blocked_terms = vec!["WEB-DL".into()];
+        let ranked = rank(
+            vec![release("Movie.2026.1080p.WEB.DL.x264-GRP")],
+            &p,
+            None,
+            None,
+        );
+        assert!(ranked[0].rejected.is_some(), "WEB-DL must match WEB.DL");
+    }
+
+    #[test]
+    fn preferred_resolution_beats_fancier_lower_resolution() {
+        // Anime fansub releases often carry no source/codec markers; the
+        // preferred 1080p must still outrank a 720p WEB-DL with matching
+        // codec and audio.
+        let ranked = rank(
+            vec![
+                release("Show.S01E01.720p.WEB-DL.x264.AAC-SCENE"),
+                release("[Subs] Show - 001 (1080p) [ABCD12EF]"),
+            ],
+            &prefs(),
+            None,
+            None,
+        );
+        assert!(
+            ranked[0].raw.title.contains("1080p"),
+            "preferred resolution must dominate; order was: {:?}",
+            ranked
+                .iter()
+                .map(|r| r.raw.title.as_str())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
