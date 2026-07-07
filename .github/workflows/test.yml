@@ -7,16 +7,19 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # The runner has limited RAM: linking the test binaries in parallel with
-  # full debuginfo got ld OOM-killed ("ld terminated with signal 9"). Debug
-  # symbols are useless in CI anyway — dropping them shrinks link memory by
-  # an order of magnitude (backtraces keep line info via debug-assertions).
+  # Debug symbols are useless in CI and linking the test binaries with full
+  # debuginfo OOM-killed the Forgejo runner's ld ("signal 9"); dropping them
+  # is harmless (and faster) on GitHub too.
   CARGO_PROFILE_DEV_DEBUG: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
 
+# The repo lives on both GitHub and a Forgejo instance (git.kreideee.com);
+# each job is gated on the server it runs on, so one workflow file serves
+# both without either side scheduling jobs it has no runners for.
 jobs:
   check:
-    runs-on: docker
+    if: github.server_url == 'https://github.com'
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -27,6 +30,26 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ffmpeg par2
       # fpcalc is optional: every fpcalc-dependent test is skip-gated, so a
       # runner image whose sources lack the package must not fail the job.
+      - name: Install chromaprint (best-effort)
+        run: sudo apt-get install -y libchromaprint-tools || echo "libchromaprint-tools unavailable; fpcalc-gated tests run without it"
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test -j 2
+
+  check-forgejo:
+    if: github.server_url != 'https://github.com'
+    runs-on: docker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install ffmpeg and par2
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg par2
       - name: Install chromaprint (best-effort)
         run: sudo apt-get install -y libchromaprint-tools || echo "libchromaprint-tools unavailable; fpcalc-gated tests run without it"
       - name: Format
