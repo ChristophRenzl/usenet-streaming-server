@@ -37,6 +37,7 @@ pub mod fingerprints;
 pub mod indexers;
 pub mod preferences;
 pub mod providers;
+pub mod release_blacklist;
 pub mod settings;
 pub mod subtitle_cache;
 pub mod watch_history;
