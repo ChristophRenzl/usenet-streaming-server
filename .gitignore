@@ -5,3 +5,4 @@
 /data
 /config.local.toml
 .DS_Store
+/tests/live_settings.toml

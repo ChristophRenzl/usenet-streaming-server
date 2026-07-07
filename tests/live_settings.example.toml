@@ -1,0 +1,29 @@
+# Settings for the live end-to-end tests (tests/live_e2e.rs).
+#
+#   cp tests/live_settings.example.toml tests/live_settings.toml   # gitignored
+#   cargo test --test live_e2e -- --ignored --nocapture
+#
+# Every value can also be set via env vars with the LIVE_E2E__ prefix and
+# double underscores between levels, e.g.:
+#   LIVE_E2E__TMDB__API_KEY=...  LIVE_E2E__INDEXER__BASE_URL=http://...
+
+[tmdb]
+# Official TMDB v3 API key (https://www.themoviedb.org/settings/api).
+api_key = ""
+
+# Any Newznab-compatible indexer or meta-indexer (NZBHydra2, Prowlarr, ...).
+[indexer]
+name = "nzbhydra2"
+base_url = "http://192.168.1.61:5076"
+api_key = ""
+
+# Optional: a real Usenet provider. Only needed for the full playback test
+# (playing_the_first_episode_streams_the_anime), which also needs
+# ffmpeg/ffprobe on PATH. Omit the whole section to skip that test.
+# [provider]
+# host = "news.example.com"
+# port = 563
+# use_tls = true
+# username = ""
+# password = ""
+# max_connections = 10

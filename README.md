@@ -84,6 +84,27 @@ cp config.example.toml config.toml   # set auth.api_key
 
 Run tests with `cargo test`.
 
+### Live end-to-end tests
+
+`tests/live_e2e.rs` runs the full resolution/playback pipeline against a
+**real** Newznab indexer (e.g. NZBHydra2) and the **official TMDB API** — no
+mocks. The scenarios pin down real-world behavior around long-running anime
+(wrong-show picks, absolute episode numbering, mid-series arcs returning
+nothing, a per-season 1080p sweep). They are `#[ignore]`d so plain
+`cargo test` stays offline.
+
+```sh
+cp tests/live_settings.example.toml tests/live_settings.toml  # gitignored
+# fill in your indexer URL/key and TMDB API key; the optional [provider]
+# section enables the full streaming test (needs ffmpeg on PATH)
+cargo test --test live_e2e -- --ignored --nocapture
+```
+
+Every value can also come from `LIVE_E2E__*` env vars
+(e.g. `LIVE_E2E__TMDB__API_KEY=...`), so CI can run them without a file.
+Mind your indexers' API limits: the suite fires dozens of real queries, and
+rate-limited indexers are temporarily disabled by NZBHydra.
+
 ## Web admin UI
 
 The server ships a built-in admin panel at `/` (no extra container, works
