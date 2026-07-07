@@ -63,6 +63,47 @@ pub fn subtitle_media_playlist(vtt_name: &str, duration_secs: Option<f64>) -> St
     )
 }
 
+/// Window length for embedded-subtitle renditions. Embedded subs are
+/// extracted *while* the media streams, so their VTT grows over time — a
+/// single-segment rendition (like external subs use) would be fetched once
+/// at start and miss every later cue. Short windows make the player fetch
+/// cues lazily near the playhead, by which point extraction has long passed.
+pub const EMBEDDED_WINDOW_SECS: f64 = 60.0;
+
+/// Window-file name for one embedded-subtitle window (`sub_emb_en_w0004.vtt`).
+pub fn embedded_window_name(language: &str, window: u64) -> String {
+    format!("sub_emb_{language}_w{window:04}.vtt")
+}
+
+/// Media playlist for an embedded-subtitle rendition: fixed-length windows
+/// covering the whole program, listed upfront (mirroring the video playlist's
+/// list-everything style). Window contents are sliced from the growing VTT at
+/// request time.
+pub fn embedded_subtitle_playlist(language: &str, duration_secs: Option<f64>) -> String {
+    let duration = duration_secs
+        .filter(|d| d.is_finite() && *d > 0.0)
+        .unwrap_or(FALLBACK_DURATION_SECS);
+    let mut out = format!(
+        "#EXTM3U\n\
+         #EXT-X-VERSION:7\n\
+         #EXT-X-TARGETDURATION:{target}\n\
+         #EXT-X-MEDIA-SEQUENCE:0\n\
+         #EXT-X-PLAYLIST-TYPE:VOD\n",
+        target = EMBEDDED_WINDOW_SECS as u64,
+    );
+    let windows = (duration / EMBEDDED_WINDOW_SECS).ceil().max(1.0) as u64;
+    for window in 0..windows {
+        let remaining = duration - window as f64 * EMBEDDED_WINDOW_SECS;
+        let length = remaining.min(EMBEDDED_WINDOW_SECS);
+        out.push_str(&format!(
+            "#EXTINF:{length:.3},\n{name}\n",
+            name = embedded_window_name(language, window),
+        ));
+    }
+    out.push_str("#EXT-X-ENDLIST\n");
+    out
+}
+
 /// Variant-level facts for the single `#EXT-X-STREAM-INF` row.
 #[derive(Debug, Clone, Default)]
 pub struct MasterVariant {
@@ -195,6 +236,18 @@ mod tests {
         assert!(master.contains("VIDEO-RANGE=PQ"));
         assert!(master
             .contains("#EXT-X-STREAM-INF:BANDWIDTH=20000000,VIDEO-RANGE=PQ,SUBTITLES=\"subs\""));
+    }
+
+    #[test]
+    fn embedded_playlist_lists_all_windows_upfront() {
+        let playlist = embedded_subtitle_playlist("en", Some(150.0));
+        assert!(playlist.contains("#EXT-X-TARGETDURATION:60"));
+        assert!(playlist.contains("#EXTINF:60.000,\nsub_emb_en_w0000.vtt"));
+        assert!(playlist.contains("#EXTINF:60.000,\nsub_emb_en_w0001.vtt"));
+        // Final partial window carries the remainder.
+        assert!(playlist.contains("#EXTINF:30.000,\nsub_emb_en_w0002.vtt"));
+        assert!(!playlist.contains("w0003"));
+        assert!(playlist.trim_end().ends_with("#EXT-X-ENDLIST"));
     }
 
     #[test]

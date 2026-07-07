@@ -141,6 +141,98 @@ fn is_index_line(line: &str) -> bool {
     !line.is_empty() && line.bytes().all(|b| b.is_ascii_digit())
 }
 
+/// One parsed WebVTT cue: absolute times plus the raw payload lines.
+#[derive(Debug, Clone, PartialEq)]
+struct Cue {
+    start_secs: f64,
+    end_secs: f64,
+    /// The timing line's trailing cue settings, when present.
+    settings: Option<String>,
+    payload: String,
+}
+
+/// Parse the cues of a WebVTT document (header and NOTE/STYLE blocks are
+/// skipped; cue identifiers are dropped).
+fn parse_cues(vtt: &str) -> Vec<Cue> {
+    let mut cues = Vec::new();
+    let mut lines = vtt.lines().peekable();
+    while let Some(line) = lines.next() {
+        if !is_timing_line(line) {
+            continue;
+        }
+        let Some((start_raw, rest)) = line.split_once("-->") else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let (end_raw, settings) = match rest.split_once(char::is_whitespace) {
+            Some((ts, tail)) => (ts, Some(tail.to_string())),
+            None => (rest, None),
+        };
+        let (Some(start_secs), Some(end_secs)) =
+            (parse_timestamp(start_raw.trim_end()), parse_timestamp(end_raw))
+        else {
+            continue;
+        };
+        let mut payload = String::new();
+        while let Some(text) = lines.peek() {
+            if text.trim().is_empty() {
+                break;
+            }
+            if !payload.is_empty() {
+                payload.push('\n');
+            }
+            payload.push_str(text);
+            lines.next();
+        }
+        cues.push(Cue {
+            start_secs,
+            end_secs,
+            settings,
+            payload,
+        });
+    }
+    cues
+}
+
+/// Slice a time window out of one or more (growing) WebVTT documents.
+///
+/// Used for embedded-subtitle renditions: ffmpeg appends cues to fragment
+/// files while the media streams (one fragment per (re)start position), and
+/// each HLS window request is answered with the cues overlapping
+/// `[start_secs, end_secs)` across all fragments, deduplicated (fragments
+/// from seek restarts can overlap). Cue times stay absolute — the rendition's
+/// `X-TIMESTAMP-MAP` anchors local zero to the program timeline.
+pub fn window_vtt(fragments: &[String], start_secs: f64, end_secs: f64) -> String {
+    let mut cues: Vec<Cue> = fragments
+        .iter()
+        .flat_map(|fragment| parse_cues(fragment))
+        .filter(|cue| cue.end_secs > start_secs && cue.start_secs < end_secs)
+        .collect();
+    cues.sort_by(|a, b| {
+        a.start_secs
+            .total_cmp(&b.start_secs)
+            .then(a.end_secs.total_cmp(&b.end_secs))
+    });
+    cues.dedup();
+
+    let mut out = String::from(VTT_HEADER);
+    for cue in cues {
+        out.push_str(&format!(
+            "{} --> {}",
+            format_timestamp(cue.start_secs),
+            format_timestamp(cue.end_secs)
+        ));
+        if let Some(settings) = &cue.settings {
+            out.push(' ');
+            out.push_str(settings);
+        }
+        out.push('\n');
+        out.push_str(&cue.payload);
+        out.push_str("\n\n");
+    }
+    out
+}
+
 /// A cue timing line contains the `-->` arrow.
 fn is_timing_line(line: &str) -> bool {
     line.contains("-->")
@@ -234,6 +326,32 @@ fn format_timestamp(secs: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_vtt_slices_and_merges_fragments() {
+        let f0 = "WEBVTT\n\n00:00:10.000 --> 00:00:12.000\nEarly\n\n\
+                  00:01:05.000 --> 00:01:07.500 line:85%\nIn window\n\n";
+        let f1 = "WEBVTT\n\n00:01:05.000 --> 00:01:07.500 line:85%\nIn window\n\n\
+                  00:01:59.000 --> 00:02:03.000\nSpans boundary\n\n\
+                  00:03:00.000 --> 00:03:02.000\nLate\n\n";
+        let out = window_vtt(&[f0.to_string(), f1.to_string()], 60.0, 120.0);
+        assert!(out.starts_with("WEBVTT\nX-TIMESTAMP-MAP"));
+        // Cue before the window is excluded, late cue too.
+        assert!(!out.contains("Early"));
+        assert!(!out.contains("Late"));
+        // The duplicated cue appears once, settings preserved.
+        assert_eq!(out.matches("In window").count(), 1);
+        assert!(out.contains("00:01:05.000 --> 00:01:07.500 line:85%"));
+        // A cue overlapping the window end is included with absolute times.
+        assert!(out.contains("00:01:59.000 --> 00:02:03.000\nSpans boundary"));
+    }
+
+    #[test]
+    fn window_vtt_empty_fragments_yield_header_only() {
+        let out = window_vtt(&[], 0.0, 60.0);
+        assert!(out.starts_with("WEBVTT\nX-TIMESTAMP-MAP"));
+        assert!(!out.contains("-->"));
+    }
 
     #[test]
     fn basic_conversion_adds_header_and_dots() {

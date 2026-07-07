@@ -125,8 +125,18 @@ pub async fn download_subtitle(
     client: &OpenSubtitlesClient,
     file_id: i64,
 ) -> AppResult<SubtitleDownload> {
+    // Downloads are the quota-limited operation (20/day on free accounts);
+    // a file that was ever fetched is served from the cache forever after,
+    // so replays / autoplay pre-sessions / retries cost no quota.
+    if let Ok(Some(srt)) = crate::db::subtitle_cache::get(&state.db, file_id).await {
+        tracing::debug!(file_id, "subtitle served from cache");
+        return Ok(SubtitleDownload {
+            text: srt,
+            remaining_quota: None,
+        });
+    }
     let token = opensubtitles_token(state, client).await;
-    match client.download_subtitle(file_id, token.as_deref()).await {
+    let download = match client.download_subtitle(file_id, token.as_deref()).await {
         Ok(download) => Ok(download),
         Err(error) if is_token_rejected(&error) => {
             // Stale cached token: drop it, re-login and retry once.
@@ -135,7 +145,11 @@ pub async fn download_subtitle(
             client.download_subtitle(file_id, token.as_deref()).await
         }
         Err(error) => Err(error),
+    }?;
+    if let Err(error) = crate::db::subtitle_cache::put(&state.db, file_id, &download.text).await {
+        tracing::warn!(file_id, %error, "caching subtitle failed");
     }
+    Ok(download)
 }
 
 /// Split a comma list of languages into trimmed, lower-cased ISO codes.

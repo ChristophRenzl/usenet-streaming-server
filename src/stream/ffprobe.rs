@@ -36,6 +36,9 @@ pub struct ProbeResult {
     pub height: Option<i64>,
     /// Container-level total bitrate in bits/s, when the format reports one.
     pub bit_rate_bps: Option<i64>,
+    /// Text-based subtitle streams embedded in the container, in file order.
+    /// Bitmap formats (PGS, VobSub) are excluded — they would need OCR.
+    pub subtitle_streams: Vec<EmbeddedSubtitle>,
     /// Embedded chapter markers, in file order. Empty for the vast majority of
     /// releases (most have no chapters). Powers the client's "Skip Intro".
     pub chapters: Vec<Chapter>,
@@ -58,6 +61,43 @@ pub struct Chapter {
 /// mid-episode chapter merely named "OP reprise" is not mistaken for the
 /// opening.
 const INTRO_MAX_START_SECS: f64 = 300.0;
+
+/// One text-based subtitle stream embedded in the probed media.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmbeddedSubtitle {
+    /// Global ffmpeg stream index (for `-map 0:<index>`).
+    pub stream_index: i64,
+    /// The stream's language tag, normalized to a primary ISO 639-1 code
+    /// ("en", "de"); `None` when untagged.
+    pub language: Option<String>,
+    /// Forced-narrative track (translations of foreign dialogue only).
+    pub forced: bool,
+    /// SDH / hearing-impaired track.
+    pub hearing_impaired: bool,
+}
+
+/// Codecs ffmpeg can convert to WebVTT as text. Bitmap subtitle formats
+/// (`hdmv_pgs_subtitle`, `dvd_subtitle`) are deliberately absent.
+const TEXT_SUBTITLE_CODECS: &[&str] = &["subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text"];
+
+/// The best embedded subtitle stream for a requested language: prefers a
+/// full track over forced/SDH variants, and only ever matches on an explicit
+/// language tag (an untagged track could be anything).
+pub fn select_embedded_subtitle<'a>(
+    streams: &'a [EmbeddedSubtitle],
+    language: &str,
+) -> Option<&'a EmbeddedSubtitle> {
+    let wanted = primary_language_code(language);
+    let candidates: Vec<&EmbeddedSubtitle> = streams
+        .iter()
+        .filter(|s| s.language.as_deref() == Some(wanted.as_str()))
+        .collect();
+    candidates
+        .iter()
+        .find(|s| !s.forced && !s.hearing_impaired)
+        .or_else(|| candidates.iter().find(|s| !s.forced))
+        .copied()
+}
 
 /// One audio stream of the probed media.
 #[derive(Debug, Clone, Default)]
@@ -153,6 +193,7 @@ struct ProbeFormat {
 
 #[derive(Debug, Deserialize)]
 struct ProbeStream {
+    index: Option<i64>,
     codec_type: Option<String>,
     codec_name: Option<String>,
     profile: Option<String>,
@@ -160,6 +201,8 @@ struct ProbeStream {
     width: Option<i64>,
     height: Option<i64>,
     channels: Option<i64>,
+    #[serde(default)]
+    disposition: Option<ProbeDisposition>,
     /// Rational frame rate `num/den`, e.g. `24000/1001`. `avg_frame_rate` is
     /// preferred (real average); `r_frame_rate` is the fallback base rate.
     avg_frame_rate: Option<String>,
@@ -172,6 +215,15 @@ struct ProbeStream {
 #[derive(Debug, Deserialize)]
 struct ProbeTags {
     language: Option<String>,
+}
+
+/// ffprobe stream disposition flags (0/1 integers).
+#[derive(Debug, Default, Deserialize)]
+struct ProbeDisposition {
+    #[serde(default)]
+    forced: i64,
+    #[serde(default)]
+    hearing_impaired: i64,
 }
 
 /// Parse an ffprobe rational frame rate (`num/den`, e.g. `24000/1001`) to fps.
@@ -275,6 +327,7 @@ fn parse_probe(doc: ProbeDoc) -> AppResult<ProbeResult> {
     let mut width = None;
     let mut height = None;
     let mut audio_streams = Vec::new();
+    let mut subtitle_streams = Vec::new();
     let mut fps = None;
     let mut color_transfer = None;
     for stream in &doc.streams {
@@ -296,6 +349,25 @@ fn parse_probe(doc: ProbeDoc) -> AppResult<ProbeResult> {
                     channels: stream.channels,
                     language: stream.tags.as_ref().and_then(|t| t.language.clone()),
                 });
+            }
+            Some("subtitle") => {
+                let text = stream
+                    .codec_name
+                    .as_deref()
+                    .is_some_and(|c| TEXT_SUBTITLE_CODECS.contains(&c));
+                if let (true, Some(index)) = (text, stream.index) {
+                    let disposition = stream.disposition.as_ref();
+                    subtitle_streams.push(EmbeddedSubtitle {
+                        stream_index: index,
+                        language: stream
+                            .tags
+                            .as_ref()
+                            .and_then(|t| t.language.as_deref())
+                            .map(primary_language_code),
+                        forced: disposition.is_some_and(|d| d.forced != 0),
+                        hearing_impaired: disposition.is_some_and(|d| d.hearing_impaired != 0),
+                    });
+                }
             }
             _ => {}
         }
@@ -340,6 +412,7 @@ fn parse_probe(doc: ProbeDoc) -> AppResult<ProbeResult> {
         width,
         height,
         bit_rate_bps,
+        subtitle_streams,
         chapters,
         intro_end_secs,
     })
@@ -523,6 +596,81 @@ mod tests {
         .expect("parse");
         let result = parse_probe(doc).expect("probe");
         assert!((result.fps.unwrap() - 25.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn embedded_subtitle_selection_prefers_full_tracks() {
+        let streams = vec![
+            EmbeddedSubtitle {
+                stream_index: 2,
+                language: Some("en".into()),
+                forced: true,
+                hearing_impaired: false,
+            },
+            EmbeddedSubtitle {
+                stream_index: 3,
+                language: Some("en".into()),
+                forced: false,
+                hearing_impaired: true,
+            },
+            EmbeddedSubtitle {
+                stream_index: 4,
+                language: Some("en".into()),
+                forced: false,
+                hearing_impaired: false,
+            },
+            EmbeddedSubtitle {
+                stream_index: 5,
+                language: None,
+                forced: false,
+                hearing_impaired: false,
+            },
+        ];
+        // Full track wins over forced and SDH variants.
+        assert_eq!(
+            select_embedded_subtitle(&streams, "en").map(|s| s.stream_index),
+            Some(4)
+        );
+        // Without a full track, SDH beats forced.
+        assert_eq!(
+            select_embedded_subtitle(&streams[..2], "en").map(|s| s.stream_index),
+            Some(3)
+        );
+        // Untagged streams never match; unknown languages find nothing.
+        assert_eq!(select_embedded_subtitle(&streams, "de"), None);
+    }
+
+    #[test]
+    fn probe_collects_text_subtitle_streams_only() {
+        let doc: ProbeDoc = serde_json::from_str(
+            r#"{
+                "streams": [
+                    {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                    {"index": 1, "codec_type": "audio", "codec_name": "aac"},
+                    {"index": 2, "codec_type": "subtitle", "codec_name": "subrip",
+                     "tags": {"language": "eng"},
+                     "disposition": {"forced": 0, "hearing_impaired": 0}},
+                    {"index": 3, "codec_type": "subtitle", "codec_name": "hdmv_pgs_subtitle",
+                     "tags": {"language": "ger"}},
+                    {"index": 4, "codec_type": "subtitle", "codec_name": "ass",
+                     "tags": {"language": "ger"},
+                     "disposition": {"forced": 1, "hearing_impaired": 0}}
+                ],
+                "format": {}
+            }"#,
+        )
+        .expect("parse");
+        let probe = parse_probe(doc).expect("probe");
+        let langs: Vec<_> = probe
+            .subtitle_streams
+            .iter()
+            .map(|s| (s.stream_index, s.language.clone(), s.forced))
+            .collect();
+        // PGS (bitmap) is excluded; language tags normalize to 639-1.
+        assert_eq!(
+            langs,
+            vec![(2, Some("en".to_string()), false), (4, Some("de".to_string()), true)]
+        );
     }
 
     #[test]

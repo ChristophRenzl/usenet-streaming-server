@@ -53,6 +53,10 @@ pub struct SpawnOptions<'a> {
     /// by language preference so dual-language releases don't default to
     /// the dub that happens to be muxed first.
     pub audio_stream_index: usize,
+    /// Embedded text-subtitle extractions: `(global stream index, output
+    /// path)`. Each becomes an extra growing-WebVTT output of the same
+    /// process, so extraction costs no additional input bandwidth.
+    pub subtitle_extractions: Vec<(i64, std::path::PathBuf)>,
 }
 
 /// Spawn ffmpeg writing an fMP4 event playlist into the session's temp dir
@@ -117,6 +121,19 @@ pub async fn spawn_hls(session: &Arc<Session>, options: SpawnOptions<'_>) -> App
     cmd.arg("-hls_segment_filename");
     cmd.arg(dir.join("seg_%05d.m4s"));
     cmd.arg(dir.join("media.m3u8"));
+    // Embedded text subtitles ride along as extra WebVTT outputs of the same
+    // process. The `?` map suffix keeps a vanished stream from failing the
+    // whole spawn; `-output_ts_offset` keeps post-seek cue times on the
+    // global VOD timeline like the video segments.
+    for (stream_index, path) in &options.subtitle_extractions {
+        cmd.arg("-map").arg(format!("0:{stream_index}?"));
+        cmd.args(["-c:s", "webvtt", "-f", "webvtt"]);
+        if options.start_secs > 0.0 {
+            cmd.arg("-output_ts_offset")
+                .arg(format!("{:.3}", options.start_secs));
+        }
+        cmd.arg(path);
+    }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

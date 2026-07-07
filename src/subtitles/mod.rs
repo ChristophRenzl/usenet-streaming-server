@@ -15,7 +15,8 @@ pub use opensubtitles::{
     is_token_rejected, DownloadLink, OpenSubtitlesClient, SubtitleDownload, SubtitleQuery,
     SubtitleResult,
 };
-pub use vtt::{decode_subtitle_bytes, shift_vtt, srt_to_vtt, srt_to_vtt_scaled};
+pub use hls::{embedded_subtitle_playlist, embedded_window_name, EMBEDDED_WINDOW_SECS};
+pub use vtt::{decode_subtitle_bytes, shift_vtt, srt_to_vtt, srt_to_vtt_scaled, window_vtt};
 
 use crate::error::{AppError, AppResult};
 use crate::stream::Session;

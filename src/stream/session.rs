@@ -83,6 +83,10 @@ pub struct MediaInfo {
     /// Peak bandwidth (bits/s) for `BANDWIDTH`; `None` falls back to the
     /// playlist default.
     pub bandwidth_bps: Option<i64>,
+    /// Embedded text-subtitle streams being extracted for this session:
+    /// `(global stream index, ISO 639-1 language)`. Seek restarts re-add the
+    /// same extractions so cues keep accumulating across the timeline.
+    pub embedded_subtitles: Vec<(i64, String)>,
     /// Embedded chapter markers from the probe (empty for most releases).
     pub chapters: Vec<crate::stream::ffprobe::Chapter>,
     /// End (seconds) of the detected intro/opening chapter, for the client's

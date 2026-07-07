@@ -68,6 +68,18 @@ static SUBTITLE_FILE_NAME: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^sub_[a-z]{2,4}(-[a-z]{2,4})?_\d+\.(m3u8|vtt)$").expect("subtitle file regex")
 });
 
+/// Embedded-subtitle rendition playlist (`sub_emb_en.m3u8`), written at
+/// session start with fixed windows listed upfront.
+static EMBEDDED_SUB_PLAYLIST: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^sub_emb_[a-z]{2,3}\.m3u8$").expect("embedded playlist regex")
+});
+
+/// One embedded-subtitle window (`sub_emb_en_w0004.vtt`), sliced on demand
+/// from the growing extraction fragments.
+static EMBEDDED_SUB_WINDOW: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^sub_emb_([a-z]{2,3})_w(\d{4})\.vtt$").expect("embedded window regex")
+});
+
 const VTT_CONTENT_TYPE: &str = "text/vtt";
 
 // ---- Session creation -------------------------------------------------------
@@ -315,8 +327,16 @@ pub async fn create_session(
 
         match assessment.verdict {
             HealthVerdict::Streamable if !request.force_repair => {
-                match start_streamable_session(&state, &target, &candidate, nzb, main, supports_hdr)
-                    .await
+                match start_streamable_session(
+                    &state,
+                    &target,
+                    &candidate,
+                    nzb,
+                    main,
+                    supports_hdr,
+                    &subtitle_languages,
+                )
+                .await
                 {
                     Ok(session) => {
                         // Best-effort auto-subtitles: never fails the session.
@@ -588,6 +608,10 @@ async fn auto_attach_subtitles(state: &AppState, session: &Arc<Session>, languag
     };
 
     for language in languages {
+        // Covered by an embedded track already — no external download needed.
+        if session.subtitle_track_by_language(language).is_some() {
+            continue;
+        }
         let query = subtitles::SubtitleQuery {
             tmdb_id: session.tmdb_id,
             season,
@@ -808,6 +832,7 @@ async fn start_streamable_session(
     nzb: Nzb,
     main: MainContent,
     supports_hdr: bool,
+    subtitle_languages: &[String],
 ) -> AppResult<Arc<Session>> {
     let source = open_media_source(
         &nzb,
@@ -858,7 +883,9 @@ async fn start_streamable_session(
     );
 
     // From here on, clean up the registered session on failure.
-    match probe_and_spawn(state, &session, supports_hdr, &audio_language).await {
+    match probe_and_spawn(state, &session, supports_hdr, &audio_language, subtitle_languages)
+        .await
+    {
         Ok(()) => {}
         Err(error) => {
             state.sessions.teardown(&session.id).await;
@@ -965,7 +992,9 @@ async fn start_disk_session(
         lookup.original_language.as_deref(),
     );
 
-    match probe_and_spawn(state, &session, supports_hdr, &audio_language).await {
+    match probe_and_spawn(state, &session, supports_hdr, &audio_language, subtitle_languages)
+        .await
+    {
         Ok(()) => {}
         Err(error) => {
             state.sessions.teardown(&session.id).await;
@@ -1042,6 +1071,7 @@ async fn probe_and_spawn(
     session: &Arc<Session>,
     supports_hdr: bool,
     audio_language: &str,
+    subtitle_languages: &[String],
 ) -> AppResult<()> {
     let url = loopback_url(state, session);
     let probe = ffprobe::probe_url(&state.config.streaming.ffprobe_path, &url).await?;
@@ -1104,6 +1134,19 @@ async fn probe_and_spawn(
         // Remuxes burst above the container average; pad by 25%.
         probe.bit_rate_bps.map(|b| b + b / 4)
     };
+    // Embedded text subtitles matching the requested languages ride along as
+    // extra WebVTT outputs of the same ffmpeg — release-accurate, no
+    // OpenSubtitles quota. One stream per language, first match wins.
+    let mut embedded_subtitles: Vec<(i64, String)> = Vec::new();
+    for language in subtitle_languages {
+        let lang = ffprobe::primary_language_code(language);
+        if embedded_subtitles.iter().any(|(_, l)| *l == lang) {
+            continue;
+        }
+        if let Some(stream) = ffprobe::select_embedded_subtitle(&probe.subtitle_streams, &lang) {
+            embedded_subtitles.push((stream.stream_index, lang));
+        }
+    }
     session.set_info(MediaInfo {
         duration_secs: probe.duration_secs,
         video_codec: probe.video_codec.clone(),
@@ -1120,6 +1163,7 @@ async fn probe_and_spawn(
         master_codecs,
         resolution,
         bandwidth_bps,
+        embedded_subtitles: embedded_subtitles.clone(),
         chapters: probe.chapters,
         intro_end_secs: probe.intro_end_secs,
     });
@@ -1133,9 +1177,62 @@ async fn probe_and_spawn(
             video_codec: probe.video_codec.as_deref(),
             tonemap_to_sdr: video_transcoded,
             audio_stream_index,
+            subtitle_extractions: embedded_subtitle_extractions(session, &embedded_subtitles, 0.0),
         },
     )
-    .await
+    .await?;
+    register_embedded_subtitle_tracks(session, &embedded_subtitles).await;
+    Ok(())
+}
+
+/// Extraction specs for [`SpawnOptions`]: one growing-VTT fragment file per
+/// embedded stream, named by the (re)start position so fragments from seek
+/// restarts coexist and the window slicer can merge them.
+fn embedded_subtitle_extractions(
+    session: &Arc<Session>,
+    embedded: &[(i64, String)],
+    start_secs: f64,
+) -> Vec<(i64, std::path::PathBuf)> {
+    embedded
+        .iter()
+        .map(|(index, lang)| {
+            (
+                *index,
+                session
+                    .temp_dir
+                    .join(format!("sub_emb_{lang}_f{:06}.vtt", start_secs as u64)),
+            )
+        })
+        .collect()
+}
+
+/// Write the windowed rendition playlist and record a [`SubtitleTrack`] per
+/// embedded extraction, so the master playlist advertises them. Runs before
+/// `auto_attach_subtitles`, which then skips languages already covered.
+async fn register_embedded_subtitle_tracks(session: &Arc<Session>, embedded: &[(i64, String)]) {
+    let duration = session.info().duration_secs;
+    for (_, lang) in embedded {
+        let playlist_name = format!("sub_emb_{lang}.m3u8");
+        let playlist = subtitles::embedded_subtitle_playlist(lang, duration);
+        if let Err(error) =
+            tokio::fs::write(session.temp_dir.join(&playlist_name), playlist.as_bytes()).await
+        {
+            tracing::warn!(session = %session.id, %lang, %error, "writing embedded subtitle playlist failed");
+            continue;
+        }
+        let default = session.subtitle_tracks().is_empty();
+        session.add_subtitle_track(crate::subtitles::SubtitleTrack {
+            language: lang.clone(),
+            name: format!("{} (embedded)", subtitles::language_display_name(lang)),
+            playlist_name,
+            vtt_name: format!("sub_emb_{lang}_f000000.vtt"),
+            key: format!("emb_{lang}"),
+            base_vtt: String::new(),
+            offset_ms: 0,
+            default,
+        });
+        tracing::info!(session = %session.id, %lang, "attached embedded subtitle");
+    }
 }
 
 // ---- Session status / teardown ----------------------------------------------
@@ -1440,9 +1537,23 @@ pub async fn hls_segment(
     let session = get_session(&state, &session_id)?;
     // Strict allowlist: the path parameter must never escape the temp dir.
     // Both regexes are fully anchored with no path separators.
+    // Embedded-subtitle windows are sliced from the growing extraction
+    // fragments at request time (they are not files on disk).
+    if let Some(captures) = EMBEDDED_SUB_WINDOW.captures(&segment) {
+        session.touch();
+        let language = captures.get(1).expect("lang group").as_str();
+        let window: u64 = captures
+            .get(2)
+            .expect("window group")
+            .as_str()
+            .parse()
+            .map_err(|_| AppError::BadRequest(format!("invalid window in '{segment}'")))?;
+        let vtt = embedded_window(&session, language, window).await;
+        return Ok(([(header::CONTENT_TYPE, VTT_CONTENT_TYPE)], vtt).into_response());
+    }
     let content_type = if SEGMENT_NAME.is_match(&segment) {
         "video/mp4"
-    } else if SUBTITLE_FILE_NAME.is_match(&segment) {
+    } else if SUBTITLE_FILE_NAME.is_match(&segment) || EMBEDDED_SUB_PLAYLIST.is_match(&segment) {
         if segment.ends_with(".vtt") {
             VTT_CONTENT_TYPE
         } else {
@@ -1493,6 +1604,30 @@ pub async fn hls_segment(
         rx.recv().await.map(|item| (item, rx))
     }));
     Ok(([(header::CONTENT_TYPE, "video/mp4")], body).into_response())
+}
+
+/// One embedded-subtitle window: merge all extraction fragments for the
+/// language (one per ffmpeg (re)start position) and slice the window's time
+/// range. Serves whatever has been extracted so far — the player requests
+/// windows near the playhead, where extraction has already passed, so a
+/// partially extracted window only occurs at the live edge (and yields the
+/// cues known so far instead of an error).
+async fn embedded_window(session: &Arc<Session>, language: &str, window: u64) -> String {
+    let prefix = format!("sub_emb_{language}_f");
+    let mut fragments = Vec::new();
+    if let Ok(mut entries) = tokio::fs::read_dir(&session.temp_dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.starts_with(&prefix) && name.ends_with(".vtt") {
+                if let Ok(text) = tokio::fs::read_to_string(entry.path()).await {
+                    fragments.push(text);
+                }
+            }
+        }
+    }
+    let start = window as f64 * subtitles::EMBEDDED_WINDOW_SECS;
+    subtitles::window_vtt(&fragments, start, start + subtitles::EMBEDDED_WINDOW_SECS)
 }
 
 /// Complete once ffmpeg lists it in its own playlist (updated by atomic
@@ -1787,6 +1922,13 @@ pub async fn offset_subtitle(
                 "subtitle track '{language}' on session {session_id}"
             ))
         })?;
+    // Embedded tracks come from the release itself — always in sync, and
+    // their cues live in growing extraction fragments, not a base VTT.
+    if track.key.starts_with("emb_") {
+        return Err(AppError::BadRequest(
+            "embedded subtitles are release-accurate and cannot be offset".into(),
+        ));
+    }
     // Re-shift from the pristine base VTT by the (absolute) offset.
     let updated = subtitles::set_subtitle_offset(&session, &track.key, request.ms)
         .await?
@@ -1930,6 +2072,11 @@ async fn restart_ffmpeg(
             video_codec: info.video_codec.as_deref(),
             tonemap_to_sdr: info.video_transcoded,
             audio_stream_index: info.audio_stream_index,
+            subtitle_extractions: embedded_subtitle_extractions(
+                session,
+                &info.embedded_subtitles,
+                target,
+            ),
         },
     )
     .await?;
@@ -1960,7 +2107,7 @@ async fn wipe_dir(dir: &FsPath) -> AppResult<()> {
         if entry
             .file_name()
             .to_str()
-            .is_some_and(|name| SUBTITLE_FILE_NAME.is_match(name))
+            .is_some_and(|name| name.starts_with("sub_"))
         {
             continue;
         }
