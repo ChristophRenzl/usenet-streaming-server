@@ -74,7 +74,7 @@ async fn watchlist_round_trip() {
     );
     assert_eq!(
         created["backdrop_url"],
-        json!("https://image.tmdb.org/t/p/w780/backdrop.jpg")
+        json!("https://image.tmdb.org/t/p/w1280/backdrop.jpg")
     );
     assert_eq!(created["overview"], json!("A mind-bending heist."));
     assert_eq!(created["vote_average"], json!(8.4));

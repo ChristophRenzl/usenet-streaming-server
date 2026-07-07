@@ -378,7 +378,7 @@ impl From<RawCollection> for Collection {
             id: raw.id,
             name: raw.name,
             overview: raw.overview.filter(|o| !o.is_empty()),
-            backdrop_url: image_url(raw.backdrop_path.as_deref(), "w780"),
+            backdrop_url: image_url(raw.backdrop_path.as_deref(), "w1280"),
             parts,
         }
     }
@@ -475,7 +475,7 @@ impl From<RawMovieDetails> for Movie {
             overview: raw.overview,
             runtime_minutes: raw.runtime,
             poster_url: image_url(raw.poster_path.as_deref(), "w500"),
-            backdrop_url: image_url(raw.backdrop_path.as_deref(), "w780"),
+            backdrop_url: image_url(raw.backdrop_path.as_deref(), "w1280"),
             vote_average: raw.vote_average,
             original_language: raw.original_language,
             trailer_youtube_key,
@@ -532,7 +532,7 @@ impl From<RawTvDetails> for TvShow {
             year: year_of(raw.first_air_date.as_deref()),
             overview: raw.overview,
             poster_url: image_url(raw.poster_path.as_deref(), "w500"),
-            backdrop_url: image_url(raw.backdrop_path.as_deref(), "w780"),
+            backdrop_url: image_url(raw.backdrop_path.as_deref(), "w1280"),
             vote_average: raw.vote_average,
             original_language: raw.original_language,
             trailer_youtube_key,
