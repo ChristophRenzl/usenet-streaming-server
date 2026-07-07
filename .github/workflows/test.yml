@@ -7,6 +7,12 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # The runner has limited RAM: linking the test binaries in parallel with
+  # full debuginfo got ld OOM-killed ("ld terminated with signal 9"). Debug
+  # symbols are useless in CI anyway — dropping them shrinks link memory by
+  # an order of magnitude (backtraces keep line info via debug-assertions).
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
 
 jobs:
   check:
@@ -28,4 +34,6 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
-        run: cargo test
+        # -j 2 also caps how many test binaries link at once — several
+        # parallel ld processes were what pushed the runner over the edge.
+        run: cargo test -j 2
