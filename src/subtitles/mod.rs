@@ -5,6 +5,7 @@
 pub mod hash;
 pub mod hls;
 pub mod opensubtitles;
+pub mod subdl;
 pub mod vtt;
 
 use std::sync::Arc;

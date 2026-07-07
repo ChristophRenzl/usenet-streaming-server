@@ -587,13 +587,20 @@ async fn auto_attach_subtitles(state: &AppState, session: &Arc<Session>, languag
     if languages.is_empty() {
         return;
     }
-    let client = match opensubtitles_client(state).await {
-        Ok(client) => client,
+    // Provider chain: embedded tracks were registered at spawn; OpenSubtitles
+    // is the primary external source; SubDL fills in when OpenSubtitles cannot
+    // deliver (quota exhausted, no result, download error).
+    let os_client = match opensubtitles_client(state).await {
+        Ok(client) => Some(client),
         Err(error) => {
-            tracing::info!(session = %session.id, %error, "skipping auto-subtitles");
-            return;
+            tracing::info!(session = %session.id, %error, "OpenSubtitles unavailable");
+            None
         }
     };
+    let subdl = super::subtitles::subdl_client(state).await;
+    if os_client.is_none() && subdl.is_none() {
+        return;
+    }
 
     // Release-accurate matching: compute the media's moviehash once. Non-fatal.
     let moviehash = match subtitles::osdb_hash(&session.media).await {
@@ -623,40 +630,117 @@ async fn auto_attach_subtitles(state: &AppState, session: &Arc<Session>, languag
             languages: vec![language.clone()],
             moviehash: moviehash.clone(),
         };
-        let top = match client.search(&query).await {
-            Ok(results) => results.into_iter().next(),
-            Err(error) => {
-                tracing::warn!(session = %session.id, %language, %error, "subtitle search failed");
+        if let Some(client) = &os_client {
+            if try_opensubtitles(state, session, client, &query, language, media_fps).await {
                 continue;
             }
-        };
-        let Some(result) = top else {
-            tracing::info!(session = %session.id, %language, "no subtitle found");
-            continue;
-        };
-        let srt = match download_subtitle(state, &client, result.file_id).await {
-            Ok(srt) => srt,
-            Err(error) => {
-                tracing::warn!(session = %session.id, %language, %error, "subtitle download failed");
-                continue;
-            }
-        };
-        let fps_scale = fps_rescale(media_fps, result.fps, result.moviehash_match);
-        // The first attached track becomes the default.
-        let make_default = session.subtitle_tracks().is_empty();
-        match subtitles::attach_subtitle(session, language, &srt.text, make_default, fps_scale)
-            .await
-        {
-            Ok(track) => tracing::info!(
+        }
+        if let Some(subdl) = &subdl {
+            try_subdl(state, session, subdl, &query, language).await;
+        }
+    }
+}
+
+/// One OpenSubtitles attempt for one language: search → download (cached) →
+/// attach. Returns whether a track was attached.
+async fn try_opensubtitles(
+    state: &AppState,
+    session: &Arc<Session>,
+    client: &crate::subtitles::OpenSubtitlesClient,
+    query: &subtitles::SubtitleQuery,
+    language: &str,
+    media_fps: Option<f64>,
+) -> bool {
+    let top = match client.search(query).await {
+        Ok(results) => results.into_iter().next(),
+        Err(error) => {
+            tracing::warn!(session = %session.id, %language, %error, "subtitle search failed");
+            return false;
+        }
+    };
+    let Some(result) = top else {
+        tracing::info!(session = %session.id, %language, "no OpenSubtitles result");
+        return false;
+    };
+    let srt = match download_subtitle(state, client, result.file_id).await {
+        Ok(srt) => srt,
+        Err(error) => {
+            tracing::warn!(session = %session.id, %language, %error, "subtitle download failed");
+            return false;
+        }
+    };
+    let fps_scale = fps_rescale(media_fps, result.fps, result.moviehash_match);
+    // The first attached track becomes the default.
+    let make_default = session.subtitle_tracks().is_empty();
+    match subtitles::attach_subtitle(session, language, &srt.text, make_default, fps_scale).await {
+        Ok(track) => {
+            tracing::info!(
                 session = %session.id,
                 language = %track.language,
                 hash_match = result.moviehash_match,
                 fps_scale = ?fps_scale,
                 "attached subtitle"
-            ),
-            Err(error) => {
-                tracing::warn!(session = %session.id, %language, %error, "attaching subtitle failed")
+            );
+            true
+        }
+        Err(error) => {
+            tracing::warn!(session = %session.id, %language, %error, "attaching subtitle failed");
+            false
+        }
+    }
+}
+
+/// One SubDL fallback attempt for one language: search → download (cached
+/// under a synthetic key) → attach. Best-effort; only logs on failure.
+async fn try_subdl(
+    state: &AppState,
+    session: &Arc<Session>,
+    client: &crate::subtitles::subdl::SubdlClient,
+    query: &subtitles::SubtitleQuery,
+    language: &str,
+) {
+    let results = match client.search(query, language).await {
+        Ok(results) => results,
+        Err(error) => {
+            tracing::warn!(session = %session.id, %language, %error, "SubDL search failed");
+            return;
+        }
+    };
+    // Prefer a non-SDH hit, like the embedded-stream selection does.
+    let Some(result) = results
+        .iter()
+        .find(|r| !r.hearing_impaired)
+        .or_else(|| results.first())
+    else {
+        tracing::info!(session = %session.id, %language, "no SubDL result");
+        return;
+    };
+    let cache_key = db::subtitle_cache::synthetic_key(&result.url);
+    let srt = match db::subtitle_cache::get(&state.db, cache_key).await {
+        Ok(Some(cached)) => cached,
+        _ => match client.download(&result.url).await {
+            Ok(text) => {
+                if let Err(error) = db::subtitle_cache::put(&state.db, cache_key, &text).await {
+                    tracing::warn!(%error, "caching SubDL subtitle failed");
+                }
+                text
             }
+            Err(error) => {
+                tracing::warn!(session = %session.id, %language, %error, "SubDL download failed");
+                return;
+            }
+        },
+    };
+    let make_default = session.subtitle_tracks().is_empty();
+    match subtitles::attach_subtitle(session, language, &srt, make_default, None).await {
+        Ok(track) => tracing::info!(
+            session = %session.id,
+            language = %track.language,
+            release = result.release_name.as_deref().unwrap_or("?"),
+            "attached SubDL subtitle"
+        ),
+        Err(error) => {
+            tracing::warn!(session = %session.id, %language, %error, "attaching SubDL subtitle failed")
         }
     }
 }

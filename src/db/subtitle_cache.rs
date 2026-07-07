@@ -13,6 +13,18 @@ use crate::error::{AppError, AppResult};
 /// typical ~50 KB per subtitle this bounds the table around 50 MB.
 const MAX_ROWS: i64 = 1000;
 
+/// Synthetic cache key for non-OpenSubtitles providers: a stable FNV-1a hash
+/// of the provider's file url, forced negative so it can never collide with a
+/// real (positive) OpenSubtitles file id.
+pub fn synthetic_key(url: &str) -> i64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in url.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    -((hash >> 1) as i64) - 1
+}
+
 /// The cached subtitle text for a file id, updating its recency. `None` on a
 /// cache miss.
 pub async fn get(pool: &SqlitePool, file_id: i64) -> AppResult<Option<String>> {
@@ -77,6 +89,16 @@ mod tests {
             .expect("get")
             .expect("hit")
             .contains("Hi"));
+    }
+
+    #[test]
+    fn synthetic_keys_are_negative_and_stable() {
+        let a = synthetic_key("/subtitle/1-2.zip");
+        let b = synthetic_key("/subtitle/1-2.zip");
+        let c = synthetic_key("/subtitle/9-9.zip");
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert!(a < 0 && c < 0);
     }
 
     #[tokio::test]

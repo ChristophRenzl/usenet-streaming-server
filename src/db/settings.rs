@@ -15,6 +15,11 @@ pub const OPENSUBTITLES_API_KEY: &str = "opensubtitles_api_key";
 /// Logging in lifts the anonymous per-IP download quota.
 pub const OPENSUBTITLES_USERNAME: &str = "opensubtitles_username";
 
+/// Key under which the SubDL API key is stored (free key from
+/// subdl.com/panel/api). Optional: SubDL is only the fallback provider when
+/// OpenSubtitles cannot deliver.
+pub const SUBDL_API_KEY: &str = "subdl_api_key";
+
 /// Key under which the OpenSubtitles account password is stored (paired with
 /// [`OPENSUBTITLES_USERNAME`]).
 pub const OPENSUBTITLES_PASSWORD: &str = "opensubtitles_password";

@@ -152,6 +152,19 @@ pub async fn download_subtitle(
     Ok(download)
 }
 
+/// The SubDL fallback client, when a `subdl_api_key` app setting is stored.
+pub async fn subdl_client(state: &AppState) -> Option<crate::subtitles::subdl::SubdlClient> {
+    let key = db::settings::get(&state.db, db::settings::SUBDL_API_KEY)
+        .await
+        .ok()
+        .flatten()
+        .filter(|k| !k.is_empty())?;
+    Some(crate::subtitles::subdl::SubdlClient::new(
+        state.http.clone(),
+        key,
+    ))
+}
+
 /// Split a comma list of languages into trimmed, lower-cased ISO codes.
 pub fn parse_languages(raw: &str) -> Vec<String> {
     raw.split(',')

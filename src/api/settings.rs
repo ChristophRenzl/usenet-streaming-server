@@ -243,6 +243,10 @@ pub struct AppSettings {
     /// Masked TMDB API key (only the last 4 characters are shown), or `null`
     /// when not configured.
     pub tmdb_api_key: Option<String>,
+    /// Masked SubDL API key (last 4 characters), or `null` when not set.
+    /// SubDL is the fallback subtitle provider when OpenSubtitles cannot
+    /// deliver (quota, no result); a free key comes from subdl.com/panel/api.
+    pub subdl_api_key: Option<String>,
     /// Masked per-user OpenSubtitles API key (last 4 characters), or `null`
     /// when no per-user key is stored. Subtitles are optional; playback works
     /// without it. A `null` here does not mean subtitles are unavailable — an
@@ -282,6 +286,9 @@ pub struct AppSettingsInput {
     pub tmdb_api_key: Option<String>,
     /// New OpenSubtitles API key. Omit to leave unchanged; send `""` to clear.
     pub opensubtitles_api_key: Option<String>,
+    /// New SubDL API key (fallback provider). Omit to leave unchanged; send
+    /// `""` to clear.
+    pub subdl_api_key: Option<String>,
     /// OpenSubtitles account username (login lifts the download quota). Omit
     /// to leave unchanged; send `""` to clear.
     pub opensubtitles_username: Option<String>,
@@ -329,6 +336,9 @@ async fn current_app_settings(state: &AppState) -> AppResult<AppSettings> {
         crate::api::subtitles::ApiKeySource::None => "none",
     }
     .to_string();
+    let subdl_key = db::settings::get(&state.db, db::settings::SUBDL_API_KEY)
+        .await?
+        .filter(|k| !k.is_empty());
     let opensubtitles_username = db::settings::get(&state.db, db::settings::OPENSUBTITLES_USERNAME)
         .await?
         .filter(|u| !u.is_empty());
@@ -349,6 +359,7 @@ async fn current_app_settings(state: &AppState) -> AppResult<AppSettings> {
             crate::api::subtitles::ApiKeySource::None
         ),
         opensubtitles_api_key: opensubtitles_key.map(|k| mask_secret(&k)),
+        subdl_api_key: subdl_key.map(|k| mask_secret(&k)),
         opensubtitles_api_key_source,
         opensubtitles_default_key_active,
         opensubtitles_username,
@@ -411,6 +422,9 @@ pub async fn put_app_settings(
         || input.opensubtitles_password.is_some();
     if let Some(key) = input.opensubtitles_api_key {
         upsert_or_clear(&state, db::settings::OPENSUBTITLES_API_KEY, key.trim()).await?;
+    }
+    if let Some(key) = input.subdl_api_key {
+        upsert_or_clear(&state, db::settings::SUBDL_API_KEY, key.trim()).await?;
     }
     if let Some(username) = input.opensubtitles_username {
         upsert_or_clear(
