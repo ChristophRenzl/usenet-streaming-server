@@ -15,7 +15,7 @@ use crate::{
     indexer::{self, SearchQuery},
     release::{
         parse::Resolution,
-        rank::{rank, RankedRelease},
+        rank::{rank, sort_candidates, RankedRelease},
         verify,
     },
     state::AppState,
@@ -78,7 +78,7 @@ pub async fn resolve_candidates(
                 },
             };
             (
-                vec![query],
+                (vec![query], Vec::new()),
                 ItemInfo {
                     title: movie.title,
                     year: movie.year,
@@ -86,6 +86,8 @@ pub async fn resolve_candidates(
                     imdb_id: movie.imdb_id,
                     original_language: movie.original_language,
                     absolute_episode: None,
+                    episode_air_year: None,
+                    episode_title: None,
                 },
             )
         }
@@ -95,11 +97,26 @@ pub async fn resolve_candidates(
                 .zip(target.episode)
                 .expect("validated TV target");
             let show = tmdb.tv_details(target.tmdb_id).await?;
-            // `tv_search_queries` already fans out tvsearch + SxxExx + (for
-            // anime) the absolute-episode-number query. The absolute number
-            // is also kept on `ItemInfo` for candidate verification below.
+            // Primary lookup plus quota-guarded fallbacks (SxxExx text and,
+            // for anime, absolute-episode-number queries). The absolute
+            // number is also kept on `ItemInfo` for candidate verification.
             let queries = tv_search_queries(&show, season, episode);
             let absolute = absolute_episode(&show, season, episode);
+            // The episode's TMDB title separates same-name shows (remakes,
+            // spin-offs) when release names carry an episode title, and its
+            // air year keeps air-date-tagged releases of current episodes
+            // from being mistaken for remakes. Optional context: resolution
+            // proceeds without it.
+            let mut episode_title = None;
+            let mut episode_air_year = None;
+            if let Ok(details) = tmdb.episode_details(target.tmdb_id, season, episode).await {
+                episode_air_year = details
+                    .air_date
+                    .as_deref()
+                    .and_then(|d| d.get(0..4))
+                    .and_then(|y| y.parse().ok());
+                episode_title = details.title;
+            }
             (
                 queries,
                 ItemInfo {
@@ -109,27 +126,19 @@ pub async fn resolve_candidates(
                     imdb_id: show.imdb_id,
                     original_language: show.original_language,
                     absolute_episode: absolute,
+                    episode_air_year,
+                    episode_title,
                 },
             )
         }
     };
+    let (primary, fallbacks) = queries;
 
-    let raw = indexer::search_many(&state.http, indexers, &queries).await;
     // Series can carry their own resolution preferences (e.g. 2160p movies
     // but 1080p episodes); rank against the pair effective for this media type.
     let prefs = db::preferences::get(&state.db)
         .await?
         .for_media_type(target.media_type == MediaType::Tv);
-    let mut ranked = rank(
-        raw,
-        &prefs,
-        max_resolution,
-        item.original_language.as_deref(),
-    );
-
-    // Reject candidates that contradict the requested title (wrong show,
-    // wrong year, wrong episode). They stay in the list with a reason so
-    // pickers can show them and a manual guid pin can still override.
     let expected = verify::Expected {
         title: &item.title,
         year: item.year,
@@ -138,16 +147,44 @@ pub async fn resolve_candidates(
         season: target.season,
         episode: target.episode,
         absolute_episode: item.absolute_episode,
+        episode_air_year: item.episode_air_year,
+        episode_title: item.episode_title.as_deref(),
     };
-    for candidate in &mut ranked {
-        if candidate.rejected.is_none() {
-            if let Some(reason) = verify::mismatch_reason(&candidate.raw, &expected) {
-                candidate.rejected = Some(reason);
+
+    // Rank, then reject candidates that contradict the requested title
+    // (wrong show, wrong year, wrong episode) — they stay in the list with a
+    // reason so pickers can show them and a manual guid pin can override —
+    // and apply episode-level score adjustments (episode-title match,
+    // unnumbered recaps/packs) before the final ordering.
+    let process = |raw: Vec<indexer::RawRelease>| -> Vec<RankedRelease> {
+        let mut ranked = rank(
+            raw,
+            &prefs,
+            max_resolution,
+            item.original_language.as_deref(),
+        );
+        for candidate in &mut ranked {
+            if candidate.rejected.is_none() {
+                candidate.rejected = verify::mismatch_reason(&candidate.raw, &expected);
+            }
+            if candidate.rejected.is_none() {
+                candidate.score += verify::score_adjustment(&candidate.raw, &expected);
             }
         }
+        sort_candidates(&mut ranked);
+        ranked
+    };
+
+    let raw = indexer::search_many(&state.http, indexers.clone(), &primary).await;
+    let mut ranked = process(raw);
+
+    if !fallbacks.is_empty() && needs_fallback(&ranked, &prefs, max_resolution) {
+        let more = indexer::search_many(&state.http, indexers, &fallbacks).await;
+        if !more.is_empty() {
+            let combined = indexer::dedupe(ranked.into_iter().map(|c| c.raw).chain(more));
+            ranked = process(combined);
+        }
     }
-    // Stable: keeps rank order within the accepted and rejected groups.
-    ranked.sort_by_key(|c| c.rejected.is_some());
     Ok(ranked)
 }
 
@@ -159,43 +196,92 @@ struct ItemInfo {
     imdb_id: Option<String>,
     original_language: Option<String>,
     absolute_episode: Option<u32>,
+    episode_air_year: Option<i32>,
+    episode_title: Option<String>,
 }
 
-/// Build the set of indexer search strategies for one TV episode. Their
-/// results are merged and deduped downstream, so issuing several is cheap and
-/// only widens coverage:
+/// Build the indexer search strategies for one TV episode, split into the
+/// primary lookup and the fallback batch. Every query burns per-indexer API
+/// quota (real indexers rate-limit and temporarily ban), so the fallbacks
+/// only run when the primary results are sparse — see [`needs_fallback`].
 ///
-/// 1. `tvsearch` by TVDB id + season + episode (when a TVDB id is known) — the
-///    canonical scene-numbered lookup.
-/// 2. A `"{title} SxxExx"` free-text query — always, as a fallback for
-///    indexers that do not index the TVDB mapping.
-/// 3. For **anime only** (original language Japanese), a `"{title} {absolute}"`
-///    free-text query using the *absolute* episode number. Anime is released
-///    and indexed by a running episode count (e.g. `One Piece - 1100`) rather
-///    than `SxxExx`, so scene-numbered lookups return nothing for it. Skipped
-///    when the absolute number cannot be derived from TMDB's season data.
-pub fn tv_search_queries(show: &TvShow, season: u32, episode: u32) -> Vec<SearchQuery> {
-    let mut queries = Vec::new();
-    if let Some(tvdb_id) = show.tvdb_id {
-        queries.push(SearchQuery::TvByTvdb {
-            tvdb_id,
-            season,
-            episode,
-        });
-    }
-    queries.push(SearchQuery::Raw {
+/// Primary: `tvsearch` by TVDB id + season + episode — the canonical
+/// scene-numbered lookup (a `"{title} SxxExx"` free-text query when no TVDB
+/// id is known).
+///
+/// Fallbacks:
+/// 1. The `"{title} SxxExx"` free-text query, for indexers that do not index
+///    the TVDB mapping.
+/// 2. For **anime only** (original language Japanese), `"{title} {absolute}"`
+///    free-text queries using the *absolute* episode number, in plain and
+///    zero-padded forms. Anime is released and indexed by a running episode
+///    count (`One Piece - 1100`, `One Piece - 0036`, `E0629`) rather than
+///    `SxxExx`, so scene-numbered lookups return nothing for it. Skipped when
+///    the absolute number cannot be derived from TMDB's season data.
+pub fn tv_search_queries(
+    show: &TvShow,
+    season: u32,
+    episode: u32,
+) -> (Vec<SearchQuery>, Vec<SearchQuery>) {
+    let text_query = SearchQuery::Raw {
         query: format!("{} S{season:02}E{episode:02}", show.title),
-    });
+    };
+    let (primary, mut fallbacks) = match show.tvdb_id {
+        Some(tvdb_id) => (
+            SearchQuery::TvByTvdb {
+                tvdb_id,
+                season,
+                episode,
+            },
+            vec![text_query],
+        ),
+        None => (text_query, Vec::new()),
+    };
     // Anime is numbered absolutely, not SxxExx. Gate on Japanese original
     // language and require enough season data to compute the running count.
     if show.original_language.as_deref() == Some("ja") {
         if let Some(absolute) = absolute_episode(show, season, episode) {
-            queries.push(SearchQuery::Raw {
-                query: format!("{} {absolute}", show.title),
-            });
+            let mut forms = vec![
+                format!("{absolute}"),
+                format!("{absolute:03}"),
+                format!("{absolute:04}"),
+            ];
+            forms.dedup();
+            for form in forms {
+                fallbacks.push(SearchQuery::Raw {
+                    query: format!("{} {form}", show.title),
+                });
+            }
         }
     }
-    queries
+    (vec![primary], fallbacks)
+}
+
+/// Accepted-candidate count below which the primary search counts as
+/// "sparse" and the fallback queries are worth their indexer API quota.
+const SPARSE_RESULTS_THRESHOLD: usize = 10;
+
+/// Whether to spend quota on the fallback queries: the primary results are
+/// sparse AND none of them delivers the preferred resolution. A rich primary
+/// result without the preferred resolution (say dozens of candidates, all
+/// 1080p, preference 2160p) means the quality simply doesn't exist — more
+/// text queries won't conjure it.
+fn needs_fallback(
+    ranked: &[RankedRelease],
+    prefs: &db::preferences::Preferences,
+    device_cap: Option<Resolution>,
+) -> bool {
+    let mut preferred = prefs.preferred_resolution.min(prefs.max_resolution);
+    if let Some(cap) = device_cap {
+        preferred = preferred.min(cap);
+    }
+    let mut accepted = 0usize;
+    let mut has_preferred = false;
+    for candidate in ranked.iter().filter(|c| c.rejected.is_none()) {
+        accepted += 1;
+        has_preferred |= candidate.parsed.resolution == Some(preferred);
+    }
+    accepted < SPARSE_RESULTS_THRESHOLD && !has_preferred
 }
 
 /// Compute the absolute episode number: the running count across all prior
@@ -379,19 +465,46 @@ mod tests {
     }
 
     #[test]
-    fn anime_show_issues_absolute_number_query() {
+    fn anime_show_issues_absolute_number_fallbacks() {
         let s = show(
             "One Piece",
             "ja",
             vec![season(1, Some(1099)), season(2, Some(50))],
         );
-        let queries = tv_search_queries(&s, 2, 1);
-        // tvsearch + SxxExx + absolute-number ("One Piece 1100").
-        assert_eq!(queries.len(), 3);
-        assert!(matches!(queries[0], SearchQuery::TvByTvdb { .. }));
-        assert!(
-            matches!(&queries[2], SearchQuery::Raw { query } if query == "One Piece 1100"),
-            "queries were: {queries:?}"
+        let (primary, fallbacks) = tv_search_queries(&s, 2, 1);
+        // Primary: tvsearch. Fallbacks: SxxExx + absolute-number forms
+        // ("One Piece 1100" — 4-digit, so no extra padded variants).
+        assert_eq!(primary.len(), 1);
+        assert!(matches!(primary[0], SearchQuery::TvByTvdb { .. }));
+        assert_eq!(fallbacks.len(), 2, "fallbacks were: {fallbacks:?}");
+        assert!(matches!(&fallbacks[0], SearchQuery::Raw { query } if query == "One Piece S02E01"));
+        assert!(matches!(&fallbacks[1], SearchQuery::Raw { query } if query == "One Piece 1100"));
+    }
+
+    #[test]
+    fn anime_absolute_fallbacks_include_zero_padded_forms() {
+        let s = show(
+            "One Piece",
+            "ja",
+            vec![season(1, Some(30)), season(2, Some(50))],
+        );
+        let (_, fallbacks) = tv_search_queries(&s, 2, 6);
+        // Absolute 36: releases carry "36", "036" and "0036" style numbers.
+        let raw: Vec<&str> = fallbacks
+            .iter()
+            .filter_map(|q| match q {
+                SearchQuery::Raw { query } => Some(query.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            raw,
+            [
+                "One Piece S02E06",
+                "One Piece 36",
+                "One Piece 036",
+                "One Piece 0036"
+            ]
         );
     }
 
@@ -402,21 +515,23 @@ mod tests {
             "en",
             vec![season(1, Some(7)), season(2, Some(13))],
         );
-        let queries = tv_search_queries(&s, 2, 1);
-        // tvsearch + SxxExx only; no absolute-number strategy.
-        assert_eq!(queries.len(), 2);
-        assert!(queries
-            .iter()
-            .all(|q| !matches!(q, SearchQuery::Raw { query } if !query.contains('S'))));
+        let (primary, fallbacks) = tv_search_queries(&s, 2, 1);
+        // tvsearch primary + SxxExx fallback only; no absolute strategy.
+        assert_eq!(primary.len(), 1);
+        assert_eq!(fallbacks.len(), 1);
+        assert!(
+            matches!(&fallbacks[0], SearchQuery::Raw { query } if query == "Breaking Bad S02E01")
+        );
     }
 
     #[test]
     fn anime_without_season_data_skips_absolute_query_gracefully() {
         let s = show("Mystery Anime", "ja", vec![]);
-        let queries = tv_search_queries(&s, 1, 1);
+        let (primary, fallbacks) = tv_search_queries(&s, 1, 1);
         // Only tvsearch + SxxExx; absolute skipped since season data is absent.
-        assert_eq!(queries.len(), 2);
-        assert!(!queries
+        assert_eq!(primary.len(), 1);
+        assert_eq!(fallbacks.len(), 1);
+        assert!(!fallbacks
             .iter()
             .any(|q| matches!(q, SearchQuery::Raw { query } if query == "Mystery Anime 1")));
     }

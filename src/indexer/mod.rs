@@ -94,7 +94,7 @@ pub async fn search_many(
 
 /// Drop releases that duplicate an earlier one by guid or by exact title. The
 /// first occurrence (search-strategy order) wins.
-fn dedupe(releases: impl IntoIterator<Item = RawRelease>) -> Vec<RawRelease> {
+pub fn dedupe(releases: impl IntoIterator<Item = RawRelease>) -> Vec<RawRelease> {
     let mut seen_guids = std::collections::HashSet::new();
     let mut seen_titles = std::collections::HashSet::new();
     releases

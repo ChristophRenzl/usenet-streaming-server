@@ -328,12 +328,13 @@ async fn releases_for_anime_issue_absolute_episode_query() {
     assert_eq!(response.status_code(), 200);
     let body: Value = response.json();
     let candidates = body["candidates"].as_array().expect("candidates array");
-    assert!(
-        candidates
-            .iter()
-            .any(|c| c["raw"]["title"] == json!("[Erai-raws] One Piece - 1100 [1080p][HEVC]")),
-        "absolute-named anime release must appear: {candidates:?}"
-    );
+    let erai = candidates
+        .iter()
+        .find(|c| c["raw"]["title"] == json!("[Erai-raws] One Piece - 1100 [1080p][HEVC]"))
+        .unwrap_or_else(|| panic!("absolute-named anime release must appear: {candidates:?}"));
+    // The group-tag prefix must not fail title verification, and the
+    // absolute number matches — the candidate is playable, not just listed.
+    assert_eq!(erai["rejected"], Value::Null, "was: {erai}");
 }
 
 /// A non-anime (English) show must NOT issue the absolute-number query — only
@@ -452,4 +453,100 @@ async fn releases_without_indexers_is_a_bad_request() {
         .await;
     assert_eq!(response.status_code(), 400);
     assert!(response.text().contains("no enabled indexers"));
+}
+
+/// Fallback queries burn indexer API quota, so they must not run when the
+/// primary tvsearch already delivers the preferred resolution — and not when
+/// its results are rich even without it (the quality simply doesn't exist).
+#[tokio::test]
+async fn tv_fallback_queries_are_skipped_when_primary_suffices() {
+    let tmdb = MockServer::start().await;
+    let indexer = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/tv/81797"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 81797,
+            "name": "One Piece",
+            "first_air_date": "1999-10-20",
+            "original_language": "ja",
+            "external_ids": { "tvdb_id": 81797 },
+            "seasons": [
+                { "season_number": 1, "episode_count": 1099 },
+                { "season_number": 2, "episode_count": 50 }
+            ]
+        })))
+        .mount(&tmdb)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/tv/81797/season/2/episode/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "season_number": 2,
+            "episode_number": 1,
+            "name": "A Fierce Battle"
+        })))
+        .mount(&tmdb)
+        .await;
+
+    // The primary tvsearch already delivers an accepted 1080p (the default
+    // preferred resolution).
+    const GOOD_RSS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:newznab="http://www.newznab.com/DTD/2010/feeds/attributes/">
+  <channel>
+    <title>example</title>
+    <item>
+      <title>One.Piece.S02E01.1080p.WEB-DL.x264-GOOD</title>
+      <guid isPermaLink="true">https://indexer.example/details/good</guid>
+      <link>https://indexer.example/getnzb/good.nzb</link>
+      <pubDate>Wed, 03 Jun 2026 12:30:00 +0000</pubDate>
+      <newznab:attr name="size" value="1531838208"/>
+    </item>
+  </channel>
+</rss>"#;
+    Mock::given(method("GET"))
+        .and(path("/api"))
+        .and(query_param("t", "tvsearch"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(GOOD_RSS, "application/rss+xml"))
+        .expect(1)
+        .mount(&indexer)
+        .await;
+    // Any t=search request would be a fallback — there must be none.
+    Mock::given(method("GET"))
+        .and(path("/api"))
+        .and(query_param("t", "search"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&indexer)
+        .await;
+
+    let mut config = AppConfig::default();
+    config.auth.api_key = API_KEY.into();
+    let state = AppState::for_tests(config)
+        .await
+        .expect("test state")
+        .with_tmdb_base_url(&tmdb.uri());
+    let server = TestServer::new(api::router(state));
+
+    let response = server
+        .put("/api/v1/settings/app")
+        .add_header("x-api-key", API_KEY)
+        .json(&json!({ "tmdb_api_key": "tmdb-key" }))
+        .await;
+    assert_eq!(response.status_code(), 200);
+    let response = server
+        .post("/api/v1/settings/indexers")
+        .add_header("x-api-key", API_KEY)
+        .json(&json!({ "name": "mock", "base_url": indexer.uri(), "api_key": "indexer-key" }))
+        .await;
+    assert_eq!(response.status_code(), 200);
+
+    let response = server
+        .get("/api/v1/releases?tmdb_id=81797&type=tv&season=2&episode=1")
+        .add_header("x-api-key", API_KEY)
+        .await;
+    assert_eq!(response.status_code(), 200);
+    let body: Value = response.json();
+    let candidates = body["candidates"].as_array().expect("candidates");
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0]["rejected"], Value::Null);
 }
