@@ -73,6 +73,16 @@ pub struct MediaInfo {
     pub video_range: String,
     /// True when the video is tone-mapped to SDR for an HDR-incapable client.
     pub video_transcoded: bool,
+    /// RFC 6381 `CODECS` value for the master playlist, describing the
+    /// *served* stream (post-transcode). `None` when the codec combination is
+    /// not confidently mappable — the attribute is then omitted.
+    pub master_codecs: Option<String>,
+    /// Served video dimensions for `RESOLUTION` (post-downscale when
+    /// tone-mapping).
+    pub resolution: Option<(i64, i64)>,
+    /// Peak bandwidth (bits/s) for `BANDWIDTH`; `None` falls back to the
+    /// playlist default.
+    pub bandwidth_bps: Option<i64>,
     /// Embedded chapter markers from the probe (empty for most releases).
     pub chapters: Vec<crate::stream::ffprobe::Chapter>,
     /// End (seconds) of the detected intro/opening chapter, for the client's

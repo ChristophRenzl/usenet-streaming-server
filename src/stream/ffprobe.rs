@@ -28,6 +28,14 @@ pub struct ProbeResult {
     /// HLS `VIDEO-RANGE` value derived from the color transfer: `PQ`
     /// (HDR10/DV), `HLG`, or `SDR`.
     pub video_range: String,
+    /// Video profile as ffprobe names it (e.g. "Main 10", "High").
+    pub video_profile: Option<String>,
+    /// Codec level as ffprobe reports it (HEVC: 153 = 5.1; H.264: 41 = 4.1).
+    pub video_level: Option<i64>,
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+    /// Container-level total bitrate in bits/s, when the format reports one.
+    pub bit_rate_bps: Option<i64>,
     /// Embedded chapter markers, in file order. Empty for the vast majority of
     /// releases (most have no chapters). Powers the client's "Skip Intro".
     pub chapters: Vec<Chapter>,
@@ -140,12 +148,17 @@ struct ProbeChapterTags {
 #[derive(Debug, Deserialize)]
 struct ProbeFormat {
     duration: Option<String>,
+    bit_rate: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ProbeStream {
     codec_type: Option<String>,
     codec_name: Option<String>,
+    profile: Option<String>,
+    level: Option<i64>,
+    width: Option<i64>,
+    height: Option<i64>,
     channels: Option<i64>,
     /// Rational frame rate `num/den`, e.g. `24000/1001`. `avg_frame_rate` is
     /// preferred (real average); `r_frame_rate` is the fallback base rate.
@@ -245,13 +258,22 @@ pub async fn probe_url(ffprobe_path: &str, url: &str) -> AppResult<ProbeResult> 
 }
 
 fn parse_probe(doc: ProbeDoc) -> AppResult<ProbeResult> {
-    let duration_secs = doc
+    let (duration_secs, bit_rate_bps) = doc
         .format
-        .and_then(|f| f.duration)
-        .and_then(|d| d.parse::<f64>().ok());
+        .map(|f| {
+            (
+                f.duration.and_then(|d| d.parse::<f64>().ok()),
+                f.bit_rate.and_then(|b| b.parse::<i64>().ok()),
+            )
+        })
+        .unwrap_or((None, None));
 
     let mut has_video = false;
     let mut video_codec = None;
+    let mut video_profile = None;
+    let mut video_level = None;
+    let mut width = None;
+    let mut height = None;
     let mut audio_streams = Vec::new();
     let mut fps = None;
     let mut color_transfer = None;
@@ -260,6 +282,10 @@ fn parse_probe(doc: ProbeDoc) -> AppResult<ProbeResult> {
             Some("video") if !has_video => {
                 has_video = true;
                 video_codec = stream.codec_name.clone();
+                video_profile = stream.profile.clone();
+                video_level = stream.level;
+                width = stream.width;
+                height = stream.height;
                 fps = parse_frame_rate(stream.avg_frame_rate.as_deref())
                     .or_else(|| parse_frame_rate(stream.r_frame_rate.as_deref()));
                 color_transfer = stream.color_transfer.clone();
@@ -309,9 +335,61 @@ fn parse_probe(doc: ProbeDoc) -> AppResult<ProbeResult> {
         audio_streams,
         fps,
         video_range,
+        video_profile,
+        video_level,
+        width,
+        height,
+        bit_rate_bps,
         chapters,
         intro_end_secs,
     })
+}
+
+/// RFC 6381 codec string for the master playlist's `CODECS` attribute.
+///
+/// AVPlayer refuses a variant whose `VIDEO-RANGE` is PQ/HLG unless it can
+/// also validate decoder support from `CODECS` — HDR releases fail with
+/// "unsupported URL" (-1002) without it. `None` when the combination is not
+/// confidently mappable; the playlist then omits the attribute (declaring a
+/// wrong string is worse than declaring none).
+pub fn rfc6381_video_codec(
+    codec: Option<&str>,
+    profile: Option<&str>,
+    level: Option<i64>,
+) -> Option<String> {
+    match codec? {
+        "hevc" => {
+            let level = level?;
+            // Main tier assumed — high-tier releases are vanishingly rare and
+            // a too-low declared tier only makes AVPlayer probe, not reject.
+            match profile? {
+                "Main" => Some(format!("hvc1.1.6.L{level}.B0")),
+                "Main 10" => Some(format!("hvc1.2.4.L{level}.B0")),
+                _ => None,
+            }
+        }
+        "h264" => {
+            let level = level?;
+            let prefix = match profile? {
+                "Baseline" | "Constrained Baseline" => "4240",
+                "Main" => "4D40",
+                "High" => "6400",
+                _ => return None,
+            };
+            Some(format!("avc1.{prefix}{level:02X}"))
+        }
+        _ => None,
+    }
+}
+
+/// RFC 6381 string for the audio half of `CODECS`.
+pub fn rfc6381_audio_codec(codec: Option<&str>) -> Option<String> {
+    match codec? {
+        "aac" => Some("mp4a.40.2".to_string()),
+        "ac3" => Some("ac-3".to_string()),
+        "eac3" => Some("ec-3".to_string()),
+        _ => None,
+    }
 }
 
 /// Find the end of the intro/opening among the chapters: the end time of the
@@ -445,6 +523,60 @@ mod tests {
         .expect("parse");
         let result = parse_probe(doc).expect("probe");
         assert!((result.fps.unwrap() - 25.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rfc6381_strings_cover_apple_playable_codecs() {
+        // UHD BluRay remux: HEVC Main 10 @ L5.1.
+        assert_eq!(
+            rfc6381_video_codec(Some("hevc"), Some("Main 10"), Some(153)).as_deref(),
+            Some("hvc1.2.4.L153.B0")
+        );
+        assert_eq!(
+            rfc6381_video_codec(Some("hevc"), Some("Main"), Some(120)).as_deref(),
+            Some("hvc1.1.6.L120.B0")
+        );
+        // 1080p web rip: H.264 High @ 4.1 (41 = 0x29).
+        assert_eq!(
+            rfc6381_video_codec(Some("h264"), Some("High"), Some(41)).as_deref(),
+            Some("avc1.640029")
+        );
+        assert_eq!(
+            rfc6381_video_codec(Some("h264"), Some("Main"), Some(40)).as_deref(),
+            Some("avc1.4D4028")
+        );
+        // Unknown combinations stay unmapped rather than guessed.
+        assert_eq!(rfc6381_video_codec(Some("hevc"), Some("Main 10"), None), None);
+        assert_eq!(rfc6381_video_codec(Some("av1"), Some("Main"), Some(8)), None);
+        assert_eq!(rfc6381_video_codec(None, Some("High"), Some(41)), None);
+
+        assert_eq!(rfc6381_audio_codec(Some("aac")).as_deref(), Some("mp4a.40.2"));
+        assert_eq!(rfc6381_audio_codec(Some("ac3")).as_deref(), Some("ac-3"));
+        assert_eq!(rfc6381_audio_codec(Some("eac3")).as_deref(), Some("ec-3"));
+        assert_eq!(rfc6381_audio_codec(Some("truehd")), None);
+        assert_eq!(rfc6381_audio_codec(None), None);
+    }
+
+    #[test]
+    fn probe_captures_codec_parameters_for_master_playlist() {
+        let doc: ProbeDoc = serde_json::from_str(
+            r#"{
+                "streams": [{
+                    "codec_type": "video", "codec_name": "hevc",
+                    "profile": "Main 10", "level": 153,
+                    "width": 3840, "height": 2160,
+                    "color_transfer": "smpte2084"
+                }],
+                "format": {"duration": "6519.776", "bit_rate": "73744240"}
+            }"#,
+        )
+        .expect("parse");
+        let probe = parse_probe(doc).expect("probe");
+        assert_eq!(probe.video_profile.as_deref(), Some("Main 10"));
+        assert_eq!(probe.video_level, Some(153));
+        assert_eq!(probe.width, Some(3840));
+        assert_eq!(probe.height, Some(2160));
+        assert_eq!(probe.bit_rate_bps, Some(73_744_240));
     }
 
     #[test]

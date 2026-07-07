@@ -1063,6 +1063,47 @@ async fn probe_and_spawn(
     // AVPlayer refuses PQ/HLG variants outright on SDR-only outputs, so HDR
     // sources are tone-mapped for clients that declare no HDR support.
     let video_transcoded = !supports_hdr && probe.video_range != "SDR";
+    // Master-playlist facts describe the *served* stream. Tone-mapping
+    // re-encodes with libx264 (High profile, ≤1920 wide, 12M maxrate); copy
+    // mode passes the probed parameters through.
+    let served_video_codec = if video_transcoded {
+        // High@L4.1 covers the ≤1080p output; a declared level above the
+        // actual one is harmless (level support is backwards-compatible).
+        Some("avc1.640029".to_string())
+    } else {
+        ffprobe::rfc6381_video_codec(
+            probe.video_codec.as_deref(),
+            probe.video_profile.as_deref(),
+            probe.video_level,
+        )
+    };
+    let served_audio_codec = if audio_transcoded {
+        Some("mp4a.40.2".to_string())
+    } else {
+        ffprobe::rfc6381_audio_codec(audio_codec.as_deref())
+    };
+    let master_codecs = match (served_video_codec, served_audio_codec) {
+        (Some(v), Some(a)) => Some(format!("{v},{a}")),
+        _ => None,
+    };
+    let resolution = match (probe.width, probe.height) {
+        (Some(w), Some(h)) if w > 0 && h > 0 => {
+            if video_transcoded && w > 1920 {
+                // Mirror the tonemap filter's `scale=min(iw,1920):-2`.
+                Some((1920, (h * 1920 / w) / 2 * 2))
+            } else {
+                Some((w, h))
+            }
+        }
+        _ => None,
+    };
+    let bandwidth_bps = if video_transcoded {
+        // 12M video maxrate plus audio headroom.
+        Some(14_000_000)
+    } else {
+        // Remuxes burst above the container average; pad by 25%.
+        probe.bit_rate_bps.map(|b| b + b / 4)
+    };
     session.set_info(MediaInfo {
         duration_secs: probe.duration_secs,
         video_codec: probe.video_codec.clone(),
@@ -1076,6 +1117,9 @@ async fn probe_and_spawn(
             probe.video_range
         },
         video_transcoded,
+        master_codecs,
+        resolution,
+        bandwidth_bps,
         chapters: probe.chapters,
         intro_end_secs: probe.intro_end_secs,
     });
@@ -1318,12 +1362,17 @@ pub async fn master_playlist(
     // advertises any attached external subtitle renditions; the ?apikey=
     // suffix is re-embedded into every URI so header-less players keep auth.
     let info = session.info();
-    let video_range = if info.video_range.is_empty() {
-        "SDR"
-    } else {
-        &info.video_range
+    let variant = subtitles::hls::MasterVariant {
+        bandwidth_bps: info.bandwidth_bps,
+        codecs: info.master_codecs.clone(),
+        resolution: info.resolution,
+        video_range: if info.video_range.is_empty() {
+            "SDR".to_string()
+        } else {
+            info.video_range.clone()
+        },
     };
-    let master = subtitles::master_playlist(&session.subtitle_tracks(), video_range);
+    let master = subtitles::master_playlist(&session.subtitle_tracks(), &variant);
     let master = playlist_with_suffix(&master, &auth.uri_suffix());
     Ok(([(header::CONTENT_TYPE, PLAYLIST_CONTENT_TYPE)], master).into_response())
 }

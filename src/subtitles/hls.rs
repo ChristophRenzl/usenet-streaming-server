@@ -63,12 +63,29 @@ pub fn subtitle_media_playlist(vtt_name: &str, duration_secs: Option<f64>) -> St
     )
 }
 
+/// Variant-level facts for the single `#EXT-X-STREAM-INF` row.
+#[derive(Debug, Clone, Default)]
+pub struct MasterVariant {
+    /// Peak bandwidth in bits/s; `None` falls back to a generous default.
+    pub bandwidth_bps: Option<i64>,
+    /// RFC 6381 `CODECS` value; omitted when unknown.
+    pub codecs: Option<String>,
+    /// Served video dimensions for `RESOLUTION`; omitted when unknown.
+    pub resolution: Option<(i64, i64)>,
+    /// `SDR`, `PQ` or `HLG`.
+    pub video_range: String,
+}
+
+/// `BANDWIDTH` fallback when the probe reported no bitrate. Generous on
+/// purpose: an underestimate makes AVPlayer buffer too little for remuxes.
+const DEFAULT_BANDWIDTH_BPS: i64 = 20_000_000;
+
 /// Render the HLS master playlist for a session with `tracks` subtitle
 /// renditions. Mirrors the inline master in `api::stream` (single video
 /// variant pointing at `media.m3u8`) but adds `#EXT-X-MEDIA:TYPE=SUBTITLES`
 /// rows and a `SUBTITLES="subs"` attribute on the variant when any track
 /// exists.
-pub fn master_playlist(tracks: &[SubtitleTrack], video_range: &str) -> String {
+pub fn master_playlist(tracks: &[SubtitleTrack], variant: &MasterVariant) -> String {
     let mut out = String::from("#EXTM3U\n#EXT-X-VERSION:7\n");
 
     for track in tracks {
@@ -84,11 +101,22 @@ pub fn master_playlist(tracks: &[SubtitleTrack], video_range: &str) -> String {
         ));
     }
 
+    out.push_str(&format!(
+        "#EXT-X-STREAM-INF:BANDWIDTH={}",
+        variant.bandwidth_bps.unwrap_or(DEFAULT_BANDWIDTH_BPS)
+    ));
+    // CODECS matters beyond bookkeeping: AVPlayer refuses PQ/HLG variants it
+    // cannot validate decoder support for, so HDR streams fail with
+    // "unsupported URL" (-1002) when the attribute is missing.
+    if let Some(codecs) = &variant.codecs {
+        out.push_str(&format!(",CODECS=\"{}\"", escape_attr(codecs)));
+    }
+    if let Some((w, h)) = variant.resolution {
+        out.push_str(&format!(",RESOLUTION={w}x{h}"));
+    }
     // VIDEO-RANGE is required: AVPlayer assumes SDR when it is absent and then
     // rejects the stream once the format description turns out to be PQ/HLG.
-    out.push_str(&format!(
-        "#EXT-X-STREAM-INF:BANDWIDTH=20000000,VIDEO-RANGE={video_range}"
-    ));
+    out.push_str(&format!(",VIDEO-RANGE={}", variant.video_range));
     if !tracks.is_empty() {
         out.push_str(&format!(",SUBTITLES=\"{SUBTITLE_GROUP}\""));
     }
@@ -139,9 +167,16 @@ mod tests {
         assert!(pl.contains("sub_en_1.vtt"));
     }
 
+    fn variant(video_range: &str) -> MasterVariant {
+        MasterVariant {
+            video_range: video_range.to_string(),
+            ..MasterVariant::default()
+        }
+    }
+
     #[test]
     fn master_without_tracks_matches_plain_variant() {
-        let master = master_playlist(&[], "SDR");
+        let master = master_playlist(&[], &variant("SDR"));
         assert!(
             master.contains("#EXT-X-STREAM-INF:BANDWIDTH=20000000,VIDEO-RANGE=SDR\nmedia.m3u8\n")
         );
@@ -150,7 +185,7 @@ mod tests {
 
     #[test]
     fn master_with_tracks_adds_media_and_variant_attribute() {
-        let master = master_playlist(&[track("en", 1, true), track("de", 1, false)], "PQ");
+        let master = master_playlist(&[track("en", 1, true), track("de", 1, false)], &variant("PQ"));
         assert!(master.contains(
             "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"English\",LANGUAGE=\"en\""
         ));
@@ -160,5 +195,23 @@ mod tests {
         assert!(master.contains("VIDEO-RANGE=PQ"));
         assert!(master
             .contains("#EXT-X-STREAM-INF:BANDWIDTH=20000000,VIDEO-RANGE=PQ,SUBTITLES=\"subs\""));
+    }
+
+    #[test]
+    fn master_declares_codecs_resolution_and_measured_bandwidth() {
+        let master = master_playlist(
+            &[],
+            &MasterVariant {
+                bandwidth_bps: Some(80_000_000),
+                codecs: Some("hvc1.2.4.L153.B0,mp4a.40.2".to_string()),
+                resolution: Some((3840, 2160)),
+                video_range: "PQ".to_string(),
+            },
+        );
+        assert!(master.contains(
+            "#EXT-X-STREAM-INF:BANDWIDTH=80000000,\
+             CODECS=\"hvc1.2.4.L153.B0,mp4a.40.2\",\
+             RESOLUTION=3840x2160,VIDEO-RANGE=PQ\nmedia.m3u8\n"
+        ));
     }
 }
