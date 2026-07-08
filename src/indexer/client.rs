@@ -243,6 +243,9 @@ fn parse_rss(body: &str, indexer: &Indexer) -> AppResult<Vec<RawRelease>> {
                         .to_string()
                 })
                 .filter(|v| !v.is_empty() && v.chars().all(|c| c.is_ascii_digit()));
+            let file_count = attr("files")
+                .and_then(|v| v.parse().ok())
+                .filter(|count| *count > 0);
             Some(RawRelease {
                 title,
                 guid,
@@ -253,6 +256,7 @@ fn parse_rss(body: &str, indexer: &Indexer) -> AppResult<Vec<RawRelease>> {
                 indexer_name: indexer.name.clone(),
                 tvdb_id,
                 imdb_id,
+                file_count,
             })
         })
         .collect();
