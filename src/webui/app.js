@@ -145,6 +145,7 @@ const routes = {
   tmdb: renderTmdb,
   opensubtitles: renderOpensubtitles,
   preferences: renderPreferences,
+  users: renderUsers,
   downloads: renderDownloads,
   security: renderSecurity,
 };
@@ -947,6 +948,135 @@ async function renderDownloads(main) {
 }
 
 // ---- Security -------------------------------------------------------------------------
+
+async function renderUsers(main) {
+  const users = await api("/users");
+
+  const rows = users
+    .map((u) => {
+      const role = u.is_admin
+        ? '<span class="chip ok">admin</span>'
+        : '<span class="chip">user</span>';
+      const owner = u.id === 1 ? '<span class="chip">owner</span>' : "";
+      const passwordState = u.has_password
+        ? ""
+        : '<span class="chip">no password set</span>';
+      const actions =
+        u.id === 1
+          ? `<button class="btn small" data-pw="${u.id}" data-name="${esc(u.name)}">Set password</button>`
+          : `<button class="btn small" data-pw="${u.id}" data-name="${esc(u.name)}">Set password</button>
+             <button class="btn small danger" data-del="${u.id}" data-name="${esc(u.name)}">Delete</button>`;
+      return `<tr>
+        <td>${esc(u.name)} ${owner}</td>
+        <td>${role} ${passwordState}</td>
+        <td class="actions">${actions}</td>
+      </tr>`;
+    })
+    .join("");
+
+  main.innerHTML = `
+    ${pageHead(
+      "Users",
+      "Accounts that can sign in on the web and mobile apps. Each user has their own watch history and watchlist; the API key always acts as the owner.",
+      '<button class="btn primary" id="add-user">Add user</button>',
+    )}
+    <div class="card">
+      <table>
+        <thead><tr><th>Name</th><th>Role</th><th></th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+    <div class="notice" style="margin-top:18px;max-width:640px">
+      The <strong>owner</strong> (first account) is what the server API key and
+      the Apple TV/iPad apps authenticate as — it cannot be deleted. Give it a
+      password too if you want to sign into the web app by name instead of with
+      the API key.
+    </div>`;
+
+  $("#add-user").addEventListener("click", () => {
+    const modal = openModal(`
+      <h2>Add user</h2>
+      <form id="user-form">
+        <div class="field">
+          <label>Username</label>
+          <input name="username" required autocomplete="off" placeholder="e.g. anna">
+        </div>
+        <div class="field">
+          <label>Password (at least 4 characters)</label>
+          <input name="password" type="password" required minlength="4" autocomplete="new-password">
+        </div>
+        <label class="checkbox"><input type="checkbox" name="is_admin"> Administrator (can manage users)</label>
+        <div class="form-actions">
+          <button type="button" class="btn" id="cancel-user">Cancel</button>
+          <button type="submit" class="btn primary">Create</button>
+        </div>
+      </form>`);
+    $("#cancel-user", modal).addEventListener("click", closeModal);
+    $("#user-form", modal).addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const form = e.target;
+      try {
+        await api("/users", {
+          method: "POST",
+          body: JSON.stringify({
+            username: form.username.value.trim(),
+            password: form.password.value,
+            is_admin: form.is_admin.checked,
+          }),
+        });
+        closeModal();
+        toast("User created.", "success");
+        navigate();
+      } catch (err) {
+        toast(err.message);
+      }
+    });
+  });
+
+  main.querySelectorAll("[data-del]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      if (!confirmDelete(`user "${btn.dataset.name}" and their watch data`)) return;
+      try {
+        await api(`/users/${btn.dataset.del}`, { method: "DELETE" });
+        toast("User deleted.", "success");
+        navigate();
+      } catch (err) {
+        toast(err.message);
+      }
+    });
+  });
+
+  main.querySelectorAll("[data-pw]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const modal = openModal(`
+        <h2>Set password for ${esc(btn.dataset.name)}</h2>
+        <form id="pw-form">
+          <div class="field">
+            <label>New password (at least 4 characters)</label>
+            <input name="password" type="password" required minlength="4" autocomplete="new-password">
+          </div>
+          <div class="form-actions">
+            <button type="button" class="btn" id="cancel-pw">Cancel</button>
+            <button type="submit" class="btn primary">Set password</button>
+          </div>
+        </form>`);
+      $("#cancel-pw", modal).addEventListener("click", closeModal);
+      $("#pw-form", modal).addEventListener("submit", async (e) => {
+        e.preventDefault();
+        try {
+          await api(`/users/${btn.dataset.pw}/password`, {
+            method: "PUT",
+            body: JSON.stringify({ password: e.target.password.value }),
+          });
+          closeModal();
+          toast("Password updated.", "success");
+        } catch (err) {
+          toast(err.message);
+        }
+      });
+    });
+  });
+}
 
 async function renderSecurity(main) {
   const app = await api("/settings/app");
