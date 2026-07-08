@@ -346,7 +346,7 @@ async fn current_app_settings(state: &AppState) -> AppResult<AppSettings> {
     let subdl_key = db::settings::get(&state.db, db::settings::SUBDL_API_KEY)
         .await?
         .filter(|k| !k.is_empty());
-    let subtitle_provider_order = crate::api::subtitles::subtitle_provider_order(&state).await;
+    let subtitle_provider_order = crate::api::subtitles::subtitle_provider_order(state).await;
     let opensubtitles_username = db::settings::get(&state.db, db::settings::OPENSUBTITLES_USERNAME)
         .await?
         .filter(|u| !u.is_empty());
