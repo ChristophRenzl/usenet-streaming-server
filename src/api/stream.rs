@@ -389,20 +389,41 @@ pub async fn create_session(
     // Scan deeper for a directly-streamable release before considering repair:
     // never fall back to download-and-repair while a clean release still exists
     // further down the ranked list.
-    let to_try = pick_candidates(
+    let mut to_try = pick_candidates(
         &candidates,
         request.release_guid.as_deref(),
         last_release.as_deref(),
         MAX_STREAMABLE_SCAN,
     )?;
 
+    // Packaging preference: pre-grab the top NZBs concurrently (the chosen
+    // one is needed anyway) and move a genuinely *unpacked* release ahead of
+    // near-tied RAR sets — an unpacked post skips the per-volume header walk
+    // and starts streaming seconds faster. The newznab `files` attribute is
+    // too unreliable across indexers for this; only the NZB itself tells the
+    // truth. A manual guid pin and the last-watched front-load are never
+    // reordered.
+    let mut pregrabbed = pregrab_candidates(&state, &to_try).await;
+    timer.mark("nzb_pregrab");
+    if request.release_guid.is_none()
+        && last_release.as_deref() != Some(to_try[0].raw.title.as_str())
+    {
+        reorder_by_packaging(&mut to_try, &pregrabbed);
+    }
+
     let mut failures: Vec<String> = Vec::new();
     // Remember the first repairable candidate (in rank order) as the fallback.
     let mut best_repairable: Option<(RankedRelease, Nzb, MainContent)> = None;
 
     for candidate in to_try {
-        // Grab + assess this candidate once.
-        let (assessment, nzb, main) = match assess_candidate(&state, &candidate, &mut timer).await {
+        // Grab (reusing the pre-grab when it succeeded) + assess this
+        // candidate once.
+        let grabbed = pregrabbed.remove(&candidate.raw.guid);
+        let (assessment, nzb, main) = match assess_candidate(
+            &state, &candidate, grabbed, &mut timer,
+        )
+        .await
+        {
             Ok(triple) => triple,
             Err(error) => {
                 tracing::warn!(release = %candidate.raw.title, %error, "candidate assessment failed, trying next");
@@ -951,15 +972,87 @@ pub(crate) async fn fetch_healthy_release(
     Ok((nzb, main))
 }
 
-/// Grab a candidate and run the full repairability assessment. Returns the
-/// verdict together with the parsed NZB and main content so the caller can
-/// reuse them (to stream or to start a repair job) without a second grab.
+/// How many top candidates get their NZB pre-grabbed concurrently at session
+/// start, to learn their real packaging (plain file vs RAR set) before
+/// committing to one. NZBs are small; the extra grabs are the only cost.
+const PREGRAB_CANDIDATES: usize = 3;
+/// Candidates scoring within this band of the front-runner count as
+/// near-tied: an unpacked one among them is preferred over RAR sets. The
+/// band sits below every meaningful quality signal in ranking (resolution
+/// 300+/tier, source 100/step, codec 150-300), so a genuinely better release
+/// is never displaced by a merely faster-starting one.
+const PACKAGING_SCORE_BAND: i64 = 150;
+
+/// Concurrently grab + parse the NZBs of the first [`PREGRAB_CANDIDATES`]
+/// candidates, keyed by guid. Failures are logged and skipped — the main
+/// loop re-grabs (and properly records) them when their turn comes.
+async fn pregrab_candidates(
+    state: &AppState,
+    to_try: &[RankedRelease],
+) -> std::collections::HashMap<String, (Nzb, MainContent)> {
+    let grabs = to_try.iter().take(PREGRAB_CANDIDATES).map(|candidate| {
+        let state = state.clone();
+        let candidate = candidate.clone();
+        async move {
+            match grab_and_select(&state, &candidate).await {
+                Ok(pair) => Some((candidate.raw.guid.clone(), pair)),
+                Err(error) => {
+                    tracing::debug!(release = %candidate.raw.title, %error, "NZB pre-grab failed");
+                    None
+                }
+            }
+        }
+    });
+    futures::future::join_all(grabs)
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+/// Stable-reorder the pre-grabbed head of the candidate list so unpacked
+/// releases within [`PACKAGING_SCORE_BAND`] of the front-runner come before
+/// RAR sets. Everything else (unknown packaging, out-of-band scores, the
+/// tail beyond the pre-grab window) keeps its rank order.
+fn reorder_by_packaging(
+    to_try: &mut [RankedRelease],
+    pregrabbed: &std::collections::HashMap<String, (Nzb, MainContent)>,
+) {
+    let Some(top_score) = to_try.first().map(|c| c.score) else {
+        return;
+    };
+    let head = to_try.len().min(PREGRAB_CANDIDATES);
+    let preferred = |candidate: &RankedRelease| {
+        matches!(
+            pregrabbed.get(&candidate.raw.guid),
+            Some((_, MainContent::Plain(_)))
+        ) && top_score - candidate.score <= PACKAGING_SCORE_BAND
+    };
+    if let Some(first) = to_try[..head].iter().find(|c| preferred(c)) {
+        if !preferred(&to_try[0]) {
+            tracing::info!(
+                release = %first.raw.title,
+                "preferring unpacked release over near-tied RAR set"
+            );
+        }
+    }
+    to_try[..head].sort_by_key(|candidate| !preferred(candidate));
+}
+
+/// Grab a candidate (unless `grabbed` already carries its pre-grabbed NZB)
+/// and run the full repairability assessment. Returns the verdict together
+/// with the parsed NZB and main content so the caller can reuse them (to
+/// stream or to start a repair job) without a second grab.
 async fn assess_candidate(
     state: &AppState,
     candidate: &RankedRelease,
+    grabbed: Option<(Nzb, MainContent)>,
     timer: &mut StageTimer,
 ) -> AppResult<(RepairAssessment, Nzb, MainContent)> {
-    let (nzb, main) = grab_and_select(state, candidate).await?;
+    let (nzb, main) = match grabbed {
+        Some(pair) => pair,
+        None => grab_and_select(state, candidate).await?,
+    };
     timer.mark("nzb_grab");
     let assessment = assess_release(&nzb, &main, &state.nntp_pool, HEALTH_SAMPLE).await?;
     timer.mark("health_check");
@@ -1346,6 +1439,7 @@ fn synthesized_release(download: &db::downloads::Download) -> RankedRelease {
         indexer_name: "local download".into(),
         tvdb_id: None,
         imdb_id: None,
+        file_count: None,
     };
     let parsed = parse_release_name(&raw.title);
     RankedRelease {
@@ -2606,6 +2700,89 @@ mod tests {
         // The detached task may still be running; give it a moment to fail.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert_eq!(session.intro_end_secs(), None);
+    }
+
+    #[test]
+    fn packaging_reorder_prefers_unpacked_within_band() {
+        use crate::nzb::NzbFileRef;
+        use crate::release::parse::parse_release_name;
+
+        fn candidate(title: &str, score: i64) -> RankedRelease {
+            let raw = RawRelease {
+                title: title.into(),
+                guid: format!("guid-{title}"),
+                nzb_url: format!("https://x/{title}.nzb"),
+                size_bytes: None,
+                posted_at: None,
+                indexer_id: 1,
+                indexer_name: "test".into(),
+                tvdb_id: None,
+                imdb_id: None,
+                file_count: None,
+            };
+            let parsed = parse_release_name(&raw.title);
+            RankedRelease {
+                raw,
+                parsed,
+                score,
+                rejected: None,
+            }
+        }
+        fn plain() -> (Nzb, MainContent) {
+            (
+                Nzb { files: Vec::new() },
+                MainContent::Plain(NzbFileRef {
+                    index: 0,
+                    file_name: "movie.mkv".into(),
+                    bytes: 1,
+                }),
+            )
+        }
+        fn rar() -> (Nzb, MainContent) {
+            (Nzb { files: Vec::new() }, MainContent::RarSet(Vec::new()))
+        }
+
+        // An unpacked release within the band moves ahead of RAR sets.
+        let mut to_try = vec![
+            candidate("Rar.Top", 1850),
+            candidate("Plain.Second", 1850),
+            candidate("Rar.Third", 1800),
+            candidate("Plain.Tail.Not.Pregrabbed", 1799),
+        ];
+        let pregrabbed = std::collections::HashMap::from([
+            ("guid-Rar.Top".to_string(), rar()),
+            ("guid-Plain.Second".to_string(), plain()),
+            ("guid-Rar.Third".to_string(), rar()),
+        ]);
+        reorder_by_packaging(&mut to_try, &pregrabbed);
+        let titles: Vec<&str> = to_try.iter().map(|c| c.raw.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            [
+                "Plain.Second",
+                "Rar.Top",
+                "Rar.Third",
+                "Plain.Tail.Not.Pregrabbed"
+            ]
+        );
+
+        // Out of the score band, packaging never displaces a better release.
+        let mut to_try = vec![
+            candidate("Rar.Much.Better", 2000),
+            candidate("Plain.Much.Worse", 1700),
+        ];
+        let pregrabbed = std::collections::HashMap::from([
+            ("guid-Rar.Much.Better".to_string(), rar()),
+            ("guid-Plain.Much.Worse".to_string(), plain()),
+        ]);
+        reorder_by_packaging(&mut to_try, &pregrabbed);
+        assert_eq!(to_try[0].raw.title, "Rar.Much.Better");
+
+        // Unknown packaging (pre-grab failed) keeps rank order.
+        let mut to_try = vec![candidate("Rar.Top", 1850), candidate("Unknown", 1850)];
+        let pregrabbed = std::collections::HashMap::from([("guid-Rar.Top".to_string(), rar())]);
+        reorder_by_packaging(&mut to_try, &pregrabbed);
+        assert_eq!(to_try[0].raw.title, "Rar.Top");
     }
 
     #[test]

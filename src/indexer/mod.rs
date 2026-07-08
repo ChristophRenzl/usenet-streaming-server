@@ -26,6 +26,11 @@ pub struct RawRelease {
     /// IMDb id the indexer reports (`newznab:attr imdbid`), digits only
     /// without the `tt` prefix or leading zeros.
     pub imdb_id: Option<String>,
+    /// Number of files in the post (`newznab:attr files`), when the indexer
+    /// reports it. A packaging signal: an unpacked post is the media file
+    /// plus a par2 set (≲20 files) while a RAR set is dozens to hundreds —
+    /// unpacked releases start streaming seconds faster (no volume walk).
+    pub file_count: Option<u32>,
 }
 
 /// What to ask the indexers for.
@@ -118,6 +123,7 @@ mod tests {
             indexer_name: "test".into(),
             tvdb_id: None,
             imdb_id: None,
+            file_count: None,
         }
     }
 
