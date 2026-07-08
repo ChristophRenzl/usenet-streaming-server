@@ -20,6 +20,8 @@ sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "migrate", "chr
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls", "webpki-roots", "http2", "stream"] }
 # SubDL delivers subtitles as ZIP archives.
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# Password hashing for user accounts.
+argon2 = "0.5"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 quick-xml = { version = "0.41", features = ["serialize"] }

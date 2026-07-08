@@ -65,6 +65,7 @@ impl DiskStack {
         let media = DiskFile::open(&path).await.expect("disk file");
         let session = Session::create(
             NewSession {
+                user_id: 1,
                 media: Arc::new(media),
                 tmdb_id: 1,
                 media_type: MediaType::Movie,

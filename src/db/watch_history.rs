@@ -73,12 +73,17 @@ pub struct PositionUpdate<'a> {
 /// table's UNIQUE index contains nullable season/episode columns and SQLite
 /// treats NULLs as distinct in unique indexes, so `ON CONFLICT` would never
 /// fire for movies.
-pub async fn record_session_start(pool: &SqlitePool, start: &SessionStart<'_>) -> AppResult<f64> {
+pub async fn record_session_start(
+    pool: &SqlitePool,
+    user_id: i64,
+    start: &SessionStart<'_>,
+) -> AppResult<f64> {
     let existing: Option<(i64, f64)> = sqlx::query_as(
         "SELECT id, position_secs FROM watch_history
-         WHERE user_id = 1 AND tmdb_id = ? AND media_type = ?
+         WHERE user_id = ? AND tmdb_id = ? AND media_type = ?
            AND season IS ? AND episode IS ?",
     )
+    .bind(user_id)
     .bind(start.tmdb_id)
     .bind(start.media_type)
     .bind(start.season)
@@ -121,8 +126,9 @@ pub async fn record_session_start(pool: &SqlitePool, start: &SessionStart<'_>) -
                      (user_id, tmdb_id, media_type, season, episode, release_title,
                       indexer_id, nzb_url, duration_secs, title, poster_url,
                       backdrop_url, episode_title, still_url)
-                 VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
+            .bind(user_id)
             .bind(start.tmdb_id)
             .bind(start.media_type)
             .bind(start.season)
@@ -144,25 +150,27 @@ pub async fn record_session_start(pool: &SqlitePool, start: &SessionStart<'_>) -
 }
 
 /// All history rows, most recently watched first.
-pub async fn list(pool: &SqlitePool) -> AppResult<Vec<HistoryEntry>> {
+pub async fn list(pool: &SqlitePool, user_id: i64) -> AppResult<Vec<HistoryEntry>> {
     Ok(sqlx::query_as(
         "SELECT id, tmdb_id, media_type, season, episode, release_title,
                 position_secs, duration_secs, watched_at,
                 title, poster_url, backdrop_url, episode_title, still_url
-         FROM watch_history WHERE user_id = 1
+         FROM watch_history WHERE user_id = ?
          ORDER BY watched_at DESC, id DESC",
     )
+    .bind(user_id)
     .fetch_all(pool)
     .await?)
 }
 
-pub async fn get(pool: &SqlitePool, id: i64) -> AppResult<Option<HistoryEntry>> {
+pub async fn get(pool: &SqlitePool, user_id: i64, id: i64) -> AppResult<Option<HistoryEntry>> {
     Ok(sqlx::query_as(
         "SELECT id, tmdb_id, media_type, season, episode, release_title,
                 position_secs, duration_secs, watched_at,
                 title, poster_url, backdrop_url, episode_title, still_url
-         FROM watch_history WHERE user_id = 1 AND id = ?",
+         FROM watch_history WHERE user_id = ? AND id = ?",
     )
+    .bind(user_id)
     .bind(id)
     .fetch_optional(pool)
     .await?)
@@ -173,13 +181,15 @@ pub async fn get(pool: &SqlitePool, id: i64) -> AppResult<Option<HistoryEntry>> 
 /// stored row.
 pub async fn upsert_position(
     pool: &SqlitePool,
+    user_id: i64,
     update: &PositionUpdate<'_>,
 ) -> AppResult<HistoryEntry> {
     let existing: Option<(i64,)> = sqlx::query_as(
         "SELECT id FROM watch_history
-         WHERE user_id = 1 AND tmdb_id = ? AND media_type = ?
+         WHERE user_id = ? AND tmdb_id = ? AND media_type = ?
            AND season IS ? AND episode IS ?",
     )
+    .bind(user_id)
     .bind(update.tmdb_id)
     .bind(update.media_type)
     .bind(update.season)
@@ -205,8 +215,9 @@ pub async fn upsert_position(
         None => sqlx::query(
             "INSERT INTO watch_history
                  (user_id, tmdb_id, media_type, season, episode, position_secs, duration_secs)
-             VALUES (1, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
+        .bind(user_id)
         .bind(update.tmdb_id)
         .bind(update.media_type)
         .bind(update.season)
@@ -217,7 +228,7 @@ pub async fn upsert_position(
         .await?
         .last_insert_rowid(),
     };
-    get(pool, id)
+    get(pool, user_id, id)
         .await?
         .ok_or_else(|| crate::error::AppError::Internal(anyhow::anyhow!("row vanished on upsert")))
 }
@@ -231,6 +242,7 @@ pub async fn upsert_position(
 /// ordering reflects when it was actually watched — not when it synced.
 pub async fn mark_watched_remote(
     pool: &SqlitePool,
+    user_id: i64,
     tmdb_id: i64,
     media_type: &str,
     season: Option<u32>,
@@ -249,9 +261,10 @@ pub async fn mark_watched_remote(
 
     let existing: Option<(i64, f64, Option<f64>)> = sqlx::query_as(
         "SELECT id, position_secs, duration_secs FROM watch_history
-         WHERE user_id = 1 AND tmdb_id = ? AND media_type = ?
+         WHERE user_id = ? AND tmdb_id = ? AND media_type = ?
            AND season IS ? AND episode IS ?",
     )
+    .bind(user_id)
     .bind(tmdb_id)
     .bind(media_type)
     .bind(season)
@@ -283,8 +296,9 @@ pub async fn mark_watched_remote(
                 "INSERT INTO watch_history
                      (user_id, tmdb_id, media_type, season, episode,
                       position_secs, duration_secs, watched_at)
-                 VALUES (1, ?, ?, ?, ?, 1.0, 1.0, COALESCE(?, datetime('now')))",
+                 VALUES (?, ?, ?, ?, ?, 1.0, 1.0, COALESCE(?, datetime('now')))",
             )
+            .bind(user_id)
             .bind(tmdb_id)
             .bind(media_type)
             .bind(season)
@@ -298,8 +312,9 @@ pub async fn mark_watched_remote(
 }
 
 /// Delete one history row. Returns false when the id is unknown.
-pub async fn delete(pool: &SqlitePool, id: i64) -> AppResult<bool> {
-    let result = sqlx::query("DELETE FROM watch_history WHERE user_id = 1 AND id = ?")
+pub async fn delete(pool: &SqlitePool, user_id: i64, id: i64) -> AppResult<bool> {
+    let result = sqlx::query("DELETE FROM watch_history WHERE user_id = ? AND id = ?")
+        .bind(user_id)
         .bind(id)
         .execute(pool)
         .await?;
@@ -310,6 +325,7 @@ pub async fn delete(pool: &SqlitePool, id: i64) -> AppResult<bool> {
 /// prefer the release the user actually watched when auto-selecting.
 pub async fn last_release_title(
     pool: &SqlitePool,
+    user_id: i64,
     tmdb_id: i64,
     media_type: &str,
     season: Option<u32>,
@@ -317,9 +333,10 @@ pub async fn last_release_title(
 ) -> AppResult<Option<String>> {
     let row: Option<(Option<String>,)> = sqlx::query_as(
         "SELECT release_title FROM watch_history
-         WHERE user_id = 1 AND tmdb_id = ? AND media_type = ?
+         WHERE user_id = ? AND tmdb_id = ? AND media_type = ?
            AND season IS ? AND episode IS ?",
     )
+    .bind(user_id)
     .bind(tmdb_id)
     .bind(media_type)
     .bind(season)
@@ -332,6 +349,7 @@ pub async fn last_release_title(
 /// Stored resume position for an item, when any.
 pub async fn position_secs(
     pool: &SqlitePool,
+    user_id: i64,
     tmdb_id: i64,
     media_type: &str,
     season: Option<u32>,
@@ -339,9 +357,10 @@ pub async fn position_secs(
 ) -> AppResult<Option<f64>> {
     let row: Option<(f64,)> = sqlx::query_as(
         "SELECT position_secs FROM watch_history
-         WHERE user_id = 1 AND tmdb_id = ? AND media_type = ?
+         WHERE user_id = ? AND tmdb_id = ? AND media_type = ?
            AND season IS ? AND episode IS ?",
     )
+    .bind(user_id)
     .bind(tmdb_id)
     .bind(media_type)
     .bind(season)
@@ -377,7 +396,7 @@ mod tests {
                 ..Default::default()
             },
         };
-        assert_eq!(record_session_start(&pool, &start).await.unwrap(), 0.0);
+        assert_eq!(record_session_start(&pool, 1, &start).await.unwrap(), 0.0);
 
         // Simulate progress written by the (future) history endpoint.
         sqlx::query("UPDATE watch_history SET position_secs = 33.5 WHERE tmdb_id = 42")
@@ -392,7 +411,7 @@ mod tests {
             meta: MediaMeta::default(),
             ..start
         };
-        assert_eq!(record_session_start(&pool, &again).await.unwrap(), 33.5);
+        assert_eq!(record_session_start(&pool, 1, &again).await.unwrap(), 33.5);
         let (count, title): (i64, String) = sqlx::query_as(
             "SELECT COUNT(*), MAX(release_title) FROM watch_history WHERE tmdb_id = 42",
         )
@@ -402,7 +421,7 @@ mod tests {
         assert_eq!(count, 1);
         assert_eq!(title, "Second.Release");
 
-        let entry = &list(&pool).await.unwrap()[0];
+        let entry = &list(&pool, 1).await.unwrap()[0];
         assert_eq!(entry.title.as_deref(), Some("The Movie"));
         assert_eq!(
             entry.backdrop_url.as_deref(),
@@ -410,25 +429,27 @@ mod tests {
         );
 
         assert_eq!(
-            last_release_title(&pool, 42, "movie", None, None)
+            last_release_title(&pool, 1, 42, "movie", None, None)
                 .await
                 .unwrap()
                 .as_deref(),
             Some("Second.Release")
         );
         assert_eq!(
-            last_release_title(&pool, 42, "tv", None, None)
+            last_release_title(&pool, 1, 42, "tv", None, None)
                 .await
                 .unwrap(),
             None
         );
 
         assert_eq!(
-            position_secs(&pool, 42, "movie", None, None).await.unwrap(),
+            position_secs(&pool, 1, 42, "movie", None, None)
+                .await
+                .unwrap(),
             Some(33.5)
         );
         assert_eq!(
-            position_secs(&pool, 42, "tv", None, None).await.unwrap(),
+            position_secs(&pool, 1, 42, "tv", None, None).await.unwrap(),
             None
         );
     }
@@ -444,13 +465,14 @@ mod tests {
             position_secs: 120.0,
             duration_secs: Some(3600.0),
         };
-        let entry = upsert_position(&pool, &movie).await.unwrap();
+        let entry = upsert_position(&pool, 1, &movie).await.unwrap();
         assert_eq!(entry.position_secs, 120.0);
         assert_eq!(entry.duration_secs, Some(3600.0));
 
         // Second update moves the position but must not erase the duration.
         let entry = upsert_position(
             &pool,
+            1,
             &PositionUpdate {
                 position_secs: 240.0,
                 duration_secs: None,
@@ -465,6 +487,7 @@ mod tests {
         // TV rows with NULL-different keys stay separate.
         upsert_position(
             &pool,
+            1,
             &PositionUpdate {
                 tmdb_id: 42,
                 media_type: "tv",
@@ -477,15 +500,15 @@ mod tests {
         .await
         .unwrap();
 
-        let all = list(&pool).await.unwrap();
+        let all = list(&pool, 1).await.unwrap();
         assert_eq!(all.len(), 2);
         // Same watched_at second is possible; the id tiebreaker puts the
         // newer row first.
         assert_eq!(all[0].media_type, "tv");
 
-        assert!(delete(&pool, entry.id).await.unwrap());
-        assert!(!delete(&pool, entry.id).await.unwrap());
-        assert_eq!(list(&pool).await.unwrap().len(), 1);
+        assert!(delete(&pool, 1, entry.id).await.unwrap());
+        assert!(!delete(&pool, 1, entry.id).await.unwrap());
+        assert_eq!(list(&pool, 1).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -503,7 +526,7 @@ mod tests {
                 duration_secs: None,
                 meta: MediaMeta::default(),
             };
-            record_session_start(&pool, &start).await.unwrap();
+            record_session_start(&pool, 1, &start).await.unwrap();
         }
         let (count,): (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM watch_history WHERE tmdb_id = 7")

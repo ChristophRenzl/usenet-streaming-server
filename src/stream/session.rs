@@ -97,6 +97,8 @@ pub struct MediaInfo {
 /// Everything needed to register a new session.
 pub struct NewSession {
     pub media: Arc<dyn VirtualFile>,
+    /// The user this session plays for; history rows land on their account.
+    pub user_id: i64,
     pub tmdb_id: i64,
     pub media_type: MediaType,
     pub season: Option<u32>,
@@ -115,6 +117,8 @@ pub struct Session {
     /// Per-session secret guarding the internal loopback VFS route.
     pub token: String,
     pub media: Arc<dyn VirtualFile>,
+    /// The user this session plays for.
+    pub user_id: i64,
     pub tmdb_id: i64,
     pub media_type: MediaType,
     pub season: Option<u32>,
@@ -191,6 +195,7 @@ impl Session {
             id,
             token,
             media: params.media,
+            user_id: params.user_id,
             tmdb_id: params.tmdb_id,
             media_type: params.media_type,
             season: params.season,
@@ -572,6 +577,7 @@ mod tests {
         Session::create(
             NewSession {
                 media: Arc::new(NullFile),
+                user_id: 1,
                 tmdb_id: 1,
                 media_type: MediaType::Movie,
                 season: None,

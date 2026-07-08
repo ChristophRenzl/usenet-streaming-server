@@ -9,6 +9,7 @@ pub mod stream;
 pub mod subtitles;
 pub mod system;
 pub mod trakt;
+pub mod users;
 pub mod watchlist;
 pub mod webui;
 
@@ -81,6 +82,7 @@ pub fn router(state: AppState) -> Router {
         .merge(history::router())
         .merge(settings::router())
         .merge(trakt::router())
+        .merge(users::router())
         .split_for_parts();
 
     let api_router = api_router.layer(middleware::from_fn_with_state(
@@ -94,6 +96,8 @@ pub fn router(state: AppState) -> Router {
         .merge(webui::router())
         .merge(SwaggerUi::new("/docs").url("/api-docs/openapi.json", api))
         .route("/health", axum::routing::get(system::health))
+        // Login is the one API call that cannot require existing auth.
+        .route("/auth/login", axum::routing::post(auth::login))
         // Loopback-only virtual-file access for ffmpeg/ffprobe. Deliberately
         // outside /api/v1 (its own token guard) and outside the OpenAPI doc.
         .route(
@@ -101,6 +105,10 @@ pub fn router(state: AppState) -> Router {
             axum::routing::get(internal::serve_vfs),
         )
         .nest("/api/v1", api_router)
+        // Browser clients (the web app) live on another origin; this is a
+        // LAN-hosted personal server, so a permissive policy is fine — auth
+        // still gates everything.
+        .layer(tower_http::cors::CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
