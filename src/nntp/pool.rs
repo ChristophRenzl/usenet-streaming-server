@@ -223,6 +223,13 @@ async fn run_on_slot(
                 // pooled; retry with a fresh one. Fresh-connection failures
                 // are real errors.
                 if from_idle && stale_retries <= 3 {
+                    // Idle checkout is LIFO, so the one that just failed was
+                    // the *most recently* pooled — every other idle
+                    // connection has been idle longer and is almost
+                    // certainly dead too. Drop them all so this retry (and
+                    // concurrent checkouts) reconnect fresh instead of
+                    // burning the retry budget popping corpses one by one.
+                    slot.idle.lock().expect("pool lock").clear();
                     continue;
                 }
                 return Err(e);

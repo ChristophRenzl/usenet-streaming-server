@@ -15,6 +15,11 @@ use super::session::{Session, SessionState};
 /// Audio codecs HLS.js/AVPlayer play back without transcoding.
 const COPYABLE_AUDIO: &[&str] = &["aac", "ac3", "eac3"];
 
+/// Dolby codecs that need a licensed decoder: real Apple devices have one,
+/// but the tvOS/iOS *simulator* (and some web players) do not. Clients
+/// declare `supports_dolby_audio: false` to have these transcoded to AAC.
+const DOLBY_AUDIO: &[&str] = &["ac3", "eac3"];
+
 /// Nominal HLS segment length. The synthetic VOD playlist, ffmpeg's
 /// `-hls_time`, the forced keyframe cadence and the segment-index ↔ time
 /// mapping must all agree on this.
@@ -27,12 +32,51 @@ const TONEMAP_TO_SDR_FILTER: &str = "scale=min(iw\\,1920):-2:flags=bilinear,\
     zscale=t=linear:npl=100,tonemap=hable:desat=0,\
     zscale=p=bt709:t=bt709:m=bt709:r=tv,format=yuv420p";
 
+/// Degraded HDR→SDR for ffmpeg builds without libzimg (no `zscale`, so no
+/// proper linear-light tonemap): swscale converts the BT.2020 matrix to
+/// BT.709 but cannot undo the PQ/HLG transfer, so the image is playable but
+/// flat/washed out. Still strictly better than failing the session — AVPlayer
+/// rejects PQ/HLG outright on SDR-only outputs.
+const TONEMAP_TO_SDR_FILTER_FALLBACK: &str = "scale=min(iw\\,1920):-2:flags=bilinear\
+    :in_color_matrix=bt2020:out_color_matrix=bt709,format=yuv420p";
+
+/// Whether this ffmpeg binary has a filter (cached per path — the check
+/// spawns `ffmpeg -filters` once).
+async fn has_filter(ffmpeg_path: &str, name: &str) -> bool {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+    static CACHE: LazyLock<Mutex<HashMap<String, bool>>> = LazyLock::new(Mutex::default);
+
+    let key = format!("{ffmpeg_path}\x00{name}");
+    if let Some(&known) = CACHE.lock().expect("filter cache lock").get(&key) {
+        return known;
+    }
+    let listed = tokio::process::Command::new(ffmpeg_path)
+        .args(["-hide_banner", "-filters"])
+        .output()
+        .await
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                // Filter lines look like ` .S. zscale  V->V  ...`: flags, name.
+                .lines()
+                .any(|line| line.split_whitespace().nth(1) == Some(name))
+        })
+        .unwrap_or(false);
+    CACHE.lock().expect("filter cache lock").insert(key, listed);
+    listed
+}
+
 /// Whether the source audio must be transcoded to AAC. `None` (no audio
-/// stream) needs no transcoding.
-pub fn should_transcode_audio(codec: Option<&str>) -> bool {
+/// stream) needs no transcoding. With `dolby_ok = false`, AC3/E-AC3 are
+/// transcoded too (players without a Dolby decoder).
+pub fn should_transcode_audio(codec: Option<&str>, dolby_ok: bool) -> bool {
     match codec {
         None => false,
-        Some(codec) => !COPYABLE_AUDIO.contains(&codec.to_ascii_lowercase().as_str()),
+        Some(codec) => {
+            let codec = codec.to_ascii_lowercase();
+            !COPYABLE_AUDIO.contains(&codec.as_str())
+                || (!dolby_ok && DOLBY_AUDIO.contains(&codec.as_str()))
+        }
     }
 }
 
@@ -65,7 +109,20 @@ pub struct SpawnOptions<'a> {
 /// it.
 pub async fn spawn_hls(session: &Arc<Session>, options: SpawnOptions<'_>) -> AppResult<()> {
     let dir = &session.temp_dir;
-    let mut cmd = build_command(&options, dir);
+    let tonemap_filter = if options.tonemap_to_sdr {
+        if has_filter(options.ffmpeg_path, "zscale").await {
+            TONEMAP_TO_SDR_FILTER
+        } else {
+            tracing::warn!(
+                session = %session.id,
+                "ffmpeg lacks zscale (libzimg); using degraded matrix-only HDR→SDR conversion"
+            );
+            TONEMAP_TO_SDR_FILTER_FALLBACK
+        }
+    } else {
+        TONEMAP_TO_SDR_FILTER
+    };
+    let mut cmd = build_command(&options, dir, tonemap_filter);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -89,7 +146,11 @@ pub async fn spawn_hls(session: &Arc<Session>, options: SpawnOptions<'_>) -> App
 
 /// The full ffmpeg invocation for [`spawn_hls`] (separate so tests can
 /// inspect the argument list without spawning anything).
-fn build_command(options: &SpawnOptions<'_>, dir: &Path) -> tokio::process::Command {
+fn build_command(
+    options: &SpawnOptions<'_>,
+    dir: &Path,
+    tonemap_filter: &str,
+) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(options.ffmpeg_path);
     cmd.args(["-nostdin", "-y", "-seekable", "1"]);
     if options.start_secs > 0.0 {
@@ -100,7 +161,7 @@ fn build_command(options: &SpawnOptions<'_>, dir: &Path) -> tokio::process::Comm
     cmd.arg("-map")
         .arg(format!("0:a:{}?", options.audio_stream_index));
     if options.tonemap_to_sdr {
-        cmd.args(["-vf", TONEMAP_TO_SDR_FILTER]);
+        cmd.args(["-vf", tonemap_filter]);
         cmd.args(["-c:v", "libx264", "-preset", "veryfast", "-crf", "21"]);
         cmd.args(["-maxrate", "12M", "-bufsize", "24M"]);
         // x264 keyframes must land on the segment cadence or the hls muxer
@@ -172,19 +233,33 @@ fn build_command(options: &SpawnOptions<'_>, dir: &Path) -> tokio::process::Comm
     cmd
 }
 
-/// Flip Starting -> Ready as soon as the media playlist appears.
+/// Flip Starting -> Ready as soon as the session is playable.
+///
+/// With a known duration the client plays from the synthetic VOD playlist and
+/// segments are pumped on demand as ffmpeg writes them — the session is
+/// usable as soon as `init.mp4` exists, which is 1-2s before the first full
+/// media segment lands in ffmpeg's own playlist. Sources without a probed
+/// duration are served ffmpeg's playlist directly and keep waiting for it.
 async fn watch_ready(session: Arc<Session>, generation: u64) {
     let playlist = session.playlist_path();
+    let init = session.temp_dir.join("init.mp4");
+    let synthetic_vod = session
+        .info()
+        .duration_secs
+        .filter(|duration| *duration > 0.0)
+        .is_some();
     loop {
         if session.generation() != generation || !matches!(session.state(), SessionState::Starting)
         {
             return;
         }
-        if tokio::fs::try_exists(&playlist).await.unwrap_or(false) {
+        let ready = tokio::fs::try_exists(&playlist).await.unwrap_or(false)
+            || (synthetic_vod && tokio::fs::try_exists(&init).await.unwrap_or(false));
+        if ready {
             session.mark_ready(generation);
             return;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -254,18 +329,23 @@ mod tests {
 
     #[test]
     fn audio_transcode_decision() {
-        assert!(!should_transcode_audio(None));
-        assert!(!should_transcode_audio(Some("aac")));
-        assert!(!should_transcode_audio(Some("AC3")));
-        assert!(!should_transcode_audio(Some("eac3")));
-        assert!(should_transcode_audio(Some("dts")));
-        assert!(should_transcode_audio(Some("truehd")));
-        assert!(should_transcode_audio(Some("flac")));
-        assert!(should_transcode_audio(Some("mp3")));
+        assert!(!should_transcode_audio(None, true));
+        assert!(!should_transcode_audio(Some("aac"), true));
+        assert!(!should_transcode_audio(Some("AC3"), true));
+        assert!(!should_transcode_audio(Some("eac3"), true));
+        assert!(should_transcode_audio(Some("dts"), true));
+        assert!(should_transcode_audio(Some("truehd"), true));
+        assert!(should_transcode_audio(Some("flac"), true));
+        assert!(should_transcode_audio(Some("mp3"), true));
+        // No Dolby decoder: AC3/E-AC3 get transcoded, AAC still copies.
+        assert!(should_transcode_audio(Some("ac3"), false));
+        assert!(should_transcode_audio(Some("EAC3"), false));
+        assert!(!should_transcode_audio(Some("aac"), false));
+        assert!(!should_transcode_audio(None, false));
     }
 
     fn args(options: &SpawnOptions<'_>) -> Vec<String> {
-        build_command(options, Path::new("/tmp/session"))
+        build_command(options, Path::new("/tmp/session"), TONEMAP_TO_SDR_FILTER)
             .as_std()
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
