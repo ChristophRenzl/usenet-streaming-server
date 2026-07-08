@@ -210,6 +210,13 @@ fn record_meta(inner: &Inner, idx: usize, seg: &CachedSegment) {
     };
 }
 
+/// Sentinel error a contended prefetch resolves its single-flight cache slot
+/// with. The cache shares in-flight results with every concurrent waiter, so
+/// a *demand* read racing a skipped prefetch of the same segment can be
+/// handed this error — it must retry with a real fetch instead of failing
+/// the read (which would fail a session start or a mid-stream request).
+const PREFETCH_SKIPPED: &str = "prefetch skipped";
+
 /// Demand fetch: waits for a pool connection, falls back across providers,
 /// maps a missing article to `AppError::MissingSegment`.
 async fn fetch_decoded(
@@ -217,17 +224,28 @@ async fn fetch_decoded(
     cache: &SegmentCache,
     message_id: &str,
 ) -> AppResult<CachedSegment> {
-    let pool = pool.clone();
-    let id = message_id.to_string();
-    cache
-        .get_or_fetch(message_id, async move {
-            let raw = pool.fetch_body(&id).await.map_err(|e| match e {
-                NntpError::ArticleNotFound => AppError::MissingSegment(id.clone()),
-                other => AppError::Upstream(format!("NNTP fetch of <{id}> failed: {other}")),
-            })?;
-            decode_segment(&raw)
-        })
-        .await
+    // Bounded retry for the prefetch-skip race (see PREFETCH_SKIPPED): the
+    // sentinel is never cached, so the retry performs the real fetch.
+    for _ in 0..3 {
+        let pool = pool.clone();
+        let id = message_id.to_string();
+        let result = cache
+            .get_or_fetch(message_id, async move {
+                let raw = pool.fetch_body(&id).await.map_err(|e| match e {
+                    NntpError::ArticleNotFound => AppError::MissingSegment(id.clone()),
+                    other => AppError::Upstream(format!("NNTP fetch of <{id}> failed: {other}")),
+                })?;
+                decode_segment(&raw)
+            })
+            .await;
+        match result {
+            Err(AppError::Upstream(message)) if message.contains(PREFETCH_SKIPPED) => continue,
+            other => return other,
+        }
+    }
+    Err(AppError::Upstream(format!(
+        "fetch of <{message_id}> kept losing the race against skipped prefetches"
+    )))
 }
 
 /// Prefetch: skips instead of waiting when the pool is contended; errors are
@@ -244,9 +262,10 @@ async fn prefetch(inner: &Arc<Inner>, idx: usize) {
         .get_or_fetch(&message_id, async move {
             match pool.try_fetch_body(&id).await {
                 Some(raw) => decode_segment(&raw),
-                // Not cached (moka does not cache errors), so a later demand
-                // read fetches for real.
-                None => Err(AppError::Upstream("prefetch skipped".into())),
+                // Not cached (errors are never cached), so a later demand
+                // read fetches for real; a concurrent demand read sharing
+                // this in-flight slot retries on the sentinel.
+                None => Err(AppError::Upstream(PREFETCH_SKIPPED.into())),
             }
         })
         .await;

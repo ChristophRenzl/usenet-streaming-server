@@ -56,6 +56,55 @@ const HEALTH_SAMPLE: usize = 10;
 
 const PLAYLIST_CONTENT_TYPE: &str = "application/vnd.apple.mpegurl";
 
+// ---- Session-start stage timings ---------------------------------------------
+
+/// One timed stage of session startup, surfaced in the session response so
+/// clients (and the live benchmark) can see where the press-play latency
+/// actually went. Stages appear in execution order; a stage repeats when a
+/// candidate failed and the next one was tried.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct StageTiming {
+    /// Stage name (`resolve_candidates`, `nzb_grab`, `health_check`,
+    /// `open_source`, `tmdb_lookup`, `ffprobe`, `ffmpeg_spawn`,
+    /// `subtitle_attach_wait`, ...).
+    pub stage: String,
+    /// Wall-clock milliseconds spent in this stage.
+    pub ms: u64,
+}
+
+/// Records wall-clock time between marks. Every `mark` closes the stage that
+/// started at the previous mark (or at construction).
+struct StageTimer {
+    started: std::time::Instant,
+    last: std::time::Instant,
+    stages: Vec<StageTiming>,
+}
+
+impl StageTimer {
+    fn new() -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            started: now,
+            last: now,
+            stages: Vec::new(),
+        }
+    }
+
+    /// Close the current stage under `name` and start the next one.
+    fn mark(&mut self, name: &str) {
+        let now = std::time::Instant::now();
+        self.stages.push(StageTiming {
+            stage: name.to_string(),
+            ms: now.duration_since(self.last).as_millis() as u64,
+        });
+        self.last = now;
+    }
+
+    fn total_ms(&self) -> u64 {
+        self.started.elapsed().as_millis() as u64
+    }
+}
+
 static SEGMENT_NAME: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(init\.mp4|seg_\d+\.m4s)$").expect("segment regex"));
 
@@ -82,6 +131,16 @@ static EMBEDDED_SUB_WINDOW: LazyLock<Regex> = LazyLock::new(|| {
 const VTT_CONTENT_TYPE: &str = "text/vtt";
 
 // ---- Session creation -------------------------------------------------------
+
+/// Client playback capabilities declared on session creation, defaulting to
+/// fully capable (real Apple devices).
+#[derive(Debug, Clone, Copy)]
+struct ClientCapabilities {
+    /// Can render PQ/HLG; `false` tone-maps HDR sources to SDR.
+    supports_hdr: bool,
+    /// Has a Dolby (AC-3/E-AC3) decoder; `false` transcodes those to AAC.
+    supports_dolby_audio: bool,
+}
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateSessionRequest {
@@ -120,6 +179,11 @@ pub struct CreateSessionRequest {
     /// HDR sources are tone-mapped to 1080p SDR H.264 instead of
     /// stream-copied. Absent means HDR-capable.
     pub supports_hdr: Option<bool>,
+    /// Whether the player has a Dolby (AC-3/E-AC3) decoder. Real Apple
+    /// devices do; the tvOS/iOS simulator and some web players do not. When
+    /// `false`, AC-3/E-AC3 audio is transcoded to AAC instead of copied.
+    /// Absent means Dolby-capable.
+    pub supports_dolby_audio: Option<bool>,
     /// When `true`, ignore the stored blocked terms so pre-release/low-quality
     /// rips (CAM/TS/…) are candidates — the "allow pre-release" retry for a
     /// brand-new title with no proper release yet.
@@ -139,6 +203,8 @@ pub struct CreateSessionResponse {
     pub audio_codec: Option<String>,
     /// True when the audio is transcoded to AAC for HLS.
     pub audio_transcoded: bool,
+    /// True when the video is tone-mapped to SDR for this session.
+    pub video_transcoded: bool,
     /// Container extension of the media file (`mkv`, `mp4`, ...).
     pub container: String,
     pub chosen_release: RankedRelease,
@@ -160,6 +226,11 @@ pub struct CreateSessionResponse {
     /// Embedded chapter markers from the probe, in file order. Empty when the
     /// release has no chapters.
     pub chapters: Vec<ChapterInfo>,
+    /// Wall-clock breakdown of session startup, in execution order. A stage
+    /// repeats when a failed candidate forced a retry with the next one.
+    pub timings: Vec<StageTiming>,
+    /// Total wall-clock milliseconds from request receipt to response.
+    pub total_startup_ms: u64,
 }
 
 /// A media chapter marker surfaced to the client.
@@ -236,14 +307,18 @@ pub async fn create_session(
 ) -> AppResult<SessionOrRepair> {
     // Requested subtitle languages (best-effort auto-attach after start).
     let subtitle_languages = request.subtitle_languages.clone().unwrap_or_default();
-    let supports_hdr = request.supports_hdr.unwrap_or(true);
+    let capabilities = ClientCapabilities {
+        supports_hdr: request.supports_hdr.unwrap_or(true),
+        supports_dolby_audio: request.supports_dolby_audio.unwrap_or(true),
+    };
+    let mut timer = StageTimer::new();
 
     // Direct playback of one specific finished download.
     if let Some(download_id) = request.download_id {
         let download = db::downloads::get(&state.db, &download_id.to_string())
             .await?
             .ok_or_else(|| AppError::NotFound(format!("download {download_id}")))?;
-        return start_disk_session(&state, &download, &subtitle_languages, supports_hdr)
+        return start_disk_session(&state, &download, &subtitle_languages, capabilities, timer)
             .await
             .map(|s| SessionOrRepair::Session(Box::new(s)));
     }
@@ -280,9 +355,15 @@ pub async fn create_session(
                 continue;
             }
             if tokio::fs::try_exists(path).await.unwrap_or(false) {
-                return start_disk_session(&state, &download, &subtitle_languages, supports_hdr)
-                    .await
-                    .map(|s| SessionOrRepair::Session(Box::new(s)));
+                return start_disk_session(
+                    &state,
+                    &download,
+                    &subtitle_languages,
+                    capabilities,
+                    timer,
+                )
+                .await
+                .map(|s| SessionOrRepair::Session(Box::new(s)));
             }
         }
     }
@@ -294,6 +375,7 @@ pub async fn create_session(
         request.ignore_blocked_terms,
     )
     .await?;
+    timer.mark("resolve_candidates");
     // Prefer the release this item was last watched with, so resuming from
     // history continues in the exact same release when it is still available.
     let last_release = db::watch_history::last_release_title(
@@ -320,7 +402,7 @@ pub async fn create_session(
 
     for candidate in to_try {
         // Grab + assess this candidate once.
-        let (assessment, nzb, main) = match assess_candidate(&state, &candidate).await {
+        let (assessment, nzb, main) = match assess_candidate(&state, &candidate, &mut timer).await {
             Ok(triple) => triple,
             Err(error) => {
                 tracing::warn!(release = %candidate.raw.title, %error, "candidate assessment failed, trying next");
@@ -337,14 +419,15 @@ pub async fn create_session(
                     &candidate,
                     nzb,
                     main,
-                    supports_hdr,
+                    capabilities,
                     &subtitle_languages,
+                    &mut timer,
                 )
                 .await
                 {
                     Ok(session) => {
                         return Ok(SessionOrRepair::Session(Box::new(session_response(
-                            &session, candidate, candidates, "nntp",
+                            &session, candidate, candidates, "nntp", &timer,
                         ))));
                     }
                     Err(error) => {
@@ -428,6 +511,7 @@ fn session_response(
     chosen_release: RankedRelease,
     candidates: Vec<RankedRelease>,
     source: &str,
+    timer: &StageTimer,
 ) -> CreateSessionResponse {
     let info = session.info();
     CreateSessionResponse {
@@ -438,6 +522,7 @@ fn session_response(
         video_codec: info.video_codec,
         audio_codec: info.audio_codec,
         audio_transcoded: info.audio_transcoded,
+        video_transcoded: info.video_transcoded,
         container: session.container.clone(),
         chosen_release,
         candidates,
@@ -455,6 +540,8 @@ fn session_response(
             .iter()
             .map(ChapterInfo::from_chapter)
             .collect(),
+        timings: timer.stages.clone(),
+        total_startup_ms: timer.total_ms(),
     }
 }
 
@@ -870,9 +957,12 @@ pub(crate) async fn fetch_healthy_release(
 async fn assess_candidate(
     state: &AppState,
     candidate: &RankedRelease,
+    timer: &mut StageTimer,
 ) -> AppResult<(RepairAssessment, Nzb, MainContent)> {
     let (nzb, main) = grab_and_select(state, candidate).await?;
+    timer.mark("nzb_grab");
     let assessment = assess_release(&nzb, &main, &state.nntp_pool, HEALTH_SAMPLE).await?;
+    timer.mark("health_check");
     Ok((assessment, nzb, main))
 }
 
@@ -984,8 +1074,9 @@ async fn start_streamable_session(
     candidate: &RankedRelease,
     nzb: Nzb,
     main: MainContent,
-    supports_hdr: bool,
+    capabilities: ClientCapabilities,
     subtitle_languages: &[String],
+    timer: &mut StageTimer,
 ) -> AppResult<Arc<Session>> {
     let source = open_media_source(
         &nzb,
@@ -995,6 +1086,7 @@ async fn start_streamable_session(
         state.config.streaming.readahead_segments,
     )
     .await?;
+    timer.mark("open_source");
 
     let resume_position_secs = db::watch_history::position_secs(
         &state.db,
@@ -1021,6 +1113,7 @@ async fn start_streamable_session(
     )
     .await?;
     state.sessions.insert(session.clone());
+    timer.mark("session_setup");
 
     let lookup = fetch_media_lookup(
         state,
@@ -1034,6 +1127,7 @@ async fn start_streamable_session(
         &db::preferences::get(&state.db).await?.language,
         lookup.original_language.as_deref(),
     );
+    timer.mark("tmdb_lookup");
 
     // From here on, clean up the registered session on failure. The subtitle
     // prefetch (moviehash reads + OpenSubtitles) only touches the virtual
@@ -1054,9 +1148,10 @@ async fn start_streamable_session(
     match probe_and_spawn(
         state,
         &session,
-        supports_hdr,
+        capabilities,
         &audio_language,
         subtitle_languages,
+        Some(timer),
     )
     .await
     {
@@ -1068,6 +1163,7 @@ async fn start_streamable_session(
         }
     }
     attach_prefetched_subtitles(&session, prefetch.await.unwrap_or_default()).await;
+    timer.mark("subtitle_attach_wait");
 
     // Best-effort intro detection (chapters first, then audio fingerprint):
     // applies a cached season intro immediately, else fingerprints in the
@@ -1089,6 +1185,7 @@ async fn start_streamable_session(
         },
     )
     .await?;
+    timer.mark("finalize");
 
     // Best-effort Trakt scrobble; a Trakt problem never affects playback.
     super::trakt::spawn_scrobble(state, &session, crate::trakt::ScrobbleAction::Start);
@@ -1102,7 +1199,8 @@ async fn start_disk_session(
     state: &AppState,
     download: &db::downloads::Download,
     subtitle_languages: &[String],
-    supports_hdr: bool,
+    capabilities: ClientCapabilities,
+    mut timer: StageTimer,
 ) -> AppResult<CreateSessionResponse> {
     if download.status != "complete" {
         return Err(AppError::BadRequest(format!(
@@ -1161,12 +1259,14 @@ async fn start_disk_session(
     )
     .await?;
     state.sessions.insert(session.clone());
+    timer.mark("session_setup");
 
     let lookup = fetch_media_lookup(state, download.tmdb_id, media_type, season, episode).await;
     let audio_language = preferred_audio_language(
         &db::preferences::get(&state.db).await?.language,
         lookup.original_language.as_deref(),
     );
+    timer.mark("tmdb_lookup");
 
     // Subtitle prefetch overlaps the probe/ffmpeg spawn, as in the NNTP path.
     let prefetch = tokio::spawn(prefetch_subtitles(
@@ -1182,9 +1282,10 @@ async fn start_disk_session(
     match probe_and_spawn(
         state,
         &session,
-        supports_hdr,
+        capabilities,
         &audio_language,
         subtitle_languages,
+        Some(&mut timer),
     )
     .await
     {
@@ -1196,6 +1297,7 @@ async fn start_disk_session(
         }
     }
     attach_prefetched_subtitles(&session, prefetch.await.unwrap_or_default()).await;
+    timer.mark("subtitle_attach_wait");
 
     // Best-effort intro detection, as for the streaming path (no-op for movies
     // or when a chapter intro was already found).
@@ -1217,6 +1319,8 @@ async fn start_disk_session(
     )
     .await?;
 
+    timer.mark("finalize");
+
     // Best-effort Trakt scrobble; a Trakt problem never affects playback.
     super::trakt::spawn_scrobble(state, &session, crate::trakt::ScrobbleAction::Start);
 
@@ -1225,6 +1329,7 @@ async fn start_disk_session(
         synthesized_release(download),
         Vec::new(),
         "disk",
+        &timer,
     ))
 }
 
@@ -1261,12 +1366,16 @@ fn loopback_url(state: &AppState, session: &Session) -> String {
 async fn probe_and_spawn(
     state: &AppState,
     session: &Arc<Session>,
-    supports_hdr: bool,
+    capabilities: ClientCapabilities,
     audio_language: &str,
     subtitle_languages: &[String],
+    mut timer: Option<&mut StageTimer>,
 ) -> AppResult<()> {
     let url = loopback_url(state, session);
     let probe = ffprobe::probe_url(&state.config.streaming.ffprobe_path, &url).await?;
+    if let Some(timer) = timer.as_deref_mut() {
+        timer.mark("ffprobe");
+    }
     // Serve the audio stream matching the preferred language — dual-language
     // releases put the dub first, so stream 0 is often the wrong track.
     let audio_stream_index =
@@ -1281,10 +1390,11 @@ async fn probe_and_spawn(
             "selected non-first audio stream by language preference"
         );
     }
-    let audio_transcoded = ffmpeg::should_transcode_audio(audio_codec.as_deref());
+    let audio_transcoded =
+        ffmpeg::should_transcode_audio(audio_codec.as_deref(), capabilities.supports_dolby_audio);
     // AVPlayer refuses PQ/HLG variants outright on SDR-only outputs, so HDR
     // sources are tone-mapped for clients that declare no HDR support.
-    let video_transcoded = !supports_hdr && probe.video_range != "SDR";
+    let video_transcoded = !capabilities.supports_hdr && probe.video_range != "SDR";
     // Master-playlist facts describe the *served* stream. Tone-mapping
     // re-encodes with libx264 (High profile, ≤1920 wide, 12M maxrate); copy
     // mode passes the probed parameters through.
@@ -1373,6 +1483,9 @@ async fn probe_and_spawn(
         },
     )
     .await?;
+    if let Some(timer) = timer {
+        timer.mark("ffmpeg_spawn");
+    }
     register_embedded_subtitle_tracks(session, &embedded_subtitles).await;
     Ok(())
 }
@@ -1909,10 +2022,24 @@ async fn pump_segment(
                 // the lowest outstanding request may restart; everyone
                 // above waits for the sweep to reach them — otherwise the
                 // burst degenerates into restarts wiping each other.
+                //
+                // Restart damping: while a fresh ffmpeg has produced nothing
+                // yet (empty window), hold restarts for 3s so a startup
+                // burst can never wipe its own spawn. Once output exists, a
+                // short 1s damper is enough — an out-of-window minimum
+                // request then means the user really scrubbed somewhere
+                // else, and every extra damping second is felt as "seeking
+                // is stuck".
                 let outside = target + seg <= window_start || target > window_end + 2.0 * seg;
+                let producing = window_end > window_start;
+                let damper = if producing {
+                    std::time::Duration::from_secs(1)
+                } else {
+                    std::time::Duration::from_secs(3)
+                };
                 if outside
                     && session.min_requested() == Some(index)
-                    && session.since_spawn() >= std::time::Duration::from_secs(3)
+                    && session.since_spawn() >= damper
                 {
                     if let Err(error) = restart_ffmpeg(&state, &session, target).await {
                         let _ = tx.send(Err(std::io::Error::other(error.to_string()))).await;
@@ -1979,7 +2106,7 @@ async fn pump_segment(
                 .await;
             return;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
 

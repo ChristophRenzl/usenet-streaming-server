@@ -4,4 +4,5 @@
 *.db-wal
 /data
 /config.local.toml
+/tests/live_settings.toml
 .DS_Store

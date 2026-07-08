@@ -1,0 +1,26 @@
+# Settings for the live test suites (tests/live_benchmark.rs). Copy to
+# tests/live_settings.toml (gitignored) and fill in your own values, or set
+# LIVE_E2E__* env vars (e.g. LIVE_E2E__TMDB__API_KEY=...).
+
+[tmdb]
+api_key = "your-tmdb-api-key"
+
+[indexer]
+# Any Newznab-compatible indexer; NZBHydra2 works well.
+name = "nzbhydra2"
+base_url = "http://192.168.1.10:5076"
+api_key = "your-indexer-api-key"
+
+# Optional: enables tests that stream real bytes from Usenet through ffmpeg
+# (the whole live benchmark needs this).
+[provider]
+host = "news.example.com"
+port = 563
+use_tls = true
+username = "user"
+password = "pass"
+max_connections = 25
+
+# Optional: benchmark movie override (defaults to "Obsession", 2026).
+#[benchmark]
+#movie_tmdb_id = 1339713
