@@ -275,6 +275,26 @@ plus whether a rotated key is in effect.
   Security; the data model is multi-user-ready).
 - No automation (monitoring, auto-grab, renaming) — on-demand only.
 
+## Live playback benchmark
+
+`tests/live_benchmark.rs` measures the full press-play path against a real
+indexer, TMDB and Usenet provider: every server stage (candidate resolution →
+NZB grab → health check → open source → probe → ffmpeg spawn), the
+client-observable stages (ready poll, playlists, init, first segments) and a
+seek/scrub stress script that flags stalls. Session responses carry the same
+per-stage breakdown in their `timings` field.
+
+```sh
+cp tests/live_settings.example.toml tests/live_settings.toml  # fill in keys
+cargo test --test live_benchmark -- --ignored --nocapture --test-threads=1
+```
+
+Each scenario (2160p HDR10 Atmos, the same release tone-mapped to SDR, plain
+1080p SDR) prints a timing table and writes a JSON report under
+`target/live-benchmark/`. The companion tvOS client repo has a matching
+`LivePlaybackBenchmarkTests` XCTest that measures AVPlayer's real
+time-to-first-frame and seek recovery against a live server.
+
 ## License
 
 [MIT](LICENSE)
