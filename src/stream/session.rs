@@ -504,6 +504,13 @@ impl SessionManager {
         self.sessions.len()
     }
 
+    /// A snapshot of the currently registered sessions, for the admin
+    /// dashboard. Cloned `Arc`s so the map isn't held across the caller's
+    /// awaits.
+    pub fn snapshot(&self) -> Vec<Arc<Session>> {
+        self.sessions.iter().map(|e| e.value().clone()).collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.sessions.is_empty()
     }

@@ -165,6 +165,37 @@ pub async fn subdl_client(state: &AppState) -> Option<crate::subtitles::subdl::S
     ))
 }
 
+/// Subtitle providers in their built-in default order (first = tried first).
+pub const SUBTITLE_PROVIDERS: [&str; 2] = ["opensubtitles", "subdl"];
+
+/// The effective subtitle provider order: the stored preference, filtered to
+/// known providers, with any missing known provider appended in default
+/// order. Falls back to the default order when nothing is stored.
+pub async fn subtitle_provider_order(state: &AppState) -> Vec<String> {
+    let stored = db::settings::get(&state.db, db::settings::SUBTITLE_PROVIDER_ORDER)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    order_from(&stored)
+}
+
+/// Pure ordering logic (see [`subtitle_provider_order`]), split out for tests.
+fn order_from(stored: &str) -> Vec<String> {
+    let mut order: Vec<String> = stored
+        .split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| SUBTITLE_PROVIDERS.contains(&s.as_str()))
+        .collect();
+    order.dedup();
+    for provider in SUBTITLE_PROVIDERS {
+        if !order.iter().any(|p| p == provider) {
+            order.push(provider.to_string());
+        }
+    }
+    order
+}
+
 /// Split a comma list of languages into trimmed, lower-cased ISO codes.
 pub fn parse_languages(raw: &str) -> Vec<String> {
     raw.split(',')
@@ -324,6 +355,21 @@ mod tests {
         let (key, source) = effective_opensubtitles_key(&state).await.unwrap();
         assert_eq!(key.as_deref(), Some("default-key"));
         assert_eq!(source, ApiKeySource::Default);
+    }
+
+    #[test]
+    fn provider_order_defaults_and_reorders() {
+        // Nothing stored → built-in default order.
+        assert_eq!(order_from(""), vec!["opensubtitles", "subdl"]);
+        // Explicit reorder is honored.
+        assert_eq!(
+            order_from("subdl,opensubtitles"),
+            vec!["subdl", "opensubtitles"]
+        );
+        // A partial preference appends the missing provider.
+        assert_eq!(order_from("subdl"), vec!["subdl", "opensubtitles"]);
+        // Unknown entries are dropped; missing ones still appended.
+        assert_eq!(order_from("bogus, subdl"), vec!["subdl", "opensubtitles"]);
     }
 
     #[tokio::test]

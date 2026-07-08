@@ -20,6 +20,11 @@ pub const OPENSUBTITLES_USERNAME: &str = "opensubtitles_username";
 /// OpenSubtitles cannot deliver.
 pub const SUBDL_API_KEY: &str = "subdl_api_key";
 
+/// Ordered, comma-separated subtitle provider preference (e.g.
+/// "subdl,opensubtitles"). Providers are tried in this order; any not listed
+/// are appended in their default order. Absent = default order.
+pub const SUBTITLE_PROVIDER_ORDER: &str = "subtitle_provider_order";
+
 /// Key under which the OpenSubtitles account password is stored (paired with
 /// [`OPENSUBTITLES_USERNAME`]).
 pub const OPENSUBTITLES_PASSWORD: &str = "opensubtitles_password";
