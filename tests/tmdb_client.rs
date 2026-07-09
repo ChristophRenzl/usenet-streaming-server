@@ -16,10 +16,15 @@ fn client(server: &MockServer) -> TmdbClient {
 }
 
 #[tokio::test]
-async fn multi_search_maps_results_and_drops_people() {
+async fn multi_search_merges_movie_and_tv_endpoints() {
+    // Multi search queries the dedicated /search/movie and /search/tv
+    // endpoints (people never appear there) and merges by title-match tier,
+    // then popularity. The prefix-union retry for the trimmed query
+    // ("inceptio") is best-effort — its unmatched 404s must not fail the
+    // search.
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/search/multi"))
+        .and(path("/search/movie"))
         .and(query_param("api_key", "test-key"))
         .and(query_param("query", "inception"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -34,31 +39,39 @@ async fn multi_search_maps_results_and_drops_people() {
                     "original_title": "Inception",
                     "overview": "Cobb, a skilled thief who commits corporate espionage...",
                     "poster_path": "/oYuLEt3zVCKq57qu2F8dT7NIa6f.jpg",
-                    "media_type": "movie",
                     "genre_ids": [28, 878, 12],
                     "release_date": "2010-07-15",
                     "vote_average": 8.369,
-                    "vote_count": 36855
-                },
-                {
-                    "id": 6193,
-                    "name": "Leonardo DiCaprio",
-                    "media_type": "person",
-                    "known_for_department": "Acting"
-                },
+                    "vote_count": 36855,
+                    "popularity": 30.0
+                }
+            ],
+            "total_pages": 1,
+            "total_results": 1
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/search/tv"))
+        .and(query_param("api_key", "test-key"))
+        .and(query_param("query", "inception"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "page": 1,
+            "results": [
                 {
                     "backdrop_path": "/tsRy63Mu5cu8etL1X7ZLyf7UP1M.jpg",
                     "id": 1396,
                     "name": "Breaking Bad",
                     "overview": "Walter White, a New Mexico chemistry teacher...",
                     "poster_path": "/ztkUQFLlC19CCMYHW9o1zWhJRNq.jpg",
-                    "media_type": "tv",
                     "first_air_date": "2008-01-20",
-                    "vote_average": 8.9
+                    "vote_average": 8.9,
+                    "popularity": 500.0
                 }
             ],
             "total_pages": 1,
-            "total_results": 3
+            "total_results": 1
         })))
         .expect(1)
         .mount(&server)
@@ -69,7 +82,8 @@ async fn multi_search_maps_results_and_drops_people() {
         .await
         .expect("search must succeed");
 
-    assert_eq!(results.len(), 2, "person results must be dropped");
+    assert_eq!(results.len(), 2, "movie and tv results must merge");
+    // The exact title match outranks the far more popular non-match.
 
     let movie = &results[0];
     assert_eq!(movie.tmdb_id, 27205);
