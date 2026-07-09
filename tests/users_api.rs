@@ -38,6 +38,14 @@ async fn login_flow_and_token_auth() {
     assert_eq!(created["is_admin"], json!(false));
     assert_eq!(created["has_password"], json!(true));
 
+    // Duplicate usernames are rejected (case-insensitively).
+    let duplicate = server
+        .post("/api/v1/users")
+        .add_header("x-api-key", API_KEY)
+        .json(&json!({"username": "CHRIS", "password": "whatever1"}))
+        .await;
+    assert_eq!(duplicate.status_code(), 400);
+
     // Wrong password is rejected; the right one yields a token.
     let bad = server
         .post("/auth/login")
