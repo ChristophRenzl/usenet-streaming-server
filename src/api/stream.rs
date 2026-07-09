@@ -745,6 +745,9 @@ async fn prefetch_subtitles(
     if os_client.is_none() && subdl.is_none() {
         return Vec::new();
     }
+    // Providers are tried in the admin-configured order; the first that
+    // returns a subtitle for a language wins.
+    let provider_order = super::subtitles::subtitle_provider_order(state).await;
 
     // Release-accurate matching: compute the media's moviehash once. Non-fatal.
     let moviehash = match subtitles::osdb_hash(&media).await {
@@ -776,12 +779,24 @@ async fn prefetch_subtitles(
             moviehash: moviehash.clone(),
         };
         let mut subtitle = None;
-        if let Some(client) = &os_client {
-            subtitle = prefetch_opensubtitles(state, client, &query, session_id, language).await;
-        }
-        if subtitle.is_none() {
-            if let Some(client) = &subdl {
-                subtitle = prefetch_subdl(state, client, &query, session_id, language).await;
+        for provider in &provider_order {
+            subtitle = match provider.as_str() {
+                "opensubtitles" => match &os_client {
+                    Some(client) => {
+                        prefetch_opensubtitles(state, client, &query, session_id, language).await
+                    }
+                    None => None,
+                },
+                "subdl" => match &subdl {
+                    Some(client) => {
+                        prefetch_subdl(state, client, &query, session_id, language).await
+                    }
+                    None => None,
+                },
+                _ => None,
+            };
+            if subtitle.is_some() {
+                break;
             }
         }
         prefetched.extend(subtitle);
@@ -2616,9 +2631,55 @@ async fn wipe_dir(dir: &FsPath) -> AppResult<()> {
     Ok(())
 }
 
+/// One active streaming session, for the admin dashboard.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ActiveSession {
+    pub session_id: Uuid,
+    pub tmdb_id: i64,
+    pub media_type: MediaType,
+    pub season: Option<u32>,
+    pub episode: Option<u32>,
+    pub release_title: String,
+    /// `starting`, `ready`, `failed` or `ended`.
+    pub state: String,
+    /// True while the video is being tone-mapped / transcoded (heavier CPU).
+    pub video_transcoded: bool,
+    pub audio_transcoded: bool,
+    /// Finished HLS segments on disk (rough progress signal).
+    pub segments_ready: usize,
+    /// Seconds since the last client request touched this session.
+    pub idle_secs: u64,
+}
+
+/// List the currently active streaming sessions (admin dashboard).
+#[utoipa::path(get, path = "/stream/sessions", tag = "streaming",
+    responses((status = 200, body = [ActiveSession])))]
+pub async fn list_sessions(State(state): State<AppState>) -> AppResult<Json<Vec<ActiveSession>>> {
+    let mut out = Vec::new();
+    for session in state.sessions.snapshot() {
+        let info = session.info();
+        out.push(ActiveSession {
+            session_id: session.id,
+            tmdb_id: session.tmdb_id,
+            media_type: session.media_type,
+            season: session.season,
+            episode: session.episode,
+            release_title: session.release_title.clone(),
+            state: session.state().label().to_string(),
+            video_transcoded: info.video_transcoded,
+            audio_transcoded: info.audio_transcoded,
+            segments_ready: count_segments(&session.temp_dir).await,
+            idle_secs: session.idle_for().as_secs(),
+        });
+    }
+    // Most recently active first.
+    out.sort_by_key(|s| s.idle_secs);
+    Ok(Json(out))
+}
+
 pub fn router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
-        .routes(routes!(create_session))
+        .routes(routes!(create_session, list_sessions))
         .routes(routes!(session_status, delete_session))
         .routes(routes!(master_playlist))
         .routes(routes!(media_playlist))

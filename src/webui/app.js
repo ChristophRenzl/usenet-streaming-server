@@ -143,7 +143,7 @@ const routes = {
   providers: renderProviders,
   indexers: renderIndexers,
   tmdb: renderTmdb,
-  opensubtitles: renderOpensubtitles,
+  opensubtitles: renderSubtitles,
   preferences: renderPreferences,
   users: renderUsers,
   downloads: renderDownloads,
@@ -282,7 +282,71 @@ async function renderDashboard(main) {
           )}
         </ul>
       </div>
+    </div>
+    <div class="card" id="streams-card" style="margin-top:16px">
+      <div class="page-head" style="margin:0 0 4px">
+        <div><h2 style="margin:0">Active streams</h2>
+             <p class="muted" style="margin:2px 0 0">Playback sessions running right now.</p></div>
+        <div><button class="btn small" id="streams-refresh">Refresh</button></div>
+      </div>
+      <div id="streams-body">${loadingHtml("Loading streams…")}</div>
     </div>`;
+
+  async function loadStreams() {
+    const body = $("#streams-body");
+    if (!body) return;
+    try {
+      body.innerHTML = renderStreams(await api("/stream/sessions"));
+    } catch (err) {
+      body.innerHTML = `<p class="muted">${esc(err.message)}</p>`;
+    }
+  }
+  $("#streams-refresh").addEventListener("click", loadStreams);
+  await loadStreams();
+  // Live-ish: refresh the streams card every 5s while the dashboard is open.
+  const timer = setInterval(loadStreams, 5000);
+  pageCleanup = () => clearInterval(timer);
+}
+
+function renderStreams(sessions) {
+  if (!sessions.length) {
+    return '<p class="muted">No active streams.</p>';
+  }
+  const rows = sessions
+    .map((s) => {
+      const scope =
+        s.media_type === "tv" && s.season != null && s.episode != null
+          ? `S${s.season}E${s.episode}`
+          : s.media_type === "tv"
+            ? "TV"
+            : "Movie";
+      const stateChip =
+        s.state === "ready"
+          ? '<span class="chip ok">ready</span>'
+          : s.state === "starting"
+            ? '<span class="chip accent">starting</span>'
+            : s.state === "failed"
+              ? '<span class="chip warn">failed</span>'
+              : `<span class="chip">${esc(s.state)}</span>`;
+      const work = [];
+      if (s.video_transcoded) work.push("video transcode");
+      if (s.audio_transcoded) work.push("audio transcode");
+      const workChip = work.length
+        ? `<span class="chip warn">${esc(work.join(" + "))}</span>`
+        : '<span class="chip">direct copy</span>';
+      return `<tr>
+        <td>${esc(scope)}</td>
+        <td title="${esc(s.release_title)}">${esc(s.release_title)}</td>
+        <td>${stateChip}</td>
+        <td>${workChip}</td>
+        <td>${s.segments_ready} seg</td>
+        <td>${s.idle_secs}s ago</td>
+      </tr>`;
+    })
+    .join("");
+  return `<div class="table-wrap"><table>
+    <thead><tr><th>Item</th><th>Release</th><th>State</th><th>Pipeline</th><th>Buffered</th><th>Last active</th></tr></thead>
+    <tbody>${rows}</tbody></table></div>`;
 }
 
 // ---- Providers ----------------------------------------------------------------
@@ -624,46 +688,76 @@ async function renderTmdb(main) {
 
 // ---- OpenSubtitles ------------------------------------------------------------------
 
-async function renderOpensubtitles(main) {
+async function renderSubtitles(main) {
   const app = await api("/settings/app");
   const defaultKeyActive = !!app.opensubtitles_default_key_active;
   const usingDefault = defaultKeyActive && app.opensubtitles_api_key_source === "default";
-  // With a server-supplied default key, the per-user key is only an override,
-  // so it is optional; otherwise it is required to enable subtitles at all.
-  const keyLabel = defaultKeyActive ? "Override API key (optional)" : "New OpenSubtitles API key";
-  const keyRequired = defaultKeyActive ? "" : "required";
-  const currentKeyLine = app.opensubtitles_api_key
+
+  // ---- OpenSubtitles box ----
+  const osConfigured = !!app.opensubtitles_configured;
+  const osKeyLine = app.opensubtitles_api_key
     ? `Current key: <code>${esc(app.opensubtitles_api_key)}</code>`
     : usingDefault
       ? `Using the server's built-in API key. <span class="chip accent">server default active</span>`
       : `Current key: <span class="chip warn">not set</span>`;
-  const keyHint = defaultKeyActive
-    ? `The server has a built-in OpenSubtitles API key, so you only need a username/password below. Set a key here only to override it with your own consumer key from <a href="https://www.opensubtitles.com/consumers" target="_blank" rel="noopener">opensubtitles.com/consumers</a>.`
+  const osKeyLabel = defaultKeyActive ? "Override API key (optional)" : "OpenSubtitles API key";
+  const osKeyRequired = defaultKeyActive ? "" : "required";
+  const osKeyHint = defaultKeyActive
+    ? `The server has a built-in key, so you only need a username/password below. Set a key here to override it with your own from <a href="https://www.opensubtitles.com/consumers" target="_blank" rel="noopener">opensubtitles.com/consumers</a>.`
     : `Get a free consumer API key at <a href="https://www.opensubtitles.com/consumers" target="_blank" rel="noopener">opensubtitles.com/consumers</a>.`;
+
+  // ---- SubDL box ----
+  const subdlSet = !!app.subdl_api_key;
+  const subdlKeyLine = subdlSet
+    ? `Current key: <code>${esc(app.subdl_api_key)}</code>`
+    : `Current key: <span class="chip">not set</span>`;
+
+  // ---- Provider order ----
+  const order = app.subtitle_provider_order || ["opensubtitles", "subdl"];
+  const providerLabel = { opensubtitles: "OpenSubtitles", subdl: "SubDL" };
+
   main.innerHTML = `
-    ${pageHead("Subtitles", "OpenSubtitles powers automatic subtitle search and delivery. Optional — playback works without it. When set, the server auto-attaches subtitles at playback start (release-accurate moviehash matching, with fps-drift correction) and offers them natively; a manual offset lets you nudge timing.")}
-    <div class="card" style="max-width:560px">
-      <h2>API key</h2>
-      <p class="muted" style="margin-top:0">
-        ${currentKeyLine}
-      </p>
+    ${pageHead("Subtitles", "Automatic subtitle search and delivery. Optional — playback works without it. When enabled, the server searches the providers below (in order) at playback start, matches the release, corrects fps drift, and offers the subtitle natively. Text subtitles embedded in the release are always preferred and cost no provider quota.")}
+
+    <div class="card" style="max-width:640px">
+      <div class="page-head" style="margin:0 0 12px">
+        <div><h2 style="margin:0">Provider priority</h2>
+             <p class="muted" style="margin:2px 0 0">Which provider is tried first for each language.</p></div>
+      </div>
+      <ol id="provider-order" class="order-list">
+        ${order
+          .map(
+            (p, i) => `<li data-provider="${esc(p)}">
+              <span class="grow">${i + 1}. ${esc(providerLabel[p] || p)}</span>
+              <button type="button" class="btn small" data-move="up" ${i === 0 ? "disabled" : ""}>↑</button>
+              <button type="button" class="btn small" data-move="down" ${i === order.length - 1 ? "disabled" : ""}>↓</button>
+            </li>`,
+          )
+          .join("")}
+      </ol>
+      <div class="form-actions">
+        <button type="button" class="btn primary" id="save-order">Save order</button>
+      </div>
+    </div>
+
+    <div class="card" style="max-width:640px;margin-top:16px">
+      <h2>OpenSubtitles</h2>
+      <p class="muted" style="margin-top:0">${osConfigured ? '<span class="chip ok">enabled</span>' : '<span class="chip">not configured</span>'} ${osKeyLine}</p>
       <form id="os-key-form">
         <div class="field">
-          <label>${keyLabel}</label>
-          <input name="key" ${keyRequired} autocomplete="off" placeholder="${defaultKeyActive ? "Leave blank to use the server's built-in key" : "Paste your OpenSubtitles API key"}">
-          <span class="hint">${keyHint}</span>
+          <label>${osKeyLabel}</label>
+          <input name="key" ${osKeyRequired} autocomplete="off" placeholder="${defaultKeyActive ? "Leave blank to use the server's built-in key" : "Paste your OpenSubtitles API key"}">
+          <span class="hint">${osKeyHint}</span>
         </div>
         <div class="form-actions">
           <button type="submit" class="btn primary">Save key</button>
           ${app.opensubtitles_api_key ? '<button type="button" id="os-key-remove" class="btn danger">Remove key</button>' : ""}
         </div>
       </form>
-    </div>
-    <div class="card" style="max-width:560px;margin-top:16px">
-      <h2>Account${defaultKeyActive ? "" : " (optional)"}</h2>
+      <hr class="sep">
+      <h3 style="margin:0 0 8px">Account${defaultKeyActive ? "" : " (optional)"}</h3>
       <p class="muted" style="margin-top:0">
-        Logging in with an OpenSubtitles account lifts the anonymous daily
-        download quota.
+        Signing in with an OpenSubtitles account lifts the anonymous daily download quota.
         ${app.opensubtitles_username ? `Signed in as <code>${esc(app.opensubtitles_username)}</code>.` : '<span class="chip">no account set</span>'}
         ${app.opensubtitles_password_set ? '<span class="chip accent">password stored</span>' : ""}
       </p>
@@ -682,40 +776,74 @@ async function renderOpensubtitles(main) {
           ${app.opensubtitles_username || app.opensubtitles_password_set ? '<button type="button" id="os-account-clear" class="btn danger">Sign out / clear account</button>' : ""}
         </div>
       </form>
+    </div>
+
+    <div class="card" style="max-width:640px;margin-top:16px">
+      <h2>SubDL</h2>
+      <p class="muted" style="margin-top:0">${subdlSet ? '<span class="chip ok">enabled</span>' : '<span class="chip">not configured</span>'} ${subdlKeyLine}</p>
+      <form id="subdl-key-form">
+        <div class="field">
+          <label>SubDL API key</label>
+          <input name="key" autocomplete="off" placeholder="Paste your SubDL API key">
+          <span class="hint">Get a free API key at <a href="https://subdl.com/panel/api" target="_blank" rel="noopener">subdl.com/panel/api</a>.</span>
+        </div>
+        <div class="form-actions">
+          <button type="submit" class="btn primary">Save key</button>
+          ${subdlSet ? '<button type="button" id="subdl-key-remove" class="btn danger">Remove key</button>' : ""}
+        </div>
+      </form>
     </div>`;
 
-  $("#os-key-form").addEventListener("submit", async (e) => {
-    e.preventDefault();
-    const key = e.target.key.value.trim();
-    // With a server default active the field is optional: a blank submit means
-    // "keep using the built-in key", so don't send "" (which would clear an
-    // override). Without a default the input is required, so key is non-empty.
-    if (defaultKeyActive && !key) {
-      toast("Using the server's built-in API key.", "success");
-      return;
-    }
+  // ---- Provider order interactions ----
+  const orderList = $("#provider-order");
+  orderList.querySelectorAll("[data-move]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const li = btn.closest("li");
+      if (btn.dataset.move === "up" && li.previousElementSibling) {
+        li.parentNode.insertBefore(li, li.previousElementSibling);
+      } else if (btn.dataset.move === "down" && li.nextElementSibling) {
+        li.parentNode.insertBefore(li.nextElementSibling, li);
+      }
+    });
+  });
+  $("#save-order").addEventListener("click", async () => {
+    const providers = Array.from(orderList.querySelectorAll("li")).map(
+      (li) => li.dataset.provider,
+    );
     try {
       await api("/settings/app", {
         method: "PUT",
-        body: JSON.stringify({ opensubtitles_api_key: key }),
+        body: JSON.stringify({ subtitle_provider_order: providers }),
       });
-      toast("OpenSubtitles key saved.", "success");
+      toast("Provider order saved.", "success");
       navigate();
     } catch (err) {
       toast(err.message);
     }
   });
 
-  const removeKeyBtn = $("#os-key-remove");
-  if (removeKeyBtn) {
-    removeKeyBtn.addEventListener("click", async () => {
-      if (!confirm("Remove the stored OpenSubtitles API key? Subtitles will be unavailable unless the server has a built-in key.")) return;
+  // ---- OpenSubtitles key ----
+  $("#os-key-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const key = e.target.key.value.trim();
+    if (defaultKeyActive && !key) {
+      toast("Using the server's built-in API key.", "success");
+      return;
+    }
+    try {
+      await api("/settings/app", { method: "PUT", body: JSON.stringify({ opensubtitles_api_key: key }) });
+      toast("OpenSubtitles key saved.", "success");
+      navigate();
+    } catch (err) {
+      toast(err.message);
+    }
+  });
+  const osRemove = $("#os-key-remove");
+  if (osRemove) {
+    osRemove.addEventListener("click", async () => {
+      if (!confirm("Remove the stored OpenSubtitles API key?")) return;
       try {
-        // An explicit empty string clears the stored key server-side.
-        await api("/settings/app", {
-          method: "PUT",
-          body: JSON.stringify({ opensubtitles_api_key: "" }),
-        });
+        await api("/settings/app", { method: "PUT", body: JSON.stringify({ opensubtitles_api_key: "" }) });
         toast("OpenSubtitles key removed.", "success");
         navigate();
       } catch (err) {
@@ -724,10 +852,9 @@ async function renderOpensubtitles(main) {
     });
   }
 
+  // ---- OpenSubtitles account ----
   $("#os-account-form").addEventListener("submit", async (e) => {
     e.preventDefault();
-    // Only send fields the user actually touched: username always (may be
-    // cleared), password only when non-empty so blank keeps the stored one.
     const body = { opensubtitles_username: e.target.username.value.trim() };
     const password = e.target.password.value;
     if (password) body.opensubtitles_password = password;
@@ -739,21 +866,46 @@ async function renderOpensubtitles(main) {
       toast(err.message);
     }
   });
-
-  const clearAccountBtn = $("#os-account-clear");
-  if (clearAccountBtn) {
-    clearAccountBtn.addEventListener("click", async () => {
+  const osAccountClear = $("#os-account-clear");
+  if (osAccountClear) {
+    osAccountClear.addEventListener("click", async () => {
       if (!confirm("Sign out and clear the stored OpenSubtitles username and password?")) return;
       try {
-        // Empty strings clear both the username and password server-side.
         await api("/settings/app", {
           method: "PUT",
-          body: JSON.stringify({
-            opensubtitles_username: "",
-            opensubtitles_password: "",
-          }),
+          body: JSON.stringify({ opensubtitles_username: "", opensubtitles_password: "" }),
         });
         toast("OpenSubtitles account cleared.", "success");
+        navigate();
+      } catch (err) {
+        toast(err.message);
+      }
+    });
+  }
+
+  // ---- SubDL key ----
+  $("#subdl-key-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const key = e.target.key.value.trim();
+    if (!key) {
+      toast("Enter a SubDL API key.");
+      return;
+    }
+    try {
+      await api("/settings/app", { method: "PUT", body: JSON.stringify({ subdl_api_key: key }) });
+      toast("SubDL key saved.", "success");
+      navigate();
+    } catch (err) {
+      toast(err.message);
+    }
+  });
+  const subdlRemove = $("#subdl-key-remove");
+  if (subdlRemove) {
+    subdlRemove.addEventListener("click", async () => {
+      if (!confirm("Remove the stored SubDL API key?")) return;
+      try {
+        await api("/settings/app", { method: "PUT", body: JSON.stringify({ subdl_api_key: "" }) });
+        toast("SubDL key removed.", "success");
         navigate();
       } catch (err) {
         toast(err.message);
