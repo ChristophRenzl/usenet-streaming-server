@@ -258,6 +258,7 @@ mod tests {
             indexer_name: "test".into(),
             tvdb_id: None,
             imdb_id: None,
+            file_count: None,
         }
     }
 
