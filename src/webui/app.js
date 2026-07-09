@@ -308,6 +308,15 @@ async function renderDashboard(main) {
   pageCleanup = () => clearInterval(timer);
 }
 
+function bufferedLabel(s) {
+  // 6s per segment (the server's fixed HLS cadence).
+  if (s.duration_secs > 0) {
+    const pct = Math.min(100, Math.round(((s.segments_ready * 6) / s.duration_secs) * 100));
+    return `${pct}%`;
+  }
+  return `${s.segments_ready} seg`;
+}
+
 function renderStreams(sessions) {
   if (!sessions.length) {
     return '<p class="muted">No active streams.</p>';
@@ -339,7 +348,7 @@ function renderStreams(sessions) {
         <td title="${esc(s.release_title)}">${esc(s.release_title)}</td>
         <td>${stateChip}</td>
         <td>${workChip}</td>
-        <td>${s.segments_ready} seg</td>
+        <td>${bufferedLabel(s)}</td>
         <td>${s.idle_secs}s ago</td>
       </tr>`;
     })
