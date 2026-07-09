@@ -416,7 +416,7 @@ mod tests {
     #[test]
     fn decode_falls_back_to_latin1() {
         // 0xE9 is 'é' in latin-1 but an invalid lone UTF-8 byte.
-        let bytes = [b'c', b'a', b'f', b'\xe9'];
+        let bytes = *b"caf\xe9";
         assert_eq!(decode_subtitle_bytes(&bytes), "café");
     }
 
