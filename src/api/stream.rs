@@ -2044,20 +2044,46 @@ pub async fn hls_segment(
 
 /// One embedded-subtitle window: merge all extraction fragments for the
 /// language (one per ffmpeg (re)start position) and slice the window's time
-/// range. Serves whatever has been extracted so far — the player requests
-/// windows near the playhead, where extraction has already passed, so a
-/// partially extracted window only occurs at the live edge (and yields the
-/// cues known so far instead of an error).
+/// range.
+///
+/// A VOD player fetches each window exactly ONCE and caches the answer
+/// forever — serving a window before extraction has passed its end
+/// permanently truncates it. That is precisely what a resume does: AVPlayer
+/// prefetches the next several windows within seconds of the seek restart,
+/// while the fresh ffmpeg is still re-covering them — each answered window
+/// froze as empty/partial and subtitles stayed dark from the resume point
+/// on. So first wait (bounded) until the transcode — cue flushing runs in
+/// step with it — has produced media past the window end, the extraction
+/// has finished, or the deadline passes. During normal linear playback the
+/// transcode is far ahead and this costs nothing.
 async fn embedded_window(session: &Arc<Session>, language: &str, window: u64) -> String {
     let start = window as f64 * subtitles::EMBEDDED_WINDOW_SECS;
     let end = start + subtitles::EMBEDDED_WINDOW_SECS;
-    // The player fetches each VOD window exactly once, so an empty answer is
-    // final for it. Right after a (seek-)restart the extraction runs a few
-    // seconds behind the requested window (ffmpeg reconnects and seeks the
-    // source first) — wait up to ~5s before conceding the window really has
-    // no cues. Longer holds would risk the player timing the segment out and
-    // disabling the whole track, which is worse than one sparse window;
-    // dialogue-free minutes pay the wait once per window.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let playlist = session.playlist_path();
+        let produced = tokio::fs::read_to_string(&playlist).await.unwrap_or_default();
+        let produced_end = session.start_offset()
+            + produced
+                .lines()
+                .filter_map(|line| line.strip_prefix("#EXTINF:"))
+                .filter_map(|rest| rest.split(',').next())
+                .filter_map(|value| value.trim().parse::<f64>().ok())
+                .sum::<f64>();
+        if produced_end >= end
+            || produced.contains("#EXT-X-ENDLIST")
+            || tokio::time::Instant::now() >= deadline
+        {
+            break;
+        }
+        // Long waits are legitimate right after a seek; keep the reaper away.
+        session.touch();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    // Extraction has passed the window (or the wait capped out). A short
+    // extra grace covers the muxer flushing a cue that straddles the window
+    // start; a genuinely dialogue-free window pays it once and returns
+    // header-only, which is correct.
     for attempt in 0..7 {
         if attempt > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(800)).await;
