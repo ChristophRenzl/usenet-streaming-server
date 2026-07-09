@@ -898,20 +898,10 @@ async fn prefetch_subdl(
 async fn attach_prefetched_subtitles(session: &Arc<Session>, prefetched: Vec<PrefetchedSubtitle>) {
     let media_fps = session.info().fps;
     for subtitle in prefetched {
-        // Embedded-subtitles-first: probe_and_spawn attached release-accurate
-        // embedded tracks for the requested languages; an external download
-        // for a language that is already covered is dropped here.
-        if session
-            .subtitle_track_by_language(&subtitle.language)
-            .is_some()
-        {
-            tracing::debug!(
-                session = %session.id,
-                language = %subtitle.language,
-                "embedded track covers language; dropping external subtitle"
-            );
-            continue;
-        }
+        // Embedded tracks attach first and stay the default, but the external
+        // subtitle is kept as a second track: it covers the whole program
+        // up-front, so it has no gaps when playback starts halfway in (the
+        // embedded extraction only covers what ffmpeg has read so far).
         let fps_scale = fps_rescale(media_fps, subtitle.subtitle_fps, subtitle.hash_match);
         // The first attached track becomes the default.
         let make_default = session.subtitle_tracks().is_empty();
@@ -2673,6 +2663,8 @@ pub struct ActiveSession {
     pub audio_transcoded: bool,
     /// Finished HLS segments on disk (rough progress signal).
     pub segments_ready: usize,
+    /// Media duration when probed; lets UIs show buffered progress in %.
+    pub duration_secs: Option<f64>,
     /// Seconds since the last client request touched this session.
     pub idle_secs: u64,
 }
@@ -2695,6 +2687,7 @@ pub async fn list_sessions(State(state): State<AppState>) -> AppResult<Json<Vec<
             video_transcoded: info.video_transcoded,
             audio_transcoded: info.audio_transcoded,
             segments_ready: count_segments(&session.temp_dir).await,
+            duration_secs: info.duration_secs,
             idle_secs: session.idle_for().as_secs(),
         });
     }
