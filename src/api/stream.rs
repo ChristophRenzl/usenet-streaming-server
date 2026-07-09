@@ -2015,10 +2015,15 @@ pub async fn hls_segment(
         };
     }
 
-    // Fast path: the segment is already on disk and complete.
+    // Fast path: the segment is already on disk and complete. An empty read
+    // means the file was just (re)created and not yet written — fall through
+    // to the pump, which waits for the bytes; serving 0 bytes is a fatal
+    // 'fmt?' parse error in AVPlayer that kills playback (or the rendition).
     if segment_complete(&session, &segment).await {
         if let Ok(bytes) = tokio::fs::read(session.temp_dir.join(&segment)).await {
-            return Ok(([(header::CONTENT_TYPE, "video/mp4")], bytes).into_response());
+            if !bytes.is_empty() {
+                return Ok(([(header::CONTENT_TYPE, "video/mp4")], bytes).into_response());
+            }
         }
     }
 
@@ -2089,11 +2094,14 @@ async fn slice_embedded_window(
 
 /// Complete once ffmpeg lists it in its own playlist (updated by atomic
 /// rename after each finished segment). init.mp4 is written whole at
-/// startup.
+/// startup — but it briefly exists EMPTY right after creation (and on a
+/// seek-restart rewrite), so existence alone would serve 0 bytes, a fatal
+/// 'fmt?' in AVPlayer; require content.
 async fn segment_complete(session: &Arc<Session>, segment: &str) -> bool {
     if segment == "init.mp4" {
-        return tokio::fs::try_exists(session.temp_dir.join(segment))
+        return tokio::fs::metadata(session.temp_dir.join(segment))
             .await
+            .map(|meta| meta.len() > 0)
             .unwrap_or(false);
     }
     tokio::fs::read_to_string(session.playlist_path())
@@ -2627,7 +2635,12 @@ async fn playlist_seconds(playlist: &FsPath) -> f64 {
 
 /// Delete the video playlist + segments inside the session dir (keeping the
 /// directory itself), but preserve attached external subtitle renditions
-/// (`sub_*.m3u8` / `sub_*.vtt`) so they survive a seek restart.
+/// (`sub_*.m3u8` / `sub_*.vtt`) so they survive a seek restart — and
+/// `init.mp4`: the init segment is identical across restarts (same input,
+/// same mapping, same encoder settings), and deleting it races any player
+/// fetching it concurrently with the seek that triggered the restart. A
+/// 0-byte init.mp4 read in that window is a fatal 'fmt?' error in AVPlayer —
+/// the exact resume-with-subtitles failure this preserves against.
 async fn wipe_dir(dir: &FsPath) -> AppResult<()> {
     let mut entries = tokio::fs::read_dir(dir)
         .await
@@ -2636,7 +2649,7 @@ async fn wipe_dir(dir: &FsPath) -> AppResult<()> {
         if entry
             .file_name()
             .to_str()
-            .is_some_and(|name| name.starts_with("sub_"))
+            .is_some_and(|name| name.starts_with("sub_") || name == "init.mp4")
         {
             continue;
         }
