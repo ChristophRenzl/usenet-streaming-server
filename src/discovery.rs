@@ -21,12 +21,23 @@ pub fn spawn(port: u16) {
             return;
         }
     };
+    // Only the short host label is valid in an mDNS hostname: "Mac.localdomain"
+    // must become "Mac.local.", not "Mac.localdomain.local." (the responder
+    // silently fails to answer queries for an invalid name).
     let host = hostname();
-    let instance = format!("MVP Server ({host})");
+    let label: String = host
+        .split('.')
+        .next()
+        .unwrap_or("mvp")
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .collect();
+    let label = if label.is_empty() { "mvp".to_string() } else { label };
+    let instance = format!("MVP Server ({label})");
     let service = match ServiceInfo::new(
         SERVICE_TYPE,
         &instance,
-        &format!("{host}.local."),
+        &format!("{label}.local."),
         (), // addresses: let the responder enumerate interface addresses
         port,
         &[("version", env!("CARGO_PKG_VERSION"))][..],
