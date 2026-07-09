@@ -120,6 +120,9 @@ pub async fn set_password(
     }
     let hash = auth::hash_password(&request.password)?;
     if db::users::set_password_hash(&state.db, id, &hash).await? {
+        // A reset must not leave old sessions signed in: whoever holds the
+        // account has to log in again with the new password.
+        db::users::delete_tokens_for_user(&state.db, id).await?;
         Ok(axum::http::StatusCode::NO_CONTENT)
     } else {
         Err(AppError::NotFound(format!("user {id}")))

@@ -1115,8 +1115,8 @@ async function renderUsers(main) {
         : '<span class="chip">no password set</span>';
       const actions =
         u.id === 1
-          ? `<button class="btn small" data-pw="${u.id}" data-name="${esc(u.name)}">Set password</button>`
-          : `<button class="btn small" data-pw="${u.id}" data-name="${esc(u.name)}">Set password</button>
+          ? `<button class="btn small" data-pw="${u.id}" data-name="${esc(u.name)}">Reset password</button>`
+          : `<button class="btn small" data-pw="${u.id}" data-name="${esc(u.name)}">Reset password</button>
              <button class="btn small danger" data-del="${u.id}" data-name="${esc(u.name)}">Delete</button>`;
       return `<tr>
         <td>${esc(u.name)} ${owner}</td>
@@ -1201,7 +1201,8 @@ async function renderUsers(main) {
   main.querySelectorAll("[data-pw]").forEach((btn) => {
     btn.addEventListener("click", () => {
       const modal = openModal(`
-        <h2>Set password for ${esc(btn.dataset.name)}</h2>
+        <h2>Reset password for ${esc(btn.dataset.name)}</h2>
+        <p class="muted">All signed-in sessions of this user are logged out.</p>
         <form id="pw-form">
           <div class="field">
             <label>New password (at least 4 characters)</label>
@@ -1209,7 +1210,7 @@ async function renderUsers(main) {
           </div>
           <div class="form-actions">
             <button type="button" class="btn" id="cancel-pw">Cancel</button>
-            <button type="submit" class="btn primary">Set password</button>
+            <button type="submit" class="btn primary">Reset password</button>
           </div>
         </form>`);
       $("#cancel-pw", modal).addEventListener("click", closeModal);
@@ -1221,7 +1222,7 @@ async function renderUsers(main) {
             body: JSON.stringify({ password: e.target.password.value }),
           });
           closeModal();
-          toast("Password updated.", "success");
+          toast("Password reset - the user was signed out everywhere.", "success");
         } catch (err) {
           toast(err.message);
         }

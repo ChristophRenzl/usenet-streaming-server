@@ -152,6 +152,25 @@ async fn non_admins_cannot_manage_users_and_data_is_isolated() {
         .await;
     assert_eq!(gone.status_code(), 401);
 
+    // Resetting ben's password signs his existing session out.
+    let ben_id = ben["user"]["id"].as_i64().unwrap();
+    let reset = server
+        .put(&format!("/api/v1/users/{ben_id}/password"))
+        .add_header("x-api-key", API_KEY)
+        .json(&json!({"password": "brand-new"}))
+        .await;
+    assert_eq!(reset.status_code(), 204);
+    let stale = server
+        .get("/api/v1/auth/me")
+        .add_header("authorization", format!("Bearer {ben_token}"))
+        .await;
+    assert_eq!(stale.status_code(), 401);
+    let relogin = server
+        .post("/auth/login")
+        .json(&json!({"username": "ben", "password": "brand-new"}))
+        .await;
+    assert_eq!(relogin.status_code(), 200);
+
     // The owner cannot be deleted.
     let protected = server
         .delete("/api/v1/users/1")
