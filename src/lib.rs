@@ -1,6 +1,7 @@
 pub mod api;
 pub mod config;
 pub mod db;
+pub mod discovery;
 pub mod download;
 pub mod error;
 pub mod indexer;
@@ -28,6 +29,8 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("failed to bind {addr}"))?;
     let public_addr = public.local_addr().context("reading bound address")?;
+    // Advertise on the LAN so clients can auto-discover this server.
+    discovery::spawn(public_addr.port());
 
     // Dedicated internal listener on 127.0.0.1 (ephemeral port). ffmpeg/ffprobe
     // read the virtual files through this loopback URL. Binding it separately
