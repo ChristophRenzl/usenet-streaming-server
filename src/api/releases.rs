@@ -504,6 +504,7 @@ mod tests {
                 indexer_name: "test".into(),
                 tvdb_id: None,
                 imdb_id: None,
+                file_count: None,
             },
             parsed: parse_release_name(title),
             score,

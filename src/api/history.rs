@@ -73,8 +73,11 @@ impl From<HistoryEntry> for HistoryItem {
 /// The watch history, most recently watched first.
 #[utoipa::path(get, path = "/history", tag = "history",
     responses((status = 200, body = [HistoryItem])))]
-pub async fn list_history(State(state): State<AppState>) -> AppResult<Json<Vec<HistoryItem>>> {
-    let entries = db::watch_history::list(&state.db).await?;
+pub async fn list_history(
+    State(state): State<AppState>,
+    axum::Extension(current): axum::Extension<super::auth::CurrentUser>,
+) -> AppResult<Json<Vec<HistoryItem>>> {
+    let entries = db::watch_history::list(&state.db, current.id).await?;
     Ok(Json(entries.into_iter().map(Into::into).collect()))
 }
 
@@ -100,6 +103,7 @@ pub struct UpdateHistoryRequest {
     responses((status = 200, body = HistoryItem), (status = 400)))]
 pub async fn update_history(
     State(state): State<AppState>,
+    axum::Extension(current): axum::Extension<super::auth::CurrentUser>,
     Json(request): Json<UpdateHistoryRequest>,
 ) -> AppResult<Json<HistoryItem>> {
     if request.media_type == MediaType::Tv
@@ -120,6 +124,7 @@ pub async fn update_history(
     };
     let entry = db::watch_history::upsert_position(
         &state.db,
+        current.id,
         &db::watch_history::PositionUpdate {
             tmdb_id: request.tmdb_id,
             media_type: request.media_type.as_str(),
@@ -155,12 +160,13 @@ pub async fn update_history(
     responses((status = 204), (status = 404)))]
 pub async fn delete_history(
     State(state): State<AppState>,
+    axum::Extension(current): axum::Extension<super::auth::CurrentUser>,
     Path(id): Path<i64>,
 ) -> AppResult<StatusCode> {
     // Grab the row first: unwatching something that was finished also
     // removes it from the Trakt history (best-effort), mirroring the add.
-    let entry = db::watch_history::get(&state.db, id).await?;
-    if db::watch_history::delete(&state.db, id).await? {
+    let entry = db::watch_history::get(&state.db, current.id, id).await?;
+    if db::watch_history::delete(&state.db, current.id, id).await? {
         if let Some(entry) = entry {
             let finished = entry
                 .duration_secs
@@ -231,6 +237,7 @@ pub async fn update_session_position(
     let position_secs = validated_position(request.position_secs)?;
     let entry = db::watch_history::upsert_position(
         &state.db,
+        session.user_id,
         &db::watch_history::PositionUpdate {
             tmdb_id: session.tmdb_id,
             media_type: session.media_type.as_str(),

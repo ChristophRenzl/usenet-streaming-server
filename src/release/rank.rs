@@ -251,6 +251,11 @@ fn score(
         }
     }
 
+    // Note on packaging (RAR set vs unpacked): the newznab `files` attribute
+    // is too unreliable across indexers to score on — session creation
+    // instead pre-grabs the top NZBs and prefers a genuinely unpacked
+    // release among near-tied candidates (see `reorder_by_packaging`).
+
     score
 }
 
@@ -291,6 +296,7 @@ mod tests {
             indexer_name: "test".into(),
             tvdb_id: None,
             imdb_id: None,
+            file_count: None,
         }
     }
 

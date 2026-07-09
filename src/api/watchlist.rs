@@ -73,10 +73,13 @@ pub struct AddWatchlistRequest {
     ))]
 pub async fn add_to_watchlist(
     State(state): State<AppState>,
+    axum::Extension(current): axum::Extension<super::auth::CurrentUser>,
     Json(request): Json<AddWatchlistRequest>,
 ) -> AppResult<(StatusCode, Json<WatchlistItem>)> {
     let media_type = request.media_type.as_str();
-    if let Some(existing) = db::watchlist::get(&state.db, request.tmdb_id, media_type).await? {
+    if let Some(existing) =
+        db::watchlist::get(&state.db, current.id, request.tmdb_id, media_type).await?
+    {
         return Ok((StatusCode::OK, Json(existing.into())));
     }
 
@@ -110,7 +113,7 @@ pub async fn add_to_watchlist(
         }
     };
 
-    let (row, created) = db::watchlist::add(&state.db, &entry).await?;
+    let (row, created) = db::watchlist::add(&state.db, current.id, &entry).await?;
     let status = if created {
         StatusCode::CREATED
     } else {
@@ -122,8 +125,11 @@ pub async fn add_to_watchlist(
 /// The watchlist, most recently added first.
 #[utoipa::path(get, path = "/watchlist", tag = "watchlist",
     responses((status = 200, body = [WatchlistItem])))]
-pub async fn list_watchlist(State(state): State<AppState>) -> AppResult<Json<Vec<WatchlistItem>>> {
-    let entries = db::watchlist::list(&state.db).await?;
+pub async fn list_watchlist(
+    State(state): State<AppState>,
+    axum::Extension(current): axum::Extension<super::auth::CurrentUser>,
+) -> AppResult<Json<Vec<WatchlistItem>>> {
+    let entries = db::watchlist::list(&state.db, current.id).await?;
     Ok(Json(entries.into_iter().map(Into::into).collect()))
 }
 
@@ -146,9 +152,16 @@ pub struct WatchlistStatus {
     responses((status = 200, body = WatchlistStatus)))]
 pub async fn watchlist_status(
     State(state): State<AppState>,
+    axum::Extension(current): axum::Extension<super::auth::CurrentUser>,
     Query(params): Query<WatchlistStatusParams>,
 ) -> AppResult<Json<WatchlistStatus>> {
-    let entry = db::watchlist::get(&state.db, params.tmdb_id, params.media_type.as_str()).await?;
+    let entry = db::watchlist::get(
+        &state.db,
+        current.id,
+        params.tmdb_id,
+        params.media_type.as_str(),
+    )
+    .await?;
     Ok(Json(WatchlistStatus {
         in_watchlist: entry.is_some(),
     }))
@@ -169,10 +182,11 @@ pub struct RemoveWatchlistParams {
     responses((status = 204), (status = 404, description = "Item is not on the watchlist")))]
 pub async fn remove_from_watchlist(
     State(state): State<AppState>,
+    axum::Extension(current): axum::Extension<super::auth::CurrentUser>,
     Path(tmdb_id): Path<i64>,
     Query(params): Query<RemoveWatchlistParams>,
 ) -> AppResult<StatusCode> {
-    if db::watchlist::delete(&state.db, tmdb_id, params.media_type.as_str()).await? {
+    if db::watchlist::delete(&state.db, current.id, tmdb_id, params.media_type.as_str()).await? {
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(AppError::NotFound(format!(

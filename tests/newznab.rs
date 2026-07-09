@@ -30,6 +30,7 @@ const RSS_FIXTURE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
       <newznab:attr name="size" value="4831838208"/>
       <newznab:attr name="imdb" value="1375666"/>
       <newznab:attr name="grabs" value="120"/>
+      <newznab:attr name="files" value="74"/>
     </item>
     <item>
       <title>Movie.Name.2020.720p.WEB-DL.H.264-OTHER</title>
@@ -94,11 +95,14 @@ async fn movie_search_parses_rss_items() {
     );
     assert_eq!(first.indexer_id, 7);
     assert_eq!(first.indexer_name, "mock-indexer");
+    // Packaging signal for ranking: the `files` attr when reported.
+    assert_eq!(first.file_count, Some(74));
 
     let second = &releases[1];
     assert_eq!(second.guid, "def456");
     // No newznab size attr — fall back to the enclosure length.
     assert_eq!(second.size_bytes, Some(2_147_483_648));
+    assert_eq!(second.file_count, None);
 }
 
 #[tokio::test]

@@ -1,11 +1,9 @@
-//! Watchlist rows for the single default user: TMDB items saved for later,
-//! denormalized (title, artwork, overview) so listing needs no TMDB calls.
+//! Watchlist rows, per user: TMDB items saved for later, denormalized
+//! (title, artwork, overview) so listing needs no TMDB calls.
 
 use sqlx::SqlitePool;
 
 use crate::error::{AppError, AppResult};
-
-const USER_ID: i64 = 1;
 
 /// One watchlist row as stored.
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -39,6 +37,7 @@ pub struct NewWatchlistEntry {
 /// The stored row for an item, when present.
 pub async fn get(
     pool: &SqlitePool,
+    user_id: i64,
     tmdb_id: i64,
     media_type: &str,
 ) -> AppResult<Option<WatchlistEntry>> {
@@ -47,7 +46,7 @@ pub async fn get(
                 backdrop_url, overview, vote_average, added_at
          FROM watchlist WHERE user_id = ? AND tmdb_id = ? AND media_type = ?",
     )
-    .bind(USER_ID)
+    .bind(user_id)
     .bind(tmdb_id)
     .bind(media_type)
     .fetch_optional(pool)
@@ -59,6 +58,7 @@ pub async fn get(
 /// whether this call created it.
 pub async fn add(
     pool: &SqlitePool,
+    user_id: i64,
     entry: &NewWatchlistEntry,
 ) -> AppResult<(WatchlistEntry, bool)> {
     let result = sqlx::query(
@@ -68,7 +68,7 @@ pub async fn add(
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (user_id, tmdb_id, media_type) DO NOTHING",
     )
-    .bind(USER_ID)
+    .bind(user_id)
     .bind(entry.tmdb_id)
     .bind(&entry.media_type)
     .bind(&entry.title)
@@ -81,7 +81,7 @@ pub async fn add(
     .await?;
 
     let created = result.rows_affected() > 0;
-    let row = get(pool, entry.tmdb_id, &entry.media_type)
+    let row = get(pool, user_id, entry.tmdb_id, &entry.media_type)
         .await?
         .ok_or_else(|| {
             AppError::Internal(anyhow::anyhow!("watchlist row vanished after insert"))
@@ -90,23 +90,28 @@ pub async fn add(
 }
 
 /// All watchlist rows, newest first.
-pub async fn list(pool: &SqlitePool) -> AppResult<Vec<WatchlistEntry>> {
+pub async fn list(pool: &SqlitePool, user_id: i64) -> AppResult<Vec<WatchlistEntry>> {
     Ok(sqlx::query_as(
         "SELECT id, tmdb_id, media_type, title, year, poster_url,
                 backdrop_url, overview, vote_average, added_at
          FROM watchlist WHERE user_id = ?
          ORDER BY added_at DESC, id DESC",
     )
-    .bind(USER_ID)
+    .bind(user_id)
     .fetch_all(pool)
     .await?)
 }
 
 /// Delete one item. Returns false when it was not on the list.
-pub async fn delete(pool: &SqlitePool, tmdb_id: i64, media_type: &str) -> AppResult<bool> {
+pub async fn delete(
+    pool: &SqlitePool,
+    user_id: i64,
+    tmdb_id: i64,
+    media_type: &str,
+) -> AppResult<bool> {
     let result =
         sqlx::query("DELETE FROM watchlist WHERE user_id = ? AND tmdb_id = ? AND media_type = ?")
-            .bind(USER_ID)
+            .bind(user_id)
             .bind(tmdb_id)
             .bind(media_type)
             .execute(pool)
@@ -138,7 +143,7 @@ mod tests {
     #[tokio::test]
     async fn add_is_idempotent_per_item() {
         let pool = pool().await;
-        let (row, created) = add(&pool, &entry(27205, "movie", "Inception"))
+        let (row, created) = add(&pool, 1, &entry(27205, "movie", "Inception"))
             .await
             .unwrap();
         assert!(created);
@@ -146,36 +151,38 @@ mod tests {
         assert_eq!(row.year, Some(2010));
 
         // Re-adding does not duplicate and keeps the original row.
-        let (again, created) = add(&pool, &entry(27205, "movie", "Renamed")).await.unwrap();
+        let (again, created) = add(&pool, 1, &entry(27205, "movie", "Renamed"))
+            .await
+            .unwrap();
         assert!(!created);
         assert_eq!(again.id, row.id);
         assert_eq!(again.title, "Inception");
 
         // The same tmdb_id with a different media type is a separate item.
-        let (_, created) = add(&pool, &entry(27205, "tv", "Inception The Series"))
+        let (_, created) = add(&pool, 1, &entry(27205, "tv", "Inception The Series"))
             .await
             .unwrap();
         assert!(created);
-        assert_eq!(list(&pool).await.unwrap().len(), 2);
+        assert_eq!(list(&pool, 1).await.unwrap().len(), 2);
     }
 
     #[tokio::test]
     async fn list_is_newest_first_and_delete_reports_absence() {
         let pool = pool().await;
-        add(&pool, &entry(1, "movie", "First")).await.unwrap();
-        add(&pool, &entry(2, "tv", "Second")).await.unwrap();
+        add(&pool, 1, &entry(1, "movie", "First")).await.unwrap();
+        add(&pool, 1, &entry(2, "tv", "Second")).await.unwrap();
 
-        let all = list(&pool).await.unwrap();
+        let all = list(&pool, 1).await.unwrap();
         assert_eq!(all.len(), 2);
         // Same added_at second is possible; the id tiebreak puts the newer first.
         assert_eq!(all[0].title, "Second");
         assert_eq!(all[1].title, "First");
 
-        assert!(get(&pool, 1, "movie").await.unwrap().is_some());
-        assert!(get(&pool, 1, "tv").await.unwrap().is_none());
+        assert!(get(&pool, 1, 1, "movie").await.unwrap().is_some());
+        assert!(get(&pool, 1, 1, "tv").await.unwrap().is_none());
 
-        assert!(delete(&pool, 1, "movie").await.unwrap());
-        assert!(!delete(&pool, 1, "movie").await.unwrap());
-        assert_eq!(list(&pool).await.unwrap().len(), 1);
+        assert!(delete(&pool, 1, 1, "movie").await.unwrap());
+        assert!(!delete(&pool, 1, 1, "movie").await.unwrap());
+        assert_eq!(list(&pool, 1).await.unwrap().len(), 1);
     }
 }
