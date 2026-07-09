@@ -32,7 +32,11 @@ pub fn spawn(port: u16) {
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
         .collect();
-    let label = if label.is_empty() { "mvp".to_string() } else { label };
+    let label = if label.is_empty() {
+        "mvp".to_string()
+    } else {
+        label
+    };
     let instance = format!("MVP Server ({label})");
     let service = match ServiceInfo::new(
         SERVICE_TYPE,
