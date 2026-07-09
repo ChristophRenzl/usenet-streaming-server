@@ -158,6 +158,17 @@ pub async fn token_user(pool: &SqlitePool, token: &str) -> AppResult<Option<User
     Ok(user)
 }
 
+/// Invalidate every login token of one user (used on password reset so
+/// existing sessions cannot continue with the old credential).
+pub async fn delete_tokens_for_user(pool: &SqlitePool, user_id: i64) -> AppResult<()> {
+    sqlx::query("DELETE FROM user_tokens WHERE user_id = ?")
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .map_err(AppError::Database)?;
+    Ok(())
+}
+
 pub async fn delete_token(pool: &SqlitePool, token: &str) -> AppResult<()> {
     sqlx::query("DELETE FROM user_tokens WHERE token = ?")
         .bind(token)
