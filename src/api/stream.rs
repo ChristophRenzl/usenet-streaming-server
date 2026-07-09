@@ -2054,6 +2054,33 @@ pub async fn hls_segment(
 /// partially extracted window only occurs at the live edge (and yields the
 /// cues known so far instead of an error).
 async fn embedded_window(session: &Arc<Session>, language: &str, window: u64) -> String {
+    let start = window as f64 * subtitles::EMBEDDED_WINDOW_SECS;
+    let end = start + subtitles::EMBEDDED_WINDOW_SECS;
+    // The player fetches each VOD window exactly once, so an empty answer is
+    // final for it. Right after a (seek-)restart the extraction runs a few
+    // seconds behind the requested window (ffmpeg reconnects and seeks the
+    // source first) — wait up to ~5s before conceding the window really has
+    // no cues. Longer holds would risk the player timing the segment out and
+    // disabling the whole track, which is worse than one sparse window;
+    // dialogue-free minutes pay the wait once per window.
+    for attempt in 0..7 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        }
+        let vtt = slice_embedded_window(session, language, start, end).await;
+        if vtt.contains("-->") {
+            return vtt;
+        }
+    }
+    slice_embedded_window(session, language, start, end).await
+}
+
+async fn slice_embedded_window(
+    session: &Arc<Session>,
+    language: &str,
+    start: f64,
+    end: f64,
+) -> String {
     let prefix = format!("sub_emb_{language}_f");
     let mut fragments = Vec::new();
     if let Ok(mut entries) = tokio::fs::read_dir(&session.temp_dir).await {
@@ -2067,8 +2094,7 @@ async fn embedded_window(session: &Arc<Session>, language: &str, window: u64) ->
             }
         }
     }
-    let start = window as f64 * subtitles::EMBEDDED_WINDOW_SECS;
-    subtitles::window_vtt(&fragments, start, start + subtitles::EMBEDDED_WINDOW_SECS)
+    subtitles::window_vtt(&fragments, start, end)
 }
 
 /// Complete once ffmpeg lists it in its own playlist (updated by atomic

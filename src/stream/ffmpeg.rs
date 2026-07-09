@@ -224,6 +224,10 @@ fn build_command(
     for (stream_index, path) in &options.subtitle_extractions {
         cmd.arg("-map").arg(format!("0:{stream_index}?"));
         cmd.args(["-c:s", "webvtt", "-f", "webvtt"]);
+        // Subtitle text trickles out slowly; without per-packet flushing the
+        // cues sit in ffmpeg's ~32K output buffer for most of the runtime and
+        // the growing VTT on disk stays empty — windows then serve no cues.
+        cmd.args(["-flush_packets", "1"]);
         if options.start_secs > 0.0 {
             cmd.arg("-output_ts_offset")
                 .arg(format!("{:.3}", options.start_secs));
@@ -375,6 +379,7 @@ mod tests {
         let args = args(&options);
         assert!(has_pair(&args, "-map", "0:2?"));
         assert!(has_pair(&args, "-c:s", "webvtt"));
+        assert!(has_pair(&args, "-flush_packets", "1"));
         assert!(args
             .last()
             .is_some_and(|a| a.ends_with("sub_emb_en_f000000.vtt")));
