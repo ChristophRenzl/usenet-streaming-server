@@ -192,8 +192,17 @@ fn build_command(
     }
     // One file-wide shift (instead of the muxer-dependent default) so the
     // audio/video relative offset provably survives the negative-timestamp
-    // fixup — also across `-ss` seek restarts.
-    cmd.args(["-avoid_negative_ts", "make_zero"]);
+    // fixup. NOT `make_zero`: that forces the first timestamp to exactly 0
+    // even when positive, silently cancelling the `-output_ts_offset` a seek
+    // restart adds below — restarted segments then carry zero-based fMP4
+    // timestamps while the playlist (and the WebVTT cues, whose outputs
+    // never had this flag) stay on the global timeline. AVPlayer rebases the
+    // video from the playlist so the picture survives, but it anchors
+    // subtitle cues to the segments' internal timestamps — every cue after a
+    // resume landed minutes in the future and never displayed.
+    // `make_non_negative` is the same file-wide shift but only when
+    // timestamps are actually negative, so the restart offset survives.
+    cmd.args(["-avoid_negative_ts", "make_non_negative"]);
     cmd.args([
         "-f",
         "hls",
@@ -412,9 +421,12 @@ mod tests {
 
     #[test]
     fn negative_timestamp_fixup_is_one_shared_shift() {
+        // make_non_negative, NOT make_zero — make_zero would force restarted
+        // spawns back to timestamp 0, cancelling -output_ts_offset and
+        // desyncing WebVTT cues from the video timeline after a resume.
         for transcode_audio in [false, true] {
             let args = args(&base_options(transcode_audio));
-            assert!(has_pair(&args, "-avoid_negative_ts", "make_zero"));
+            assert!(has_pair(&args, "-avoid_negative_ts", "make_non_negative"));
         }
     }
 
