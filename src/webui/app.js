@@ -1124,7 +1124,7 @@ async function renderUsers(main) {
         : '<span class="chip">no password set</span>';
       const actions =
         u.id === 1
-          ? `<button class="btn small" data-pw="${u.id}" data-name="${esc(u.name)}">Reset password</button>`
+          ? '<span class="chip">API-key access</span>'
           : `<button class="btn small" data-pw="${u.id}" data-name="${esc(u.name)}">Reset password</button>
              <button class="btn small danger" data-del="${u.id}" data-name="${esc(u.name)}">Delete</button>`;
       return `<tr>
@@ -1148,10 +1148,10 @@ async function renderUsers(main) {
       </table>
     </div>
     <div class="notice" style="margin-top:18px;max-width:640px">
-      The <strong>owner</strong> (first account) is what the server API key and
-      the Apple TV/iPad apps authenticate as — it cannot be deleted. Give it a
-      password too if you want to sign into the web app by name instead of with
-      the API key.
+      The <strong>owner</strong> (first account) is what the server API key
+      authenticates as — it cannot be deleted and has no password. Devices
+      either use the API key (owner) or sign in with one of the user accounts
+      below.
     </div>`;
 
   $("#add-user").addEventListener("click", () => {

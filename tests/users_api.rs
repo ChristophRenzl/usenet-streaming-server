@@ -179,6 +179,14 @@ async fn non_admins_cannot_manage_users_and_data_is_isolated() {
         .await;
     assert_eq!(relogin.status_code(), 200);
 
+    // The owner has no password to reset — it authenticates via API key.
+    let owner_reset = server
+        .put("/api/v1/users/1/password")
+        .add_header("x-api-key", API_KEY)
+        .json(&json!({"password": "should-not-work"}))
+        .await;
+    assert_eq!(owner_reset.status_code(), 400);
+
     // The owner cannot be deleted.
     let protected = server
         .delete("/api/v1/users/1")

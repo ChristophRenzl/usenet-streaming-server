@@ -108,6 +108,11 @@ pub async fn set_password(
     Path(id): Path<i64>,
     Json(request): Json<SetPasswordRequest>,
 ) -> AppResult<axum::http::StatusCode> {
+    if id == 1 {
+        return Err(AppError::BadRequest(
+            "the owner authenticates with the API key and has no password".into(),
+        ));
+    }
     if !current.is_admin && current.id != id {
         return Err(AppError::BadRequest(
             "you can only change your own password".into(),
