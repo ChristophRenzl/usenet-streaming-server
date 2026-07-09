@@ -40,5 +40,6 @@ pub mod providers;
 pub mod release_blacklist;
 pub mod settings;
 pub mod subtitle_cache;
+pub mod users;
 pub mod watch_history;
 pub mod watchlist;

@@ -303,8 +303,10 @@ impl IntoResponse for SessionOrRepair {
     ))]
 pub async fn create_session(
     State(state): State<AppState>,
+    axum::Extension(current): axum::Extension<super::auth::CurrentUser>,
     Json(request): Json<CreateSessionRequest>,
 ) -> AppResult<SessionOrRepair> {
+    let user_id = current.id;
     // Requested subtitle languages (best-effort auto-attach after start).
     let subtitle_languages = request.subtitle_languages.clone().unwrap_or_default();
     let capabilities = ClientCapabilities {
@@ -318,9 +320,16 @@ pub async fn create_session(
         let download = db::downloads::get(&state.db, &download_id.to_string())
             .await?
             .ok_or_else(|| AppError::NotFound(format!("download {download_id}")))?;
-        return start_disk_session(&state, &download, &subtitle_languages, capabilities, timer)
-            .await
-            .map(|s| SessionOrRepair::Session(Box::new(s)));
+        return start_disk_session(
+            &state,
+            user_id,
+            &download,
+            &subtitle_languages,
+            capabilities,
+            timer,
+        )
+        .await
+        .map(|s| SessionOrRepair::Session(Box::new(s)));
     }
 
     let (tmdb_id, media_type) = request.tmdb_id.zip(request.media_type).ok_or_else(|| {
@@ -357,6 +366,7 @@ pub async fn create_session(
             if tokio::fs::try_exists(path).await.unwrap_or(false) {
                 return start_disk_session(
                     &state,
+                    user_id,
                     &download,
                     &subtitle_languages,
                     capabilities,
@@ -380,6 +390,7 @@ pub async fn create_session(
     // history continues in the exact same release when it is still available.
     let last_release = db::watch_history::last_release_title(
         &state.db,
+        user_id,
         target.tmdb_id,
         target.media_type.as_str(),
         target.season,
@@ -436,6 +447,7 @@ pub async fn create_session(
             HealthVerdict::Streamable if !request.force_repair => {
                 match start_streamable_session(
                     &state,
+                    user_id,
                     &target,
                     &candidate,
                     nzb,
@@ -1163,6 +1175,7 @@ fn preferred_audio_language(pref: &str, original_language: Option<&str>) -> Stri
 #[allow(clippy::too_many_arguments)]
 async fn start_streamable_session(
     state: &AppState,
+    user_id: i64,
     target: &ReleaseTarget,
     candidate: &RankedRelease,
     nzb: Nzb,
@@ -1183,6 +1196,7 @@ async fn start_streamable_session(
 
     let resume_position_secs = db::watch_history::position_secs(
         &state.db,
+        user_id,
         target.tmdb_id,
         target.media_type.as_str(),
         target.season,
@@ -1194,6 +1208,7 @@ async fn start_streamable_session(
     let session = Session::create(
         NewSession {
             media: source.file,
+            user_id,
             tmdb_id: target.tmdb_id,
             media_type: target.media_type,
             season: target.season,
@@ -1265,6 +1280,7 @@ async fn start_streamable_session(
 
     db::watch_history::record_session_start(
         &state.db,
+        user_id,
         &db::watch_history::SessionStart {
             tmdb_id: target.tmdb_id,
             media_type: target.media_type.as_str(),
@@ -1290,6 +1306,7 @@ async fn start_streamable_session(
 /// [`DiskFile`] over the stored path feeds the usual probe/HLS pipeline.
 async fn start_disk_session(
     state: &AppState,
+    user_id: i64,
     download: &db::downloads::Download,
     subtitle_languages: &[String],
     capabilities: ClientCapabilities,
@@ -1329,6 +1346,7 @@ async fn start_disk_session(
 
     let resume_position_secs = db::watch_history::position_secs(
         &state.db,
+        user_id,
         download.tmdb_id,
         media_type.as_str(),
         season,
@@ -1340,6 +1358,7 @@ async fn start_disk_session(
     let session = Session::create(
         NewSession {
             media: Arc::new(media),
+            user_id,
             tmdb_id: download.tmdb_id,
             media_type,
             season,
@@ -1398,6 +1417,7 @@ async fn start_disk_session(
 
     db::watch_history::record_session_start(
         &state.db,
+        user_id,
         &db::watch_history::SessionStart {
             tmdb_id: download.tmdb_id,
             media_type: media_type.as_str(),
@@ -1788,16 +1808,23 @@ fn vod_playlist(duration_secs: f64, suffix: &str) -> String {
 #[derive(Debug, Deserialize)]
 pub struct ApiKeyParam {
     apikey: Option<String>,
+    /// User bearer token — the web client's media requests authenticate by
+    /// query because hls.js segment fetches cannot always carry headers.
+    token: Option<String>,
 }
 
 impl ApiKeyParam {
-    /// `?apikey=<encoded>` when the request authenticated by query, else "".
-    /// Header-authenticated clients keep sending the header themselves.
+    /// `?apikey=<encoded>` / `?token=<encoded>` when the request
+    /// authenticated by query, else "". Header-authenticated clients keep
+    /// sending the header themselves.
     fn uri_suffix(&self) -> String {
-        match &self.apikey {
-            Some(key) => format!("?apikey={}", percent_encode_component(key)),
-            None => String::new(),
+        if let Some(key) = &self.apikey {
+            return format!("?apikey={}", percent_encode_component(key));
         }
+        if let Some(token) = &self.token {
+            return format!("?token={}", percent_encode_component(token));
+        }
+        String::new()
     }
 }
 
@@ -2635,6 +2662,7 @@ mod tests {
         Session::create(
             NewSession {
                 media: Arc::new(NullFile),
+                user_id: 1,
                 tmdb_id,
                 media_type: MediaType::Tv,
                 season: Some(season),
@@ -2849,10 +2877,18 @@ mod tests {
     #[test]
     fn apikey_suffix_is_percent_encoded() {
         let auth = ApiKeyParam {
+            token: None,
             apikey: Some("k/e y+&=?".into()),
         };
         assert_eq!(auth.uri_suffix(), "?apikey=k%2Fe%20y%2B%26%3D%3F");
-        assert_eq!(ApiKeyParam { apikey: None }.uri_suffix(), "");
+        assert_eq!(
+            ApiKeyParam {
+                apikey: None,
+                token: None
+            }
+            .uri_suffix(),
+            ""
+        );
     }
 
     #[test]

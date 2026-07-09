@@ -154,6 +154,7 @@ async fn scrobble(
     // once more right before ending the session).
     let position = db::watch_history::position_secs(
         &state.db,
+        session.user_id,
         session.tmdb_id,
         session.media_type.as_str(),
         session.season,
@@ -203,6 +204,7 @@ pub async fn sync_watched_from_trakt(state: &AppState) -> AppResult<(u64, u64)> 
     for movie in client.watched_movies(&token).await? {
         if db::watch_history::mark_watched_remote(
             &state.db,
+            1, // Trakt is linked server-wide; imports land on the owner.
             movie.tmdb_id,
             "movie",
             None,
@@ -221,6 +223,7 @@ pub async fn sync_watched_from_trakt(state: &AppState) -> AppResult<(u64, u64)> 
             for episode in &season.episodes {
                 if db::watch_history::mark_watched_remote(
                     &state.db,
+                    1, // Trakt is linked server-wide; imports land on the owner.
                     show.tmdb_id,
                     "tv",
                     Some(season.number),
