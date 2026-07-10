@@ -17,8 +17,8 @@ use crate::error::{AppError, AppResult};
 
 use super::models::{
     Collection, Episode, Genre, MediaType, Movie, Person, RawCollection, RawEpisode, RawGenreList,
-    RawMovieDetails, RawPerson, RawSearchResponse, RawSeasonDetails, RawTvDetails, SearchResult,
-    Season, TvShow,
+    RawMovieDetails, RawPerson, RawSearchItem, RawSearchResponse, RawSeasonDetails, RawTvDetails,
+    SearchResult, Season, TvShow,
 };
 
 /// Search scope for [`TmdbClient::search`].
@@ -222,7 +222,7 @@ impl TmdbClient {
                 }
                 ("/search/tv", Some(MediaType::Tv))
             }
-            SearchType::Multi => ("/search/multi", None),
+            SearchType::Multi => return self.search_combined(query).await,
         };
         let raw: RawSearchResponse = self.get_json(path, &params).await?;
         Ok(raw
@@ -230,6 +230,75 @@ impl TmdbClient {
             .into_iter()
             .filter_map(|item| item.into_result(forced))
             .collect())
+    }
+
+    /// Combined movie+TV search. TMDB's /search/multi is a poor fit for
+    /// search-as-you-type: it ranks people above titles (page one for
+    /// "strang" is all actors named Strang, which we drop, leaving nothing)
+    /// and it misses word prefixes the dedicated endpoints match ("strang"
+    /// finds Stranger Things on /search/tv, zero titles on /search/multi).
+    /// Query both endpoints and merge: exact titles, then title-prefix
+    /// matches, then word-prefix matches, then the rest — popularity within
+    /// each tier.
+    async fn search_combined(&self, query: &str) -> AppResult<Vec<SearchResult>> {
+        let (movies, tv) = self.search_title_pair(query).await;
+        let query_lower = query.to_lowercase();
+        let mut candidates: Vec<(RawSearchItem, MediaType)> = (movies?.results)
+            .into_iter()
+            .map(|item| (item, MediaType::Movie))
+            .chain((tv?.results).into_iter().map(|item| (item, MediaType::Tv)))
+            .collect();
+
+        // TMDB only prefix-matches an *incomplete* final word: "strang" finds
+        // Stranger Things, but the complete word "strange" matches only as
+        // the word "strange" and the show vanishes mid-typing. Re-querying
+        // with the last character dropped turns the final word back into a
+        // prefix; the union keeps such titles visible through every
+        // keystroke. Best-effort — errors here never fail the search.
+        let last_word_len = query
+            .split_whitespace()
+            .next_back()
+            .map_or(0, |word| word.chars().count());
+        if !query.ends_with(char::is_whitespace) && last_word_len >= 4 {
+            let mut chars = query.chars();
+            chars.next_back();
+            let (movies, tv) = self.search_title_pair(chars.as_str()).await;
+            if let Ok(response) = movies {
+                candidates.extend(response.results.into_iter().map(|i| (i, MediaType::Movie)));
+            }
+            if let Ok(response) = tv {
+                candidates.extend(response.results.into_iter().map(|i| (i, MediaType::Tv)));
+            }
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        let mut merged: Vec<(u8, f64, SearchResult)> = candidates
+            .into_iter()
+            .filter_map(|(item, kind)| {
+                let popularity = item.popularity.unwrap_or(0.0);
+                item.into_result(Some(kind))
+                    .filter(|result| seen.insert((result.media_type, result.tmdb_id)))
+                    .map(|result| (title_match_tier(&result.title, &query_lower), popularity, result))
+            })
+            .collect();
+        merged.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.total_cmp(&a.1)));
+        Ok(merged.into_iter().map(|(_, _, result)| result).collect())
+    }
+
+    /// One page each of /search/movie and /search/tv for `query`, fetched
+    /// concurrently.
+    async fn search_title_pair(
+        &self,
+        query: &str,
+    ) -> (
+        AppResult<RawSearchResponse>,
+        AppResult<RawSearchResponse>,
+    ) {
+        let params = vec![("query", query.to_string())];
+        tokio::join!(
+            self.get_json::<RawSearchResponse>("/search/movie", &params),
+            self.get_json::<RawSearchResponse>("/search/tv", &params),
+        )
     }
 
     /// One page of a TMDB list endpoint mapped to [`SearchResult`]s. `forced`
@@ -433,5 +502,43 @@ impl TmdbClient {
             )
             .await?;
         Ok(raw.into())
+    }
+}
+
+/// Relevance tier for merged search results: 0 = exact title match,
+/// 1 = title starts with the query, 2 = some word in the title starts with
+/// the query, 3 = everything else. Lower sorts first.
+fn title_match_tier(title: &str, query_lower: &str) -> u8 {
+    let title_lower = title.to_lowercase();
+    if title_lower == query_lower {
+        0
+    } else if title_lower.starts_with(query_lower) {
+        1
+    } else if title_lower
+        .split_whitespace()
+        .any(|word| word.starts_with(query_lower))
+    {
+        2
+    } else {
+        3
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::title_match_tier;
+
+    #[test]
+    fn prefix_typing_ranks_title_starts_first() {
+        // Typing "strange" on the way to "stranger things": the title that
+        // continues the query beats one that merely contains the word.
+        assert!(
+            title_match_tier("Stranger Things", "strange")
+                < title_match_tier("Doctor Strange", "strange")
+        );
+        assert_eq!(title_match_tier("Stranger Things", "stranger things"), 0);
+        assert_eq!(title_match_tier("Stranger Things", "stranger th"), 1);
+        assert_eq!(title_match_tier("Doctor Strange", "strang"), 2);
+        assert_eq!(title_match_tier("Moana", "strang"), 3);
     }
 }
