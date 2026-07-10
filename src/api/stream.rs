@@ -1653,6 +1653,8 @@ async fn register_embedded_subtitle_tracks(session: &Arc<Session>, embedded: &[(
             key: format!("emb_{lang}"),
             base_vtt: String::new(),
             offset_ms: 0,
+            // Embedded timing IS the reference; never auto-aligned.
+            auto_offset_ms: Some(0),
             default,
         });
         tracing::info!(session = %session.id, %lang, "attached embedded subtitle");
@@ -1996,6 +1998,41 @@ pub async fn hls_segment(
         )));
     };
     session.touch();
+    // First fetch of an external subtitle: snap it onto the embedded track's
+    // release-accurate cue timing before the bytes go out. Providers author
+    // against arbitrary encodes, so a constant sync error is common — and the
+    // player caches this VTT for the whole session, so this is the one moment
+    // the correction can happen. Runs once per track; the manual offset (if
+    // any) is preserved on top.
+    if segment.ends_with(".vtt") && !segment.starts_with("sub_emb_") {
+        let unaligned = session
+            .subtitle_tracks()
+            .into_iter()
+            .find(|t| t.vtt_name == segment && t.auto_offset_ms.is_none());
+        if let Some(track) = unaligned {
+            let reference = embedded_reference_cues(&session, &track.language).await;
+            // Fewer reference cues than the estimator's own minimum cannot
+            // produce an estimate; leave the track unmarked so a later
+            // refetch (e.g. after a manual-offset reload) retries with more
+            // of the extraction done.
+            if reference.len() >= 10 {
+                match subtitles::auto_align_subtitle(&session, &track.key, &reference).await {
+                    Ok(Some(ms)) if ms != 0 => tracing::info!(
+                        session = %session.id, key = %track.key, auto_offset_ms = ms,
+                        "auto-aligned external subtitle to embedded timing"
+                    ),
+                    Ok(_) => tracing::debug!(
+                        session = %session.id, key = %track.key,
+                        "external subtitle already in sync with embedded timing"
+                    ),
+                    Err(error) => tracing::warn!(
+                        session = %session.id, key = %track.key, %error,
+                        "subtitle auto-align failed"
+                    ),
+                }
+            }
+        }
+    }
     // Subtitle renditions are written straight to the session dir (not produced
     // by ffmpeg), so serve them from disk. The child playlist references the
     // .vtt by a relative URI, so header-less players need the ?apikey=
@@ -2085,6 +2122,40 @@ async fn slice_embedded_window(
         }
     }
     subtitles::window_vtt(&fragments, start, end)
+}
+
+/// Cue start times from the session's embedded-subtitle extraction, the
+/// release-accurate timing reference for auto-aligning external tracks.
+/// Prefers fragments of `language`; any embedded language is still a valid
+/// timing reference (same cut, same scene timing) when the requested one has
+/// no extraction.
+async fn embedded_reference_cues(session: &Arc<Session>, language: &str) -> Vec<f64> {
+    let preferred = format!("sub_emb_{language}_f");
+    let mut same_language: Vec<f64> = Vec::new();
+    let mut any_language: Vec<f64> = Vec::new();
+    if let Ok(mut entries) = tokio::fs::read_dir(&session.temp_dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !(name.starts_with("sub_emb_") && name.ends_with(".vtt") && name.contains("_f")) {
+                continue;
+            }
+            let Ok(text) = tokio::fs::read_to_string(entry.path()).await else {
+                continue;
+            };
+            let starts = subtitles::vtt::cue_start_times(&text);
+            if name.starts_with(&preferred) {
+                same_language.extend(starts);
+            } else {
+                any_language.extend(starts);
+            }
+        }
+    }
+    if same_language.len() >= 10 {
+        same_language
+    } else {
+        any_language
+    }
 }
 
 /// Complete once ffmpeg lists it in its own playlist (updated by atomic

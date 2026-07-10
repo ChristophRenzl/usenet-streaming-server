@@ -281,6 +281,15 @@ impl Session {
         Some(track.clone())
     }
 
+    /// Record the automatic alignment result for the track with `key` (0 =
+    /// attempted, nothing to correct), so alignment runs once per session.
+    pub fn set_subtitle_auto_offset(&self, key: &str, auto_ms: i64) -> Option<SubtitleTrack> {
+        let mut tracks = self.subtitles.lock().expect("subtitle lock");
+        let track = tracks.iter_mut().find(|t| t.key == key)?;
+        track.auto_offset_ms = Some(auto_ms);
+        Some(track.clone())
+    }
+
     /// Set the probe result; only the first call wins.
     pub fn set_info(&self, info: MediaInfo) {
         let _ = self.info.set(info);

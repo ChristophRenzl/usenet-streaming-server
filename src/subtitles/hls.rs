@@ -38,6 +38,11 @@ pub struct SubtitleTrack {
     pub base_vtt: String,
     /// Current cumulative manual offset in milliseconds (positive = later).
     pub offset_ms: i64,
+    /// Automatic alignment against the embedded track's release-accurate cue
+    /// timing: `None` = not attempted yet, `Some(ms)` = attempted (0 when the
+    /// track was already in sync or no confident estimate existed). Applied
+    /// on top of the manual offset when the VTT is emitted.
+    pub auto_offset_ms: Option<i64>,
     /// Whether this is the auto-selected default track.
     pub default: bool,
 }
@@ -187,6 +192,7 @@ mod tests {
             key: format!("{lang}_{n}"),
             base_vtt: String::new(),
             offset_ms: 0,
+            auto_offset_ms: None,
             default,
         }
     }
