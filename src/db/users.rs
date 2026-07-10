@@ -23,6 +23,30 @@ pub struct User {
     pub has_password: bool,
 }
 
+/// Per-user playback aggregates for the admin Users page. `watch_time_secs`
+/// sums the stored playback positions across all history rows — a proxy for
+/// total time watched (rewatches and abandoned positions count once);
+/// `last_activity` is the newest history update (position reports touch it
+/// every few seconds during playback).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct WatchStats {
+    pub user_id: i64,
+    pub watch_time_secs: f64,
+    pub last_activity: Option<String>,
+}
+
+pub async fn watch_stats(pool: &SqlitePool) -> AppResult<Vec<WatchStats>> {
+    sqlx::query_as(
+        "SELECT user_id,
+                COALESCE(SUM(position_secs), 0.0) AS watch_time_secs,
+                MAX(watched_at) AS last_activity
+         FROM watch_history GROUP BY user_id",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(AppError::Database)
+}
+
 pub async fn list(pool: &SqlitePool) -> AppResult<Vec<User>> {
     sqlx::query_as(
         "SELECT id, name, is_admin,

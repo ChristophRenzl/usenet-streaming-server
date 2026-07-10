@@ -1133,6 +1133,26 @@ async function renderDownloads(main) {
 
 // ---- Security -------------------------------------------------------------------------
 
+/// "3h 42m" (or "12m" / "—") from a seconds count.
+function formatWatchTime(secs) {
+  if (!secs || secs < 60) return "\u2014";
+  const h = Math.floor(secs / 3600);
+  const m = Math.round((secs % 3600) / 60);
+  return h > 0 ? `${h}h ${m}m` : `${m}m`;
+}
+
+/// Relative "3h ago" / "2d ago" from an SQLite UTC timestamp, or "never".
+function formatLastActivity(ts) {
+  if (!ts) return "never";
+  const then = new Date(ts.replace(" ", "T") + "Z");
+  const mins = Math.floor((Date.now() - then.getTime()) / 60000);
+  if (Number.isNaN(mins)) return esc(ts);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins}m ago`;
+  if (mins < 48 * 60) return `${Math.floor(mins / 60)}h ago`;
+  return `${Math.floor(mins / 1440)}d ago`;
+}
+
 async function renderUsers(main) {
   const users = await api("/users");
 
@@ -1153,6 +1173,8 @@ async function renderUsers(main) {
       return `<tr>
         <td>${esc(u.name)} ${owner}</td>
         <td>${role} ${passwordState}</td>
+        <td>${formatWatchTime(u.watch_time_secs)}</td>
+        <td class="muted">${formatLastActivity(u.last_activity)}</td>
         <td class="actions">${actions}</td>
       </tr>`;
     })
@@ -1166,7 +1188,7 @@ async function renderUsers(main) {
     )}
     <div class="card">
       <table>
-        <thead><tr><th>Name</th><th>Role</th><th></th></tr></thead>
+        <thead><tr><th>Name</th><th>Role</th><th>Watch time</th><th>Last activity</th><th></th></tr></thead>
         <tbody>${rows}</tbody>
       </table>
     </div>
