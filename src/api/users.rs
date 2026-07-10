@@ -4,7 +4,7 @@
 
 use axum::extract::{Path, State};
 use axum::{Extension, Json};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
@@ -29,9 +29,41 @@ fn require_admin(user: &CurrentUser) -> AppResult<()> {
 pub async fn list_users(
     State(state): State<AppState>,
     Extension(current): Extension<CurrentUser>,
-) -> AppResult<Json<Vec<User>>> {
+) -> AppResult<Json<Vec<UserWithStats>>> {
     require_admin(&current)?;
-    Ok(Json(db::users::list(&state.db).await?))
+    let stats: std::collections::HashMap<i64, db::users::WatchStats> =
+        db::users::watch_stats(&state.db)
+            .await?
+            .into_iter()
+            .map(|s| (s.user_id, s))
+            .collect();
+    let users = db::users::list(&state.db)
+        .await?
+        .into_iter()
+        .map(|user| {
+            let stat = stats.get(&user.id);
+            UserWithStats {
+                watch_time_secs: stat.map(|s| s.watch_time_secs).unwrap_or(0.0),
+                last_activity: stat.and_then(|s| s.last_activity.clone()),
+                user,
+            }
+        })
+        .collect();
+    Ok(Json(users))
+}
+
+/// A user plus playback-report aggregates for the admin Users page.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct UserWithStats {
+    #[serde(flatten)]
+    pub user: User,
+    /// Sum of stored playback positions across the user's history, in
+    /// seconds — a proxy for total watch time.
+    pub watch_time_secs: f64,
+    /// UTC timestamp of the user's newest history update (position reports
+    /// touch it during playback), or null for a user who never played
+    /// anything.
+    pub last_activity: Option<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
