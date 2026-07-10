@@ -248,6 +248,99 @@ pub fn window_vtt(fragments: &[String], start_secs: f64, end_secs: f64) -> Strin
     out
 }
 
+/// Start times (seconds) of every cue in a WebVTT document, in document
+/// order. Used to align one subtitle timeline against another.
+pub fn cue_start_times(vtt: &str) -> Vec<f64> {
+    parse_cues(vtt).into_iter().map(|c| c.start_secs).collect()
+}
+
+/// Largest plausible sync error between a provider subtitle and the release,
+/// in seconds. Deltas beyond this are treated as "different cue entirely".
+const ALIGN_MAX_SHIFT_SECS: f64 = 30.0;
+/// Histogram bin width for the offset vote.
+const ALIGN_BIN_SECS: f64 = 0.25;
+/// Deltas within this distance of the winning bin count as inliers.
+const ALIGN_INLIER_SECS: f64 = 0.6;
+/// Minimum inliers for a confident estimate.
+const ALIGN_MIN_INLIERS: usize = 10;
+/// Offsets smaller than this are noise — the track is already in sync.
+const ALIGN_MIN_OFFSET_SECS: f64 = 0.2;
+
+/// Estimate the constant offset (seconds, positive = subject is early and
+/// must shift later) that best aligns `subject` cue start times onto
+/// `reference` ones.
+///
+/// Used to snap a provider subtitle (authored against some arbitrary encode)
+/// onto the release-accurate timing of the embedded track. Each subject cue
+/// votes with the delta to its nearest reference cue; the densest 0.25s bin
+/// wins and the estimate is the median of its ±0.6s inliers. Returns `None`
+/// without a confident majority (≥ 10 inliers and ≥ half of all votes) or
+/// when the estimate is too small to matter — a wrong shift is worse than
+/// none, so every threshold errs toward `None`.
+pub fn estimate_alignment_offset(subject: &[f64], reference: &[f64]) -> Option<f64> {
+    let mut reference: Vec<f64> = reference.iter().copied().filter(|t| t.is_finite()).collect();
+    reference.sort_by(f64::total_cmp);
+    if reference.len() < ALIGN_MIN_INLIERS {
+        return None;
+    }
+    let (ref_first, ref_last) = (reference[0], reference[reference.len() - 1]);
+
+    // Nearest-reference delta for every subject cue near the covered span.
+    let mut deltas: Vec<f64> = Vec::new();
+    for &t in subject {
+        if !t.is_finite() || t < ref_first - ALIGN_MAX_SHIFT_SECS || t > ref_last + ALIGN_MAX_SHIFT_SECS
+        {
+            continue;
+        }
+        let i = reference.partition_point(|&r| r < t);
+        let mut best = f64::INFINITY;
+        if i < reference.len() {
+            best = reference[i] - t;
+        }
+        if i > 0 && (reference[i - 1] - t).abs() < best.abs() {
+            best = reference[i - 1] - t;
+        }
+        if best.abs() <= ALIGN_MAX_SHIFT_SECS {
+            deltas.push(best);
+        }
+    }
+    if deltas.len() < ALIGN_MIN_INLIERS {
+        return None;
+    }
+
+    // Vote: densest bin (with its direct neighbors, so a peak straddling a
+    // bin edge still wins) proposes the offset.
+    let bins = (2.0 * ALIGN_MAX_SHIFT_SECS / ALIGN_BIN_SECS).ceil() as usize + 1;
+    let mut histogram = vec![0usize; bins];
+    for &d in &deltas {
+        let bin = ((d + ALIGN_MAX_SHIFT_SECS) / ALIGN_BIN_SECS) as usize;
+        histogram[bin.min(bins - 1)] += 1;
+    }
+    let peak = (0..bins)
+        .max_by_key(|&i| {
+            histogram[i.saturating_sub(1)]
+                + histogram[i]
+                + histogram[(i + 1).min(bins - 1)]
+        })
+        .unwrap_or(0);
+    let peak_center = peak as f64 * ALIGN_BIN_SECS - ALIGN_MAX_SHIFT_SECS + ALIGN_BIN_SECS / 2.0;
+
+    let mut inliers: Vec<f64> = deltas
+        .iter()
+        .copied()
+        .filter(|d| (d - peak_center).abs() <= ALIGN_INLIER_SECS)
+        .collect();
+    if inliers.len() < ALIGN_MIN_INLIERS || inliers.len() * 2 < deltas.len() {
+        return None;
+    }
+    inliers.sort_by(f64::total_cmp);
+    let offset = inliers[inliers.len() / 2];
+    if offset.abs() < ALIGN_MIN_OFFSET_SECS {
+        return None;
+    }
+    Some(offset)
+}
+
 /// A cue timing line contains the `-->` arrow.
 fn is_timing_line(line: &str) -> bool {
     line.contains("-->")
@@ -362,6 +455,50 @@ mod tests {
         assert!(out.contains("00:00:05.000 --> 00:00:07.500 line:85%"));
         // A cue overlapping the window end is included.
         assert!(out.contains("00:00:59.000 --> 00:01:03.000\nSpans boundary"));
+    }
+
+    #[test]
+    fn alignment_recovers_constant_shift() {
+        // Provider subs run 2.5s early relative to the release; timing jitter
+        // of up to ±120ms, a few dropped and a few extra cues.
+        let reference: Vec<f64> = (0..40).map(|i| 10.0 + i as f64 * 7.3).collect();
+        let mut subject: Vec<f64> = reference
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i % 9 != 0) // dropouts
+            .map(|(i, t)| t - 2.5 + ((i % 5) as f64 - 2.0) * 0.06) // jitter
+            .collect();
+        subject.extend([3.0, 150.55, 260.2]); // stray extra cues
+        let offset = estimate_alignment_offset(&subject, &reference).expect("confident estimate");
+        assert!((offset - 2.5).abs() < 0.15, "estimated {offset}");
+    }
+
+    #[test]
+    fn alignment_rejects_unrelated_timelines() {
+        let reference: Vec<f64> = (0..40).map(|i| 10.0 + i as f64 * 7.0).collect();
+        // Pseudo-random unrelated cue times (deterministic LCG).
+        let mut x: u64 = 7;
+        let subject: Vec<f64> = (0..40)
+            .map(|_| {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (x >> 33) as f64 % 280.0
+            })
+            .collect();
+        assert_eq!(estimate_alignment_offset(&subject, &reference), None);
+    }
+
+    #[test]
+    fn alignment_leaves_synced_tracks_alone() {
+        let reference: Vec<f64> = (0..30).map(|i| 5.0 + i as f64 * 6.0).collect();
+        let subject: Vec<f64> = reference.iter().map(|t| t + 0.05).collect();
+        assert_eq!(estimate_alignment_offset(&subject, &reference), None);
+    }
+
+    #[test]
+    fn alignment_needs_enough_evidence() {
+        let reference = vec![10.0, 20.0, 30.0];
+        let subject = vec![12.5, 22.5, 32.5];
+        assert_eq!(estimate_alignment_offset(&subject, &reference), None);
     }
 
     #[test]

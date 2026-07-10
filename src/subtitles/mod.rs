@@ -135,6 +135,7 @@ pub async fn attach_subtitle(
         key,
         base_vtt: vtt,
         offset_ms: 0,
+        auto_offset_ms: None,
         default,
     };
     session.add_subtitle_track(track.clone());
@@ -154,12 +155,43 @@ pub async fn set_subtitle_offset(
     let Some(track) = session.subtitle_track_by_key(key) else {
         return Ok(None);
     };
-    let shifted = vtt::shift_vtt(&track.base_vtt, offset_ms);
+    let shifted = vtt::shift_vtt(
+        &track.base_vtt,
+        offset_ms + track.auto_offset_ms.unwrap_or(0),
+    );
     tokio::fs::write(session.temp_dir.join(&track.vtt_name), shifted.as_bytes())
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("rewriting subtitle vtt: {e}")))?;
     let updated = session.set_subtitle_offset(key, offset_ms);
     Ok(updated)
+}
+
+/// Align an external track onto reference cue start times (the embedded
+/// track's release-accurate timing) and re-emit its WebVTT with the detected
+/// offset (manual offset preserved on top). Records the attempt on the track
+/// either way so it runs once per session; `reference` must already carry
+/// enough cues to judge (the caller gates on that). Returns the applied
+/// offset in milliseconds, `Some(0)` when the track was already in sync.
+pub async fn auto_align_subtitle(
+    session: &Arc<Session>,
+    key: &str,
+    reference: &[f64],
+) -> AppResult<Option<i64>> {
+    let Some(track) = session.subtitle_track_by_key(key) else {
+        return Ok(None);
+    };
+    let subject = vtt::cue_start_times(&track.base_vtt);
+    let auto_ms = vtt::estimate_alignment_offset(&subject, reference)
+        .map(|secs| (secs * 1000.0).round() as i64)
+        .unwrap_or(0);
+    if auto_ms != 0 {
+        let shifted = vtt::shift_vtt(&track.base_vtt, track.offset_ms + auto_ms);
+        tokio::fs::write(session.temp_dir.join(&track.vtt_name), shifted.as_bytes())
+            .await
+            .map_err(|e| AppError::Internal(anyhow::anyhow!("rewriting subtitle vtt: {e}")))?;
+    }
+    session.set_subtitle_auto_offset(key, auto_ms);
+    Ok(Some(auto_ms))
 }
 
 /// Validate + normalize a language code to lower case: a 2–3 letter ISO code
