@@ -201,8 +201,16 @@ fn parse_cues(vtt: &str) -> Vec<Cue> {
 /// files while the media streams (one fragment per (re)start position), and
 /// each HLS window request is answered with the cues overlapping
 /// `[start_secs, end_secs)` across all fragments, deduplicated (fragments
-/// from seek restarts can overlap). Cue times stay absolute — the rendition's
-/// `X-TIMESTAMP-MAP` anchors local zero to the program timeline.
+/// from seek restarts can overlap).
+///
+/// Cue times are emitted RELATIVE to the window start, with the
+/// `X-TIMESTAMP-MAP` advertising the window's position on the program
+/// timeline — the canonical form every HLS packager produces and the only
+/// one AVPlayer reliably renders. The mathematically equivalent absolute
+/// form (absolute cue times, `MPEGTS:0`) coincides with it near time zero,
+/// which is why fresh-from-the-start playback rendered while a deep resume
+/// left the track dark (AVPlayer logs WebVTT err=-12783 and stops consuming
+/// the rendition).
 pub fn window_vtt(fragments: &[String], start_secs: f64, end_secs: f64) -> String {
     let mut cues: Vec<Cue> = fragments
         .iter()
@@ -216,12 +224,18 @@ pub fn window_vtt(fragments: &[String], start_secs: f64, end_secs: f64) -> Strin
     });
     cues.dedup();
 
-    let mut out = String::from(VTT_HEADER);
+    let mut out = format!(
+        "WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:{},LOCAL:00:00:00.000\n\n",
+        (start_secs * 90_000.0).round() as u64
+    );
     for cue in cues {
+        // A cue straddling the window start clamps to local zero.
+        let local_start = (cue.start_secs - start_secs).max(0.0);
+        let local_end = (cue.end_secs - start_secs).max(0.0);
         out.push_str(&format!(
             "{} --> {}",
-            format_timestamp(cue.start_secs),
-            format_timestamp(cue.end_secs)
+            format_timestamp(local_start),
+            format_timestamp(local_end)
         ));
         if let Some(settings) = &cue.settings {
             out.push(' ');
@@ -336,15 +350,18 @@ mod tests {
                   00:01:59.000 --> 00:02:03.000\nSpans boundary\n\n\
                   00:03:00.000 --> 00:03:02.000\nLate\n\n";
         let out = window_vtt(&[f0.to_string(), f1.to_string()], 60.0, 120.0);
-        assert!(out.starts_with("WEBVTT\nX-TIMESTAMP-MAP"));
+        // The map advertises the window's position on the program timeline
+        // (60s × 90kHz) and cue times are window-relative — the canonical
+        // HLS WebVTT form AVPlayer renders.
+        assert!(out.starts_with("WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:5400000,LOCAL:00:00:00.000"));
         // Cue before the window is excluded, late cue too.
         assert!(!out.contains("Early"));
         assert!(!out.contains("Late"));
-        // The duplicated cue appears once, settings preserved.
+        // The duplicated cue appears once, settings preserved, times relative.
         assert_eq!(out.matches("In window").count(), 1);
-        assert!(out.contains("00:01:05.000 --> 00:01:07.500 line:85%"));
-        // A cue overlapping the window end is included with absolute times.
-        assert!(out.contains("00:01:59.000 --> 00:02:03.000\nSpans boundary"));
+        assert!(out.contains("00:00:05.000 --> 00:00:07.500 line:85%"));
+        // A cue overlapping the window end is included.
+        assert!(out.contains("00:00:59.000 --> 00:01:03.000\nSpans boundary"));
     }
 
     #[test]

@@ -1557,9 +1557,17 @@ async fn probe_and_spawn(
     };
     // Embedded text subtitles matching the requested languages ride along as
     // extra WebVTT outputs of the same ffmpeg — release-accurate, no
-    // OpenSubtitles quota. One stream per language, first match wins.
+    // OpenSubtitles quota. One stream per language, first match wins. The
+    // admin can turn the whole mechanism off, leaving external providers as
+    // the only subtitle source.
+    let embedded_enabled = db::settings::get(&state.db, db::settings::EMBEDDED_SUBTITLES_ENABLED)
+        .await
+        .ok()
+        .flatten()
+        .as_deref()
+        != Some("false");
     let mut embedded_subtitles: Vec<(i64, String)> = Vec::new();
-    for language in subtitle_languages {
+    for language in subtitle_languages.iter().filter(|_| embedded_enabled) {
         let lang = ffprobe::primary_language_code(language);
         if embedded_subtitles.iter().any(|(_, l)| *l == lang) {
             continue;
@@ -2015,10 +2023,15 @@ pub async fn hls_segment(
         };
     }
 
-    // Fast path: the segment is already on disk and complete.
+    // Fast path: the segment is already on disk and complete. An empty read
+    // means the file was just (re)created and not yet written — fall through
+    // to the pump, which waits for the bytes; serving 0 bytes is a fatal
+    // 'fmt?' parse error in AVPlayer that kills playback (or the rendition).
     if segment_complete(&session, &segment).await {
         if let Ok(bytes) = tokio::fs::read(session.temp_dir.join(&segment)).await {
-            return Ok(([(header::CONTENT_TYPE, "video/mp4")], bytes).into_response());
+            if !bytes.is_empty() {
+                return Ok(([(header::CONTENT_TYPE, "video/mp4")], bytes).into_response());
+            }
         }
     }
 
@@ -2039,20 +2052,46 @@ pub async fn hls_segment(
 
 /// One embedded-subtitle window: merge all extraction fragments for the
 /// language (one per ffmpeg (re)start position) and slice the window's time
-/// range. Serves whatever has been extracted so far — the player requests
-/// windows near the playhead, where extraction has already passed, so a
-/// partially extracted window only occurs at the live edge (and yields the
-/// cues known so far instead of an error).
+/// range.
+///
+/// A VOD player fetches each window exactly ONCE and caches the answer
+/// forever — serving a window before extraction has passed its end
+/// permanently truncates it. That is precisely what a resume does: AVPlayer
+/// prefetches the next several windows within seconds of the seek restart,
+/// while the fresh ffmpeg is still re-covering them — each answered window
+/// froze as empty/partial and subtitles stayed dark from the resume point
+/// on. So first wait (bounded) until the transcode — cue flushing runs in
+/// step with it — has produced media past the window end, the extraction
+/// has finished, or the deadline passes. During normal linear playback the
+/// transcode is far ahead and this costs nothing.
 async fn embedded_window(session: &Arc<Session>, language: &str, window: u64) -> String {
     let start = window as f64 * subtitles::EMBEDDED_WINDOW_SECS;
     let end = start + subtitles::EMBEDDED_WINDOW_SECS;
-    // The player fetches each VOD window exactly once, so an empty answer is
-    // final for it. Right after a (seek-)restart the extraction runs a few
-    // seconds behind the requested window (ffmpeg reconnects and seeks the
-    // source first) — wait up to ~5s before conceding the window really has
-    // no cues. Longer holds would risk the player timing the segment out and
-    // disabling the whole track, which is worse than one sparse window;
-    // dialogue-free minutes pay the wait once per window.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let playlist = session.playlist_path();
+        let produced = tokio::fs::read_to_string(&playlist).await.unwrap_or_default();
+        let produced_end = session.start_offset()
+            + produced
+                .lines()
+                .filter_map(|line| line.strip_prefix("#EXTINF:"))
+                .filter_map(|rest| rest.split(',').next())
+                .filter_map(|value| value.trim().parse::<f64>().ok())
+                .sum::<f64>();
+        if produced_end >= end
+            || produced.contains("#EXT-X-ENDLIST")
+            || tokio::time::Instant::now() >= deadline
+        {
+            break;
+        }
+        // Long waits are legitimate right after a seek; keep the reaper away.
+        session.touch();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    // Extraction has passed the window (or the wait capped out). A short
+    // extra grace covers the muxer flushing a cue that straddles the window
+    // start; a genuinely dialogue-free window pays it once and returns
+    // header-only, which is correct.
     for attempt in 0..7 {
         if attempt > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(800)).await;
@@ -2089,11 +2128,14 @@ async fn slice_embedded_window(
 
 /// Complete once ffmpeg lists it in its own playlist (updated by atomic
 /// rename after each finished segment). init.mp4 is written whole at
-/// startup.
+/// startup — but it briefly exists EMPTY right after creation (and on a
+/// seek-restart rewrite), so existence alone would serve 0 bytes, a fatal
+/// 'fmt?' in AVPlayer; require content.
 async fn segment_complete(session: &Arc<Session>, segment: &str) -> bool {
     if segment == "init.mp4" {
-        return tokio::fs::try_exists(session.temp_dir.join(segment))
+        return tokio::fs::metadata(session.temp_dir.join(segment))
             .await
+            .map(|meta| meta.len() > 0)
             .unwrap_or(false);
     }
     tokio::fs::read_to_string(session.playlist_path())
@@ -2627,7 +2669,12 @@ async fn playlist_seconds(playlist: &FsPath) -> f64 {
 
 /// Delete the video playlist + segments inside the session dir (keeping the
 /// directory itself), but preserve attached external subtitle renditions
-/// (`sub_*.m3u8` / `sub_*.vtt`) so they survive a seek restart.
+/// (`sub_*.m3u8` / `sub_*.vtt`) so they survive a seek restart — and
+/// `init.mp4`: the init segment is identical across restarts (same input,
+/// same mapping, same encoder settings), and deleting it races any player
+/// fetching it concurrently with the seek that triggered the restart. A
+/// 0-byte init.mp4 read in that window is a fatal 'fmt?' error in AVPlayer —
+/// the exact resume-with-subtitles failure this preserves against.
 async fn wipe_dir(dir: &FsPath) -> AppResult<()> {
     let mut entries = tokio::fs::read_dir(dir)
         .await
@@ -2636,7 +2683,7 @@ async fn wipe_dir(dir: &FsPath) -> AppResult<()> {
         if entry
             .file_name()
             .to_str()
-            .is_some_and(|name| name.starts_with("sub_"))
+            .is_some_and(|name| name.starts_with("sub_") || name == "init.mp4")
         {
             continue;
         }

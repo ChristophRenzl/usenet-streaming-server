@@ -129,7 +129,25 @@ const DEFAULT_BANDWIDTH_BPS: i64 = 20_000_000;
 pub fn master_playlist(tracks: &[SubtitleTrack], variant: &MasterVariant) -> String {
     let mut out = String::from("#EXTM3U\n#EXT-X-VERSION:7\n");
 
-    for track in tracks {
+    // External provider tracks are listed first and carry the DEFAULT flag:
+    // they are single full-file VTTs that every player times correctly from
+    // any resume position. The windowed embedded renditions misrender after
+    // deep resumes on AVPlayer (tvOS/iOS) regardless of X-TIMESTAMP-MAP
+    // form, so they stay selectable but are never auto-picked. Sessions
+    // without an external track keep the embedded default as a fallback.
+    let mut ordered: Vec<&SubtitleTrack> = tracks
+        .iter()
+        .filter(|t| !t.key.starts_with("emb_"))
+        .collect();
+    let externals = ordered.len();
+    ordered.extend(tracks.iter().filter(|t| t.key.starts_with("emb_")));
+
+    for (index, track) in ordered.iter().enumerate() {
+        let default = if externals > 0 {
+            index == 0
+        } else {
+            track.default
+        };
         out.push_str(&format!(
             "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"{group}\",NAME=\"{name}\",\
              LANGUAGE=\"{lang}\",AUTOSELECT=YES,DEFAULT={default},\
@@ -137,7 +155,7 @@ pub fn master_playlist(tracks: &[SubtitleTrack], variant: &MasterVariant) -> Str
             group = SUBTITLE_GROUP,
             name = escape_attr(&track.name),
             lang = escape_attr(&track.language),
-            default = if track.default { "YES" } else { "NO" },
+            default = if default { "YES" } else { "NO" },
             uri = track.playlist_name,
         ));
     }
