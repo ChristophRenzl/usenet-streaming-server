@@ -726,7 +726,7 @@ async function renderSubtitles(main) {
   const providerLabel = { opensubtitles: "OpenSubtitles", subdl: "SubDL" };
 
   main.innerHTML = `
-    ${pageHead("Subtitles", "Automatic subtitle search and delivery. Optional — playback works without it. When enabled, the server searches the providers below (in order) at playback start, matches the release, corrects fps drift, and offers the subtitle natively. Text subtitles embedded in the release are always preferred and cost no provider quota.")}
+    ${pageHead("Subtitles", "Automatic subtitle search and delivery. Optional — playback works without it. When enabled, the server searches the providers below (in order) at playback start, matches the release, corrects fps drift, and offers the subtitle natively. Text subtitles embedded in the release are preferred (toggle below) and cost no provider quota.")}
 
     <div class="card" style="max-width:640px">
       <div class="page-head" style="margin:0 0 12px">
@@ -747,6 +747,15 @@ async function renderSubtitles(main) {
       <div class="form-actions">
         <button type="button" class="btn primary" id="save-order">Save order</button>
       </div>
+    </div>
+
+    <div class="card" style="max-width:640px;margin-top:16px">
+      <h2>Embedded subtitles</h2>
+      <p class="muted" style="margin-top:0">Text subtitles inside the release itself are extracted on the fly and offered as "(embedded)" tracks — perfectly synced and free of provider quota. Turn this off to always use the providers below instead.</p>
+      <label class="field" style="display:flex;align-items:center;gap:10px;cursor:pointer">
+        <input type="checkbox" id="embedded-subs" style="width:auto" ${app.embedded_subtitles_enabled === false ? "" : "checked"}>
+        <span>Extract embedded subtitles</span>
+      </label>
     </div>
 
     <div class="card" style="max-width:640px;margin-top:16px">
@@ -802,6 +811,20 @@ async function renderSubtitles(main) {
         </div>
       </form>
     </div>`;
+
+  // ---- Embedded subtitles toggle ----
+  $("#embedded-subs").addEventListener("change", async (e) => {
+    try {
+      await api("/settings/app", {
+        method: "PUT",
+        body: JSON.stringify({ embedded_subtitles_enabled: e.target.checked }),
+      });
+      toast(e.target.checked ? "Embedded subtitles enabled." : "Embedded subtitles disabled.", "success");
+    } catch (err) {
+      e.target.checked = !e.target.checked;
+      toast("Saving failed: " + err.message);
+    }
+  });
 
   // ---- Provider order interactions ----
   const orderList = $("#provider-order");

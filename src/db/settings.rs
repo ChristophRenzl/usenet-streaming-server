@@ -25,6 +25,11 @@ pub const SUBDL_API_KEY: &str = "subdl_api_key";
 /// are appended in their default order. Absent = default order.
 pub const SUBTITLE_PROVIDER_ORDER: &str = "subtitle_provider_order";
 
+/// "false" disables on-the-fly extraction of text subtitles embedded in the
+/// release (the "(embedded)" tracks); external providers are then the only
+/// subtitle source. Absent or anything else = enabled.
+pub const EMBEDDED_SUBTITLES_ENABLED: &str = "embedded_subtitles_enabled";
+
 /// Key under which the OpenSubtitles account password is stored (paired with
 /// [`OPENSUBTITLES_USERNAME`]).
 pub const OPENSUBTITLES_PASSWORD: &str = "opensubtitles_password";

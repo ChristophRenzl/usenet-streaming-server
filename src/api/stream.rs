@@ -1557,9 +1557,17 @@ async fn probe_and_spawn(
     };
     // Embedded text subtitles matching the requested languages ride along as
     // extra WebVTT outputs of the same ffmpeg — release-accurate, no
-    // OpenSubtitles quota. One stream per language, first match wins.
+    // OpenSubtitles quota. One stream per language, first match wins. The
+    // admin can turn the whole mechanism off, leaving external providers as
+    // the only subtitle source.
+    let embedded_enabled = db::settings::get(&state.db, db::settings::EMBEDDED_SUBTITLES_ENABLED)
+        .await
+        .ok()
+        .flatten()
+        .as_deref()
+        != Some("false");
     let mut embedded_subtitles: Vec<(i64, String)> = Vec::new();
-    for language in subtitle_languages {
+    for language in subtitle_languages.iter().filter(|_| embedded_enabled) {
         let lang = ffprobe::primary_language_code(language);
         if embedded_subtitles.iter().any(|(_, l)| *l == lang) {
             continue;
