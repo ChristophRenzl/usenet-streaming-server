@@ -104,11 +104,29 @@ fn try_patch(bytes: &[u8], dv_level: u8) -> Option<Vec<u8>> {
         return None;
     }
 
+    // Dolby's ISOBMFF spec: the DOVIConfigurationBox must DIRECTLY follow the
+    // HEVCConfigurationBox — Apple's parser will not engage the DV pipeline
+    // with another box (e.g. `pasp`) in between. Sub-boxes start after the
+    // 78-byte VisualSampleEntry fields.
+    let mut sub = entry + 86;
+    let entry_end = entry + entry_size;
+    let mut insert_at = None;
+    while sub + 8 <= entry_end {
+        let size = read_u32(bytes, sub)? as usize;
+        if size < 8 || sub + size > entry_end {
+            return None;
+        }
+        if &bytes[sub + 4..sub + 8] == b"hvcC" {
+            insert_at = Some(sub + size);
+            break;
+        }
+        sub += size;
+    }
+    let insert_at = insert_at?;
+
     let mut out = Vec::with_capacity(bytes.len() + DVCC_BOX_LEN as usize);
     out.extend_from_slice(bytes);
     out[entry + 4..entry + 8].copy_from_slice(b"dvh1");
-    // Splice dvcC at the end of the sample entry, after hvcC & friends.
-    let insert_at = entry + entry_size;
     let dvcc = dvcc_box(dv_level);
     out.splice(insert_at..insert_at, dvcc.iter().copied());
     // Every ancestor grows by the spliced box.
@@ -132,9 +150,12 @@ mod tests {
     }
 
     fn synthetic_init() -> Vec<u8> {
-        // hvc1 sample entry: 8 header + 4 payload stand-in (a real entry has
-        // 70+ bytes and an hvcC box; the patcher only needs size + fourcc).
-        let entry = container(b"hvc1", vec![0xAA; 4]);
+        // hvc1 sample entry: 78-byte visual header, then an hvcC box followed
+        // by a pasp box (mirrors ffmpeg output; dvcC must land between them).
+        let mut entry_payload = vec![0u8; 78];
+        entry_payload.extend(container(b"hvcC", vec![0xBB; 8]));
+        entry_payload.extend(container(b"pasp", vec![0u8; 8]));
+        let entry = container(b"hvc1", entry_payload);
         let mut stsd_payload = vec![0, 0, 0, 0, 0, 0, 0, 1]; // version/flags + count
         stsd_payload.extend(entry);
         let stsd = container(b"stsd", stsd_payload);
@@ -163,6 +184,10 @@ mod tests {
             .position(|w| w == b"dvcC")
             .expect("dvcC");
         assert_eq!(&patched[at + 4..at + 9], &[1, 0, 0x0A, 0x35, 0]);
+        // dvcC must directly follow hvcC (before pasp), per Dolby's spec.
+        let hvcc = patched.windows(4).position(|w| w == b"hvcC").expect("hvcC");
+        let pasp = patched.windows(4).position(|w| w == b"pasp").expect("pasp");
+        assert!(hvcc < at && at < pasp, "dvcC must sit between hvcC and pasp");
         // moov size grew by exactly one box.
         let moov_at = patched
             .windows(4)
