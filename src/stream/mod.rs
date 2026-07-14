@@ -2,6 +2,7 @@
 //! remux writing into a per-session temp dir, byte-range access to the raw
 //! media, and lifecycle management (idle reaping, seek restarts, teardown).
 
+pub mod dovi;
 pub mod ffmpeg;
 pub mod ffprobe;
 pub mod fingerprint;

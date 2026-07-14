@@ -93,6 +93,8 @@ pub struct SpawnOptions<'a> {
     pub video_codec: Option<&'a str>,
     /// Tone-map HDR video to 1080p SDR H.264 instead of copying.
     pub tonemap_to_sdr: bool,
+    /// Source carries a Dolby Vision configuration record (any profile).
+    pub dolby_vision: bool,
     /// Which audio stream (0-based, among audio streams) to serve — picked
     /// by language preference so dual-language releases don't default to
     /// the dub that happens to be muxed first.
@@ -109,9 +111,22 @@ pub struct SpawnOptions<'a> {
 /// it.
 pub async fn spawn_hls(session: &Arc<Session>, options: SpawnOptions<'_>) -> AppResult<()> {
     let dir = &session.temp_dir;
+    // Dolby Vision (profile 5 especially) ships without standard color tags —
+    // zscale then fails the whole filter graph ("Generic error in an external
+    // library"). Declare the PQ/BT.2020 assumption explicitly; for P5's
+    // IPTPQc2 base layer the colors come out slightly shifted, but a watchable
+    // tone-map beats a dead session.
+    let dv_tonemap: String;
     let tonemap_filter = if options.tonemap_to_sdr {
         if has_filter(options.ffmpeg_path, "zscale").await {
-            TONEMAP_TO_SDR_FILTER
+            if options.dolby_vision {
+                dv_tonemap = format!(
+                    "setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc,{TONEMAP_TO_SDR_FILTER}"
+                );
+                dv_tonemap.as_str()
+            } else {
+                TONEMAP_TO_SDR_FILTER
+            }
         } else {
             tracing::warn!(
                 session = %session.id,
@@ -177,6 +192,12 @@ fn build_command(
         // rebuild hvcC from the in-band parameter sets.
         if matches!(options.video_codec, Some(c) if c.eq_ignore_ascii_case("hevc")) {
             cmd.args(["-tag:v", "hvc1", "-bsf:v", "hevc_mp4toannexb"]);
+        }
+        // Keep the Dolby Vision configuration record: movenc only writes the
+        // dvcC box under unofficial compliance, and without it a DV stream
+        // decodes with garbage colors on Apple players.
+        if options.dolby_vision {
+            cmd.args(["-strict", "unofficial"]);
         }
     }
     if options.transcode_audio {
@@ -373,6 +394,7 @@ mod tests {
             transcode_audio,
             video_codec: Some("h264"),
             tonemap_to_sdr: false,
+            dolby_vision: false,
             audio_stream_index: 0,
             subtitle_extractions: Vec::new(),
         }

@@ -28,6 +28,11 @@ pub struct ProbeResult {
     /// HLS `VIDEO-RANGE` value derived from the color transfer: `PQ`
     /// (HDR10/DV), `HLG`, or `SDR`.
     pub video_range: String,
+    /// Dolby Vision profile from the DOVI configuration record (5, 7, 8...);
+    /// `None` for non-DV streams.
+    pub dv_profile: Option<i64>,
+    /// Dolby Vision level, for the `dvh1.PP.LL` codec string.
+    pub dv_level: Option<i64>,
     /// Video profile as ffprobe names it (e.g. "Main 10", "High").
     pub video_profile: Option<String>,
     /// Codec level as ffprobe reports it (HEVC: 153 = 5.1; H.264: 41 = 4.1).
@@ -211,6 +216,16 @@ struct ProbeStream {
     color_transfer: Option<String>,
     #[serde(default)]
     tags: Option<ProbeTags>,
+    #[serde(default)]
+    side_data_list: Vec<ProbeSideData>,
+}
+
+/// Per-stream side data; only the Dolby Vision configuration record is read.
+#[derive(Debug, Deserialize)]
+struct ProbeSideData {
+    side_data_type: Option<String>,
+    dv_profile: Option<i64>,
+    dv_level: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -340,6 +355,8 @@ fn parse_probe(doc: ProbeDoc) -> AppResult<ProbeResult> {
     let mut subtitle_streams = Vec::new();
     let mut fps = None;
     let mut color_transfer = None;
+    let mut dv_profile = None;
+    let mut dv_level = None;
     for stream in &doc.streams {
         match stream.codec_type.as_deref() {
             Some("video") if !has_video => {
@@ -352,6 +369,12 @@ fn parse_probe(doc: ProbeDoc) -> AppResult<ProbeResult> {
                 fps = parse_frame_rate(stream.avg_frame_rate.as_deref())
                     .or_else(|| parse_frame_rate(stream.r_frame_rate.as_deref()));
                 color_transfer = stream.color_transfer.clone();
+                if let Some(dovi) = stream.side_data_list.iter().find(|d| {
+                    d.side_data_type.as_deref() == Some("DOVI configuration record")
+                }) {
+                    dv_profile = dovi.dv_profile;
+                    dv_level = dovi.dv_level;
+                }
             }
             Some("audio") => {
                 audio_streams.push(AudioStream {
@@ -391,9 +414,13 @@ fn parse_probe(doc: ProbeDoc) -> AppResult<ProbeResult> {
         ));
     }
 
+    // Dolby Vision profile 5 carries no standard transfer tags — its HDR
+    // nature lives solely in the DOVI configuration record. Without this it
+    // would be mislabeled SDR and AVPlayer decodes garbage (or refuses).
     let video_range = match color_transfer.as_deref() {
         Some("smpte2084") => "PQ",
         Some("arib-std-b67") => "HLG",
+        _ if dv_profile == Some(5) => "PQ",
         _ => "SDR",
     }
     .to_string();
@@ -417,6 +444,8 @@ fn parse_probe(doc: ProbeDoc) -> AppResult<ProbeResult> {
         audio_streams,
         fps,
         video_range,
+        dv_profile,
+        dv_level,
         video_profile,
         video_level,
         width,

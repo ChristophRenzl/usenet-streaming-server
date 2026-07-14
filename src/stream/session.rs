@@ -73,6 +73,13 @@ pub struct MediaInfo {
     pub video_range: String,
     /// True when the video is tone-mapped to SDR for an HDR-incapable client.
     pub video_transcoded: bool,
+    /// Dolby Vision profile of the *source* (`None` for non-DV). When served
+    /// unchanged (copy mode), profile 5 needs the `dvh1` sample entry patched
+    /// into the init segment; when tone-mapping, it drives explicit zscale
+    /// input color parameters.
+    pub dv_profile: Option<i64>,
+    /// Dolby Vision level for the dvcC box / codec string.
+    pub dv_level: Option<i64>,
     /// RFC 6381 `CODECS` value for the master playlist, describing the
     /// *served* stream (post-transcode). `None` when the codec combination is
     /// not confidently mappable — the attribute is then omitted.
