@@ -32,6 +32,11 @@ pub struct Preferences {
     pub allowed_terms: Vec<String>,
     /// Hard-exclude terms — case-insensitive substring match on the title.
     pub blocked_terms: Vec<String>,
+    /// Rank larger releases (more bitrate) above smaller ones within the same
+    /// quality tier. Defaulted so older clients that omit the field keep
+    /// working.
+    #[serde(default)]
+    pub prefer_larger_releases: bool,
 }
 
 impl Preferences {
@@ -68,6 +73,7 @@ struct PreferencesRow {
     language: String,
     allowed_terms: String,
     blocked_terms: String,
+    prefer_larger_releases: bool,
 }
 
 const USER_ID: i64 = 1;
@@ -76,7 +82,8 @@ pub async fn get(pool: &SqlitePool) -> AppResult<Preferences> {
     let row: PreferencesRow = sqlx::query_as(
         "SELECT preferred_resolution, max_resolution, preferred_resolution_tv,
                 max_resolution_tv, preferred_video_codecs,
-                preferred_audio_codecs, max_size_bytes, language, allowed_terms, blocked_terms
+                preferred_audio_codecs, max_size_bytes, language, allowed_terms, blocked_terms,
+                prefer_larger_releases
          FROM preferences WHERE user_id = ?",
     )
     .bind(USER_ID)
@@ -94,6 +101,7 @@ pub async fn get(pool: &SqlitePool) -> AppResult<Preferences> {
         language: row.language,
         allowed_terms: parse_terms(&row.allowed_terms)?,
         blocked_terms: parse_terms(&row.blocked_terms)?,
+        prefer_larger_releases: row.prefer_larger_releases,
     })
 }
 
@@ -102,7 +110,8 @@ pub async fn set(pool: &SqlitePool, prefs: &Preferences) -> AppResult<()> {
         "UPDATE preferences SET preferred_resolution = ?, max_resolution = ?,
              preferred_resolution_tv = ?, max_resolution_tv = ?,
              preferred_video_codecs = ?, preferred_audio_codecs = ?, max_size_bytes = ?,
-             language = ?, allowed_terms = ?, blocked_terms = ?, updated_at = datetime('now')
+             language = ?, allowed_terms = ?, blocked_terms = ?,
+             prefer_larger_releases = ?, updated_at = datetime('now')
          WHERE user_id = ?",
     )
     .bind(prefs.preferred_resolution.to_string())
@@ -115,6 +124,7 @@ pub async fn set(pool: &SqlitePool, prefs: &Preferences) -> AppResult<()> {
     .bind(&prefs.language)
     .bind(to_json(&prefs.allowed_terms)?)
     .bind(to_json(&prefs.blocked_terms)?)
+    .bind(prefs.prefer_larger_releases)
     .bind(USER_ID)
     .execute(pool)
     .await?;
@@ -155,6 +165,7 @@ mod tests {
             language: "en".into(),
             allowed_terms: vec![],
             blocked_terms: vec![],
+            prefer_larger_releases: false,
         }
     }
 

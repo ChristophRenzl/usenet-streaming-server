@@ -249,6 +249,13 @@ fn score(
         if size < 100 * 1024 * 1024 {
             score -= 100;
         }
+        // Opt-in: more bytes = more bitrate at the same tier. 15 points/GB,
+        // capped below the resolution-tier step (300) plus source-tier gaps so
+        // size breaks ties within a tier but cannot outvote the preferred
+        // resolution.
+        if prefs.prefer_larger_releases {
+            score += (size / 1_000_000_000 * 15).min(450);
+        }
     }
 
     // Note on packaging (RAR set vs unpacked): the newznab `files` attribute
@@ -282,6 +289,7 @@ mod tests {
             language: "en".into(),
             allowed_terms: vec![],
             blocked_terms: vec!["CAM".into(), "TELESYNC".into(), "HDCAM".into()],
+            prefer_larger_releases: false,
         }
     }
 
@@ -610,5 +618,33 @@ mod tests {
         let normal = release("Movie.2026.1080p.BluRay.x264-NORMAL");
         let ranked = rank(vec![small, normal], &prefs(), None, None);
         assert!(ranked[0].raw.title.ends_with("NORMAL"));
+    }
+
+    #[test]
+    fn prefer_larger_ranks_bigger_release_first_within_tier() {
+        let mut p = prefs();
+        p.preferred_resolution = Resolution::R2160p;
+        let mut small = release("Show.S01E01.2160p.WEBRip.x265-SMALL");
+        small.size_bytes = Some(1_500_000_000);
+        let mut big = release("Show.S01E01.2160p.WEB.h265-BIG");
+        big.size_bytes = Some(10_500_000_000);
+
+        // Default: the WEBRip's codec bonus can outrank the bigger WEB-DL.
+        // With the toggle, size dominates within the same resolution tier.
+        p.prefer_larger_releases = true;
+        let ranked = rank(vec![small.clone(), big.clone()], &p, None, None);
+        assert_eq!(ranked[0].raw.title, big.title);
+        assert!(ranked[0].score > ranked[1].score);
+
+        p.prefer_larger_releases = false;
+        let ranked = rank(vec![small, big], &p, None, None);
+        let delta = ranked
+            .iter()
+            .find(|c| c.raw.title.contains("BIG"))
+            .map(|c| c.score)
+            .unwrap();
+        // Without the toggle no size bonus is applied to the big release
+        // beyond its normal scoring.
+        assert!(delta <= ranked[0].score);
     }
 }

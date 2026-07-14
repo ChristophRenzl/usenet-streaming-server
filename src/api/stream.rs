@@ -1521,6 +1521,10 @@ async fn probe_and_spawn(
         // High@L4.1 covers the ≤1080p output; a declared level above the
         // actual one is harmless (level support is backwards-compatible).
         Some("avc1.640029".to_string())
+    } else if probe.dv_profile == Some(5) {
+        // DV profile 5 has no HDR10/SDR-compatible base layer; it must be
+        // declared as Dolby Vision or the decoder renders garbage colors.
+        Some(format!("dvh1.05.{:02}", probe.dv_level.unwrap_or(6)))
     } else {
         ffprobe::rfc6381_video_codec(
             probe.video_codec.as_deref(),
@@ -1589,6 +1593,8 @@ async fn probe_and_spawn(
             probe.video_range
         },
         video_transcoded,
+        dv_profile: probe.dv_profile,
+        dv_level: probe.dv_level,
         master_codecs,
         resolution,
         bandwidth_bps,
@@ -1605,6 +1611,7 @@ async fn probe_and_spawn(
             transcode_audio: audio_transcoded,
             video_codec: probe.video_codec.as_deref(),
             tonemap_to_sdr: video_transcoded,
+            dolby_vision: probe.dv_profile.is_some(),
             audio_stream_index,
             subtitle_extractions: embedded_subtitle_extractions(session, &embedded_subtitles, 0.0),
         },
@@ -2058,6 +2065,33 @@ pub async fn hls_segment(
             }
             Err(_) => Err(AppError::NotFound(format!("segment {segment}"))),
         };
+    }
+
+    // Dolby Vision profile 5: ffmpeg 5.x can only write the sample entry as
+    // `hvc1` (+dvcC), but AVPlayer engages its DV pipeline solely for `dvh1`.
+    // The init segment is a single small atomic write at transcode start, so
+    // wait for it (bounded) and patch the fourcc before the bytes go out.
+    let served_info = session.info();
+    if segment == "init.mp4" && served_info.dv_profile == Some(5) && !served_info.video_transcoded {
+        let path = session.temp_dir.join(&segment);
+        let dv_level = session.info().dv_level.unwrap_or(6) as u8;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if let Ok(bytes) = tokio::fs::read(&path).await {
+                if !bytes.is_empty() {
+                    return Ok((
+                        [(header::CONTENT_TYPE, "video/mp4")],
+                        crate::stream::dovi::patch_init_for_dv_p5(bytes, dv_level),
+                    )
+                        .into_response());
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(AppError::NotFound("init.mp4 not produced".into()));
+            }
+            session.touch();
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        }
     }
 
     // Fast path: the segment is already on disk and complete. An empty read
@@ -2713,6 +2747,7 @@ async fn restart_ffmpeg(
             transcode_audio: info.audio_transcoded,
             video_codec: info.video_codec.as_deref(),
             tonemap_to_sdr: info.video_transcoded,
+            dolby_vision: info.dv_profile.is_some(),
             audio_stream_index: info.audio_stream_index,
             subtitle_extractions: embedded_subtitle_extractions(
                 session,
