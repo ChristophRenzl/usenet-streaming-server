@@ -457,6 +457,65 @@ fn parse_probe(doc: ProbeDoc) -> AppResult<ProbeResult> {
     })
 }
 
+/// Presentation time of the last video keyframe at or before `target`,
+/// scanning up to `window` seconds back. Packet-level only (no decoding).
+/// `None` on any failure or when the window holds no keyframe — callers fall
+/// back to plain demuxer seeking.
+pub async fn last_keyframe_before(
+    ffprobe_path: &str,
+    url: &str,
+    target: f64,
+    window: f64,
+) -> Option<f64> {
+    let from = (target - window).max(0.0);
+    // A hair past the target so a keyframe exactly on it is included.
+    let interval = format!("{from:.3}%{:.3}", target + 0.05);
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        tokio::process::Command::new(ffprobe_path)
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "packet=pts_time,flags",
+                "-print_format",
+                "csv",
+                "-read_intervals",
+                &interval,
+            ])
+            .arg(url)
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let mut best: Option<f64> = None;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        // csv: packet,<pts_time>,<flags>
+        let mut fields = line.split(',').skip(1);
+        let (Some(pts), Some(flags)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        if !flags.contains('K') {
+            continue;
+        }
+        let Ok(pts) = pts.trim().parse::<f64>() else {
+            continue;
+        };
+        if pts <= target + 0.05 && best.is_none_or(|b| pts > b) {
+            best = Some(pts);
+        }
+    }
+    best
+}
+
 /// RFC 6381 codec string for the master playlist's `CODECS` attribute.
 ///
 /// AVPlayer refuses a variant whose `VIDEO-RANGE` is PQ/HLG unless it can

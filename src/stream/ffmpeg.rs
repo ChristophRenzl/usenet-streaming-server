@@ -87,6 +87,13 @@ pub struct SpawnOptions<'a> {
     pub input_url: &'a str,
     /// `-ss` input seek; 0 for a fresh start.
     pub start_secs: f64,
+    /// Override for `-output_ts_offset` (defaults to `start_secs`). A
+    /// copy-mode restart pre-probes the keyframe the demuxer will land on
+    /// and sets `2*start_secs - keyframe`, so that keyframe is stamped
+    /// exactly AT the requested segment boundary — video, audio and cues
+    /// shift identically (lip sync survives) and the fMP4 timestamps match
+    /// the VOD playlist grid.
+    pub timeline_offset_secs: Option<f64>,
     pub transcode_audio: bool,
     /// Probed source video codec; decides container-level fixups like the
     /// HEVC `hvc1` tag.
@@ -241,8 +248,8 @@ fn build_command(
         // timeline so a restarted ffmpeg slots into the same playlist.
         let start_number = (options.start_secs / SEGMENT_SECONDS).round() as u64;
         cmd.arg("-start_number").arg(start_number.to_string());
-        cmd.arg("-output_ts_offset")
-            .arg(format!("{:.3}", options.start_secs));
+        let offset = options.timeline_offset_secs.unwrap_or(options.start_secs);
+        cmd.arg("-output_ts_offset").arg(format!("{offset:.3}"));
     }
     cmd.arg("-hls_segment_filename");
     cmd.arg(dir.join("seg_%05d.m4s"));
@@ -395,6 +402,7 @@ mod tests {
             video_codec: Some("h264"),
             tonemap_to_sdr: false,
             dolby_vision: false,
+            timeline_offset_secs: None,
             audio_stream_index: 0,
             subtitle_extractions: Vec::new(),
         }

@@ -985,6 +985,9 @@ async function renderPreferences(main) {
           <div class="field"><label>Prefer larger releases</label>
             <label class="check"><input type="checkbox" name="prefer_larger_releases" ${prefs.prefer_larger_releases ? "checked" : ""}> Rank bigger files first</label>
             <span class="hint">More bitrate at the same resolution; needs a fast connection</span></div>
+          <div class="field"><label>Allow Dolby Vision</label>
+            <label class="check"><input type="checkbox" name="allow_dolby_vision" ${prefs.allow_dolby_vision !== false ? "checked" : ""}> Use DV-only releases</label>
+            <span class="hint">Off: DV-only releases are skipped and stray DV streams are tone-mapped</span></div>
         </div>
       </div>
       <div class="card">
@@ -1033,6 +1036,7 @@ async function renderPreferences(main) {
       allowed_terms: list(f.allowed_terms.value),
       blocked_terms: list(f.blocked_terms.value),
       prefer_larger_releases: f.prefer_larger_releases.checked,
+      allow_dolby_vision: f.allow_dolby_vision.checked,
     };
     try {
       await api("/settings/preferences", { method: "PUT", body: JSON.stringify(body) });

@@ -182,6 +182,12 @@ fn rejection_reason(
             return Some(format!("size {size} exceeds max {max} bytes"));
         }
     }
+    // DV-only releases (no HDR10 fallback layer signaled in the title) are
+    // exactly the ones that need the Dolby Vision pipeline end-to-end;
+    // DV+HDR10 hybrids play fine as plain HDR10 and stay allowed.
+    if !prefs.allow_dolby_vision && parsed.dolby_vision && !parsed.hdr {
+        return Some("Dolby Vision is disabled in preferences".to_string());
+    }
     if let Some(resolution) = parsed.resolution {
         if resolution > prefs.max_resolution {
             return Some(format!(
@@ -290,6 +296,7 @@ mod tests {
             allowed_terms: vec![],
             blocked_terms: vec!["CAM".into(), "TELESYNC".into(), "HDCAM".into()],
             prefer_larger_releases: false,
+            allow_dolby_vision: true,
         }
     }
 
@@ -646,5 +653,22 @@ mod tests {
         // Without the toggle no size bonus is applied to the big release
         // beyond its normal scoring.
         assert!(delta <= ranked[0].score);
+    }
+
+    #[test]
+    fn dolby_vision_only_release_rejected_when_disallowed() {
+        let mut p = prefs();
+        p.preferred_resolution = Resolution::R2160p;
+        p.allow_dolby_vision = false;
+        let dv_only = release("Show.S01E01.DV.2160p.WEB.h265-GRP");
+        let dv_hybrid = release("Show.S01E01.DV.HDR10Plus.2160p.WEBRip-GRP");
+        let hdr = release("Show.S01E01.HDR.2160p.WEB.h265-GRP");
+        let ranked = rank(vec![dv_only, dv_hybrid, hdr], &p, None, None);
+        let rejected: Vec<_> = ranked
+            .iter()
+            .filter(|c| c.rejected.is_some())
+            .map(|c| c.raw.title.clone())
+            .collect();
+        assert_eq!(rejected, vec!["Show.S01E01.DV.2160p.WEB.h265-GRP"]);
     }
 }

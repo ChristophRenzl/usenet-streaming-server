@@ -1513,7 +1513,12 @@ async fn probe_and_spawn(
         ffmpeg::should_transcode_audio(audio_codec.as_deref(), capabilities.supports_dolby_audio);
     // AVPlayer refuses PQ/HLG variants outright on SDR-only outputs, so HDR
     // sources are tone-mapped for clients that declare no HDR support.
-    let video_transcoded = !capabilities.supports_hdr && probe.video_range != "SDR";
+    // A DV profile 5 stream cannot be served as anything but Dolby Vision
+    // (its base layer is compatible with nothing), so when DV is disallowed
+    // in preferences the only correct output is a tone-mapped SDR encode.
+    let allow_dolby_vision = db::preferences::get(&state.db).await?.allow_dolby_vision;
+    let video_transcoded = (!capabilities.supports_hdr && probe.video_range != "SDR")
+        || (probe.dv_profile == Some(5) && !allow_dolby_vision);
     // Master-playlist facts describe the *served* stream. Tone-mapping
     // re-encodes with libx264 (High profile, ≤1920 wide, 12M maxrate); copy
     // mode passes the probed parameters through.
@@ -1608,6 +1613,7 @@ async fn probe_and_spawn(
             ffmpeg_path: &state.config.streaming.ffmpeg_path,
             input_url: &url,
             start_secs: 0.0,
+            timeline_offset_secs: None,
             transcode_audio: audio_transcoded,
             video_codec: probe.video_codec.as_deref(),
             tonemap_to_sdr: video_transcoded,
@@ -2738,12 +2744,46 @@ async fn restart_ffmpeg(
 
     let url = loopback_url(state, session);
     let info = session.info();
+    // Copy mode: `-ss target` lands the demuxer on the keyframe BEFORE the
+    // target, so the first served segment carries timestamps starting up to
+    // a full GOP before its declared playlist position. AVPlayer resolves
+    // that mismatch per track — after a resume, audio and video ended up
+    // anchored differently (seconds of lip-sync offset, varying per seek).
+    // Pre-probe that keyframe and stamp it AT the target instead
+    // (`-output_ts_offset 2*target - keyframe`): the picture resumes a
+    // moment earlier, but video, audio and embedded cues all shift
+    // identically (lip sync survives) and the fMP4 timestamps match the VOD
+    // playlist grid exactly. The demuxer is deliberately still seeked with
+    // the same `target` the probe used, so both resolve the same keyframe.
+    // Transcoding decodes up to the target exactly and needs none of this.
+    let timeline_offset_secs = if !info.video_transcoded && target > 0.0 {
+        let ffprobe_path = &state.config.streaming.ffprobe_path;
+        // Narrow window first: GOPs are a few seconds, and every probed
+        // second is megabytes pulled through the NNTP-backed source.
+        let mut kf = ffprobe::last_keyframe_before(ffprobe_path, &url, target, 4.0).await;
+        if kf.is_none() {
+            kf = ffprobe::last_keyframe_before(ffprobe_path, &url, target, 12.0).await;
+        }
+        if kf.is_none() {
+            tracing::warn!(
+                session = %session.id, target,
+                "keyframe probe failed; restart falls back to demuxer seek (playlist skew up to one GOP)"
+            );
+        }
+        kf.filter(|kf| *kf < target).map(|kf| {
+            tracing::debug!(session = %session.id, target, keyframe = kf, "keyframe-aligned restart");
+            2.0 * target - kf
+        })
+    } else {
+        None
+    };
     ffmpeg::spawn_hls(
         session,
         SpawnOptions {
             ffmpeg_path: &state.config.streaming.ffmpeg_path,
             input_url: &url,
             start_secs: target,
+            timeline_offset_secs,
             transcode_audio: info.audio_transcoded,
             video_codec: info.video_codec.as_deref(),
             tonemap_to_sdr: info.video_transcoded,

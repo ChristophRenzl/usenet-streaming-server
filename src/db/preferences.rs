@@ -37,6 +37,15 @@ pub struct Preferences {
     /// working.
     #[serde(default)]
     pub prefer_larger_releases: bool,
+    /// Allow Dolby-Vision-only releases. When off, DV releases without an
+    /// HDR10 fallback are rejected in ranking and a DV profile 5 stream that
+    /// still slips through is tone-mapped instead of served as DV.
+    #[serde(default = "default_true")]
+    pub allow_dolby_vision: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Preferences {
@@ -74,6 +83,7 @@ struct PreferencesRow {
     allowed_terms: String,
     blocked_terms: String,
     prefer_larger_releases: bool,
+    allow_dolby_vision: bool,
 }
 
 const USER_ID: i64 = 1;
@@ -83,7 +93,7 @@ pub async fn get(pool: &SqlitePool) -> AppResult<Preferences> {
         "SELECT preferred_resolution, max_resolution, preferred_resolution_tv,
                 max_resolution_tv, preferred_video_codecs,
                 preferred_audio_codecs, max_size_bytes, language, allowed_terms, blocked_terms,
-                prefer_larger_releases
+                prefer_larger_releases, allow_dolby_vision
          FROM preferences WHERE user_id = ?",
     )
     .bind(USER_ID)
@@ -102,6 +112,7 @@ pub async fn get(pool: &SqlitePool) -> AppResult<Preferences> {
         allowed_terms: parse_terms(&row.allowed_terms)?,
         blocked_terms: parse_terms(&row.blocked_terms)?,
         prefer_larger_releases: row.prefer_larger_releases,
+        allow_dolby_vision: row.allow_dolby_vision,
     })
 }
 
@@ -111,7 +122,8 @@ pub async fn set(pool: &SqlitePool, prefs: &Preferences) -> AppResult<()> {
              preferred_resolution_tv = ?, max_resolution_tv = ?,
              preferred_video_codecs = ?, preferred_audio_codecs = ?, max_size_bytes = ?,
              language = ?, allowed_terms = ?, blocked_terms = ?,
-             prefer_larger_releases = ?, updated_at = datetime('now')
+             prefer_larger_releases = ?, allow_dolby_vision = ?,
+             updated_at = datetime('now')
          WHERE user_id = ?",
     )
     .bind(prefs.preferred_resolution.to_string())
@@ -125,6 +137,7 @@ pub async fn set(pool: &SqlitePool, prefs: &Preferences) -> AppResult<()> {
     .bind(to_json(&prefs.allowed_terms)?)
     .bind(to_json(&prefs.blocked_terms)?)
     .bind(prefs.prefer_larger_releases)
+    .bind(prefs.allow_dolby_vision)
     .bind(USER_ID)
     .execute(pool)
     .await?;
@@ -166,6 +179,7 @@ mod tests {
             allowed_terms: vec![],
             blocked_terms: vec![],
             prefer_larger_releases: false,
+            allow_dolby_vision: true,
         }
     }
 
