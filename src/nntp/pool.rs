@@ -227,7 +227,10 @@ impl NntpPool {
             };
             match checkout_from(slot, &self.inner.options, Some(permit)).await {
                 Ok(mut guard) => match guard.body(message_id).await {
-                    Ok(body) => return Some(body),
+                    Ok(body) => {
+                        self.record_transfer(body.len());
+                        return Some(body);
+                    }
                     Err(_) => continue,
                 },
                 Err(_) => continue,

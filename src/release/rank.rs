@@ -296,7 +296,11 @@ fn bandwidth_rejection(raw: &RawRelease, gate: Option<StreamGate>) -> Option<Str
         return None;
     }
     let required_bps = size as f64 * 8.0 / gate.runtime_secs;
-    let budget = gate.available_bps as f64 * 0.85;
+    // The measurement is a best 30s window; sustained throughput over a
+    // whole episode runs meaningfully below it (seek locality, article-size
+    // variance, audio transcode competing for CPU). 0.7 measured live: a
+    // remux needing 78 Mbit/s only sustained ~39 on a 93 Mbit/s-burst link.
+    let budget = gate.available_bps as f64 * 0.70;
     if required_bps > budget {
         return Some(format!(
             "needs ~{:.0} Mbit/s but the connection sustains ~{:.0} Mbit/s",

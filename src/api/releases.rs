@@ -81,7 +81,11 @@ pub async fn resolve_candidates(
             (
                 vec![query],
                 ItemInfo {
-                    runtime_secs: movie.runtime_minutes.map(|m| m as f64 * 60.0),
+                    // TMDB rarely lacks movie runtimes; assume a compact 100
+                    // minutes when it does so the bandwidth gate stays armed
+                    // (underestimating runtime overestimates bitrate — the
+                    // safe direction for "will it stream").
+                    runtime_secs: Some(movie.runtime_minutes.map_or(100.0 * 60.0, |m| m as f64 * 60.0)),
                     title: movie.title,
                     year: movie.year,
                     tvdb_id: None,
@@ -105,7 +109,12 @@ pub async fn resolve_candidates(
             (
                 queries,
                 ItemInfo {
-                    runtime_secs: show.episode_runtime_minutes.map(|m| m as f64 * 60.0),
+                    // Prestige shows (HBO etc.) often have an empty
+                    // episode_run_time on TMDB; assume 40 minutes so huge
+                    // remuxes still get bitrate-checked.
+                    runtime_secs: Some(
+                        show.episode_runtime_minutes.map_or(40.0 * 60.0, |m| m as f64 * 60.0),
+                    ),
                     title: show.title,
                     year: show.year,
                     tvdb_id: show.tvdb_id,
