@@ -265,9 +265,13 @@ fn build_command(
         // cues sit in ffmpeg's ~32K output buffer for most of the runtime and
         // the growing VTT on disk stays empty — windows then serve no cues.
         cmd.args(["-flush_packets", "1"]);
-        if options.start_secs > 0.0 {
-            cmd.arg("-output_ts_offset")
-                .arg(format!("{:.3}", options.start_secs));
+        // The SAME timeline offset as the A/V output — a keyframe-aligned
+        // restart stamps video/audio onto the segment grid, and cues must
+        // ride along or every subtitle leads the picture by the keyframe
+        // backoff after a resume.
+        let offset = options.timeline_offset_secs.unwrap_or(options.start_secs);
+        if offset > 0.0 {
+            cmd.arg("-output_ts_offset").arg(format!("{offset:.3}"));
         }
         cmd.arg(path);
     }
