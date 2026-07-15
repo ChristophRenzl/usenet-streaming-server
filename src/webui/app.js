@@ -212,7 +212,7 @@ function currentPage() {
 }
 
 function navigate() {
-  if (!state.key) return;
+  if (!state.auth) return;
   if (pageCleanup) {
     pageCleanup();
     pageCleanup = null;
@@ -1400,9 +1400,12 @@ async function renderSecurity(main) {
     }
     try {
       await api("/settings/app", { method: "PUT", body: JSON.stringify({ api_key: key }) });
-      // Keep this browser signed in with the new key.
-      state.key = key;
-      localStorage.setItem(STORAGE_KEY, key);
+      // Keep this browser signed in with the new key (token sessions are
+      // unaffected by an API-key rotation).
+      if (!state.auth || state.auth.type === "key") {
+        state.auth = { type: "key", value: key };
+        localStorage.setItem(STORAGE_AUTH, JSON.stringify(state.auth));
+      }
       toast("API key changed. Update your other devices with the new key.", "success");
       navigate();
     } catch (err) {
@@ -1414,13 +1417,13 @@ async function renderSecurity(main) {
 // ---- Boot -----------------------------------------------------------------------------
 
 (async function boot() {
-  if (!state.key) {
+  if (!state.auth) {
     $("#login").classList.remove("hidden");
-    $("#login-key").focus();
+    $("#login-user").focus();
     return;
   }
   try {
-    state.info = await verifyKey(state.key);
+    state.info = await verifyAuth(state.auth);
     showApp();
   } catch (err) {
     if (!err.message.includes("not accepted")) toast(err.message);
