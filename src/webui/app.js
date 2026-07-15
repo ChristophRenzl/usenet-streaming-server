@@ -14,7 +14,31 @@ const esc = (s) =>
   );
 
 const STORAGE_KEY = "usenet-streamer-api-key";
-const state = { key: localStorage.getItem(STORAGE_KEY) || "", info: null };
+const STORAGE_AUTH = "usenet-streamer-auth";
+
+/// Auth is either {type:"key",value} (X-Api-Key) or {type:"token",value}
+/// (bearer token from a username/password sign-in). The legacy raw-key
+/// localStorage entry keeps working.
+function loadAuth() {
+  const raw = localStorage.getItem(STORAGE_AUTH);
+  if (raw) {
+    try {
+      const auth = JSON.parse(raw);
+      if (auth && auth.type && auth.value) return auth;
+    } catch { /* fall through */ }
+  }
+  const legacy = localStorage.getItem(STORAGE_KEY);
+  return legacy ? { type: "key", value: legacy } : null;
+}
+
+const state = { auth: loadAuth(), info: null };
+
+function authHeaders(auth = state.auth) {
+  if (!auth) return {};
+  return auth.type === "token"
+    ? { Authorization: `Bearer ${auth.value}` }
+    : { "X-Api-Key": auth.value };
+}
 
 function toast(message, kind = "error") {
   const el = document.createElement("div");
@@ -31,7 +55,7 @@ function loadingHtml(label) {
 // ---- API client -------------------------------------------------------------
 
 async function api(path, options = {}) {
-  const headers = { "X-Api-Key": state.key, ...(options.headers || {}) };
+  const headers = { ...authHeaders(), ...(options.headers || {}) };
   if (options.body !== undefined) headers["Content-Type"] = "application/json";
   let res;
   try {
@@ -60,25 +84,48 @@ async function api(path, options = {}) {
 // ---- Auth / login -----------------------------------------------------------
 
 function signOut() {
-  state.key = "";
+  state.auth = null;
   state.info = null;
   localStorage.removeItem(STORAGE_KEY);
+  localStorage.removeItem(STORAGE_AUTH);
   $("#app").classList.add("hidden");
   $("#login").classList.remove("hidden");
   $("#login-key").value = "";
-  $("#login-key").focus();
+  $("#login-user").value = "";
+  $("#login-pass").value = "";
+  $("#login-user").focus();
 }
 
-async function verifyKey(key) {
+async function verifyAuth(auth) {
   let res;
   try {
-    res = await fetch("/api/v1/system/info", { headers: { "X-Api-Key": key } });
+    res = await fetch("/api/v1/system/info", { headers: authHeaders(auth) });
   } catch {
     throw new Error("Cannot reach the server. Is it running?");
   }
-  if (res.status === 401) throw new Error("That API key was not accepted.");
+  if (res.status === 401) throw new Error("Sign-in was not accepted.");
   if (!res.ok) throw new Error(`Server error (HTTP ${res.status}).`);
   return res.json();
+}
+
+async function loginWithPassword(username, password) {
+  let res;
+  try {
+    res = await fetch("/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password }),
+    });
+  } catch {
+    throw new Error("Cannot reach the server. Is it running?");
+  }
+  if (res.status === 401) throw new Error("Wrong username or password.");
+  if (!res.ok) throw new Error(`Server error (HTTP ${res.status}).`);
+  const data = await res.json();
+  if (!data.user || !data.user.is_admin) {
+    throw new Error("This account is not an admin — ask the server owner, or use the API key.");
+  }
+  return { type: "token", value: data.token };
 }
 
 function showApp() {
@@ -98,10 +145,19 @@ $("#login-form").addEventListener("submit", async (e) => {
   button.disabled = true;
   button.textContent = "Checking…";
   try {
+    const username = $("#login-user").value.trim();
     const key = $("#login-key").value.trim();
-    state.info = await verifyKey(key);
-    state.key = key;
-    localStorage.setItem(STORAGE_KEY, key);
+    let auth;
+    if (username) {
+      auth = await loginWithPassword(username, $("#login-pass").value);
+    } else if (key) {
+      auth = { type: "key", value: key };
+    } else {
+      throw new Error("Enter a username and password, or an API key.");
+    }
+    state.info = await verifyAuth(auth);
+    state.auth = auth;
+    localStorage.setItem(STORAGE_AUTH, JSON.stringify(auth));
     showApp();
   } catch (err) {
     errorBox.textContent = err.message;

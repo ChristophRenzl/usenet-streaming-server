@@ -17,12 +17,17 @@
       <svg viewBox="0 0 32 32" width="44" height="44"><rect width="32" height="32" rx="8" fill="#7b61ff"/><path d="M10 22V10l12 6z" fill="#07080e"/></svg>
     </div>
     <h1>Usenet Streaming Server</h1>
-    <p class="muted">Enter the server API key to open the admin panel.<br>
-       It is the <code>auth.api_key</code> value from your <code>config.toml</code>
-       (or the <code>APP_AUTH__API_KEY</code> environment variable).</p>
+    <p class="muted">Sign in with an admin account, or with the server API key
+       (<code>auth.api_key</code> from <code>config.toml</code> /
+       <code>APP_AUTH__API_KEY</code>).</p>
+    <label for="login-user">Username</label>
+    <input id="login-user" type="text" autocomplete="username" placeholder="Username">
+    <label for="login-pass">Password</label>
+    <input id="login-pass" type="password" autocomplete="current-password" placeholder="Password">
+    <div class="login-divider muted">— or —</div>
     <label for="login-key">API key</label>
-    <input id="login-key" type="password" autocomplete="current-password"
-           placeholder="Paste your API key" required>
+    <input id="login-key" type="password" autocomplete="off"
+           placeholder="Paste your API key">
     <div id="login-error" class="form-error hidden"></div>
     <button type="submit" class="btn primary" id="login-submit">Sign in</button>
   </form>

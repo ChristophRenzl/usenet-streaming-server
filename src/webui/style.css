@@ -439,3 +439,5 @@ td.actions .btn { margin-left: 6px; }
 }
 .order-list li .grow { flex: 1; }
 hr.sep { border: none; border-top: 1px solid var(--border); margin: 20px 0; }
+
+.login-divider { text-align: center; margin: 10px 0 2px; font-size: 12px; }
