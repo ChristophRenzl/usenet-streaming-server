@@ -27,11 +27,21 @@ pub struct RankedRelease {
 ///
 /// `original_language` is the title's ISO 639-1 original language from TMDB;
 /// it only matters when the stored language preference is `original`.
+/// Connection-speed gate: penalize releases whose average bitrate cannot be
+/// streamed over the measured NNTP throughput.
+#[derive(Debug, Clone, Copy)]
+pub struct StreamGate {
+    pub runtime_secs: f64,
+    /// Proven NNTP throughput in bits/s.
+    pub available_bps: u64,
+}
+
 pub fn rank(
     releases: Vec<RawRelease>,
     prefs: &Preferences,
     device_cap: Option<Resolution>,
     original_language: Option<&str>,
+    gate: Option<StreamGate>,
 ) -> Vec<RankedRelease> {
     let scoring_prefs = effective_prefs(prefs, device_cap);
     let lang = LanguageTarget::from_prefs(&prefs.language, original_language);
@@ -39,7 +49,10 @@ pub fn rank(
         .into_iter()
         .map(|raw| {
             let parsed = parse_release_name(&raw.title);
-            let rejected = rejection_reason(&raw, &parsed, prefs, device_cap);
+            let mut rejected = rejection_reason(&raw, &parsed, prefs, device_cap);
+            if rejected.is_none() {
+                rejected = bandwidth_rejection(&raw, gate);
+            }
             let score = score(&raw, &parsed, &scoring_prefs, &lang);
             RankedRelease {
                 raw,
@@ -272,6 +285,28 @@ fn score(
     score
 }
 
+/// Reject releases the connection provably cannot stream in real time:
+/// average bitrate (size over runtime) above 85% of the proven throughput
+/// stalls no matter what the player does. Kept as a rejection (visible in
+/// pickers, overridable by explicit guid pin) rather than a silent skip.
+fn bandwidth_rejection(raw: &RawRelease, gate: Option<StreamGate>) -> Option<String> {
+    let gate = gate?;
+    let size = raw.size_bytes?;
+    if gate.runtime_secs < 60.0 {
+        return None;
+    }
+    let required_bps = size as f64 * 8.0 / gate.runtime_secs;
+    let budget = gate.available_bps as f64 * 0.85;
+    if required_bps > budget {
+        return Some(format!(
+            "needs ~{:.0} Mbit/s but the connection sustains ~{:.0} Mbit/s",
+            required_bps / 1e6,
+            gate.available_bps as f64 / 1e6,
+        ));
+    }
+    None
+}
+
 fn contains_ci(haystack: &[String], needle: &str) -> bool {
     haystack.iter().any(|h| h.eq_ignore_ascii_case(needle))
 }
@@ -325,6 +360,7 @@ mod tests {
             &prefs(),
             None,
             None,
+            None,
         );
         assert_eq!(ranked.len(), 2);
         assert!(ranked[0].rejected.is_none());
@@ -341,6 +377,7 @@ mod tests {
         let ranked = rank(
             vec![release("Movie.2026.2160p.WEB-DL.HEVC-X")],
             &p,
+            None,
             None,
             None,
         );
@@ -361,6 +398,7 @@ mod tests {
             &p,
             None,
             None,
+            None,
         );
         assert!(ranked[0].rejected.as_deref().unwrap().contains("size"));
     }
@@ -373,6 +411,7 @@ mod tests {
                 release("Movie.2026.1080p.BluRay.x264-FHD"),
             ],
             &prefs(),
+            None,
             None,
             None,
         );
@@ -394,6 +433,7 @@ mod tests {
             &prefs(),
             None,
             None,
+            None,
         );
         let titles: Vec<&str> = ranked.iter().map(|r| r.raw.title.as_str()).collect();
         assert!(titles[0].contains("REMUX"));
@@ -413,6 +453,7 @@ mod tests {
             &p,
             None,
             None,
+            None,
         );
         assert!(ranked[0].raw.title.contains("BOOSTED"));
     }
@@ -421,8 +462,8 @@ mod tests {
     fn deterministic_order_with_equal_scores() {
         let a = release("Movie.2026.1080p.BluRay.x264-AAA");
         let b = release("Movie.2026.1080p.BluRay.x264-BBB");
-        let first = rank(vec![a.clone(), b.clone()], &prefs(), None, None);
-        let second = rank(vec![b, a], &prefs(), None, None);
+        let first = rank(vec![a.clone(), b.clone()], &prefs(), None, None, None);
+        let second = rank(vec![b, a], &prefs(), None, None, None);
         let order1: Vec<&str> = first.iter().map(|r| r.raw.title.as_str()).collect();
         let order2: Vec<&str> = second.iter().map(|r| r.raw.title.as_str()).collect();
         assert_eq!(order1, order2, "input order must not matter");
@@ -437,7 +478,7 @@ mod tests {
         let mut old = release("Movie.2026.1080p.BluRay.x264-OLD");
         old.posted_at = Some(Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap());
         let newer = release("Movie.2026.1080p.BluRay.x264-NEW");
-        let ranked = rank(vec![old, newer], &prefs(), None, None);
+        let ranked = rank(vec![old, newer], &prefs(), None, None, None);
         assert!(ranked[0].raw.title.ends_with("NEW"));
     }
 
@@ -451,6 +492,7 @@ mod tests {
             ],
             &prefs(),
             Some(Resolution::R1080p),
+            None,
             None,
         );
         assert!(ranked[0].raw.title.contains("1080p"));
@@ -471,10 +513,12 @@ mod tests {
             &p,
             Some(Resolution::R1080p),
             None,
+            None,
         );
         let native = rank(
             vec![release("Movie.2026.1080p.BluRay.x264-FHD")],
             &prefs(), // prefers 1080p natively
+            None,
             None,
             None,
         );
@@ -500,6 +544,7 @@ mod tests {
             &p,
             Some(Resolution::R1080p),
             None,
+            None,
         );
         let titles: Vec<&str> = ranked.iter().map(|r| r.raw.title.as_str()).collect();
         assert!(titles[0].contains("1080p"), "order was: {titles:?}");
@@ -517,6 +562,7 @@ mod tests {
             vec![release("Movie.2026.2160p.WEB-DL.HEVC-X")],
             &p,
             Some(Resolution::R2160p),
+            None,
             None,
         );
         let reason = ranked[0].rejected.as_deref().expect("must be rejected");
@@ -540,6 +586,7 @@ mod tests {
             &p,
             None,
             Some("ja"),
+            None,
         );
         let titles: Vec<&str> = ranked.iter().map(|r| r.raw.title.as_str()).collect();
         assert!(titles[0].contains("Japanese"), "order was: {titles:?}");
@@ -563,6 +610,7 @@ mod tests {
             &p,
             None,
             Some("en"),
+            None,
         );
         assert!(ranked[0].raw.title.contains("PLAIN"));
     }
@@ -578,6 +626,7 @@ mod tests {
                 release("Movie.2026.French.1080p.BluRay.x264-FR"),
             ],
             &p,
+            None,
             None,
             None,
         );
@@ -599,6 +648,7 @@ mod tests {
             &p,
             None,
             Some("ja"),
+            None,
         );
         assert!(ranked[0].raw.title.contains("VOSTFR"));
     }
@@ -614,6 +664,7 @@ mod tests {
             &p,
             None,
             None,
+            None,
         );
         assert!(ranked[0].rejected.is_some());
     }
@@ -623,7 +674,7 @@ mod tests {
         let mut small = release("Movie.2026.1080p.BluRay.x264-SMALL");
         small.size_bytes = Some(10 * 1024 * 1024);
         let normal = release("Movie.2026.1080p.BluRay.x264-NORMAL");
-        let ranked = rank(vec![small, normal], &prefs(), None, None);
+        let ranked = rank(vec![small, normal], &prefs(), None, None, None);
         assert!(ranked[0].raw.title.ends_with("NORMAL"));
     }
 
@@ -639,12 +690,12 @@ mod tests {
         // Default: the WEBRip's codec bonus can outrank the bigger WEB-DL.
         // With the toggle, size dominates within the same resolution tier.
         p.prefer_larger_releases = true;
-        let ranked = rank(vec![small.clone(), big.clone()], &p, None, None);
+        let ranked = rank(vec![small.clone(), big.clone()], &p, None, None, None);
         assert_eq!(ranked[0].raw.title, big.title);
         assert!(ranked[0].score > ranked[1].score);
 
         p.prefer_larger_releases = false;
-        let ranked = rank(vec![small, big], &p, None, None);
+        let ranked = rank(vec![small, big], &p, None, None, None);
         let delta = ranked
             .iter()
             .find(|c| c.raw.title.contains("BIG"))
@@ -663,12 +714,38 @@ mod tests {
         let dv_only = release("Show.S01E01.DV.2160p.WEB.h265-GRP");
         let dv_hybrid = release("Show.S01E01.DV.HDR10Plus.2160p.WEBRip-GRP");
         let hdr = release("Show.S01E01.HDR.2160p.WEB.h265-GRP");
-        let ranked = rank(vec![dv_only, dv_hybrid, hdr], &p, None, None);
+        let ranked = rank(vec![dv_only, dv_hybrid, hdr], &p, None, None, None);
         let rejected: Vec<_> = ranked
             .iter()
             .filter(|c| c.rejected.is_some())
             .map(|c| c.raw.title.clone())
             .collect();
         assert_eq!(rejected, vec!["Show.S01E01.DV.2160p.WEB.h265-GRP"]);
+    }
+
+    #[test]
+    fn bandwidth_gate_rejects_unstreamable_bitrate() {
+        // 60 GB over 60 min = ~133 Mbit/s; a 90 Mbit/s connection cannot play it.
+        let mut big = release("Show.S01E01.2160p.BluRay.REMUX-GRP");
+        big.size_bytes = Some(60_000_000_000);
+        let mut ok = release("Show.S01E01.2160p.WEB.h265-GRP");
+        ok.size_bytes = Some(10_000_000_000);
+        let gate = Some(StreamGate { runtime_secs: 3600.0, available_bps: 90_000_000 });
+        let mut p = prefs();
+        p.preferred_resolution = Resolution::R2160p;
+        let ranked = rank(vec![big, ok], &p, None, None, gate);
+        let rejected: Vec<_> = ranked.iter().filter(|c| c.rejected.is_some()).collect();
+        assert_eq!(rejected.len(), 1);
+        assert!(rejected[0].raw.title.contains("REMUX"));
+        assert!(rejected[0].rejected.as_deref().unwrap().contains("Mbit/s"));
+        // Without a measurement nothing is gated.
+        let ranked = rank(
+            ranked.into_iter().map(|c| c.raw).collect(),
+            &p,
+            None,
+            None,
+            None,
+        );
+        assert!(ranked.iter().all(|c| c.rejected.is_none()));
     }
 }

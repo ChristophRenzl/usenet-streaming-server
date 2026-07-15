@@ -148,6 +148,9 @@ pub struct TvShow {
     pub seasons: Vec<SeasonSummary>,
     /// Top-billed cast (up to 20, TMDB billing order).
     pub cast: Vec<CastMember>,
+    /// Typical episode length in minutes (TMDB `episode_run_time`, first
+    /// entry), used to estimate a release's bitrate for bandwidth gating.
+    pub episode_runtime_minutes: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -505,6 +508,8 @@ pub(crate) struct RawTvDetails {
     pub seasons: Vec<RawSeasonSummary>,
     #[serde(default)]
     pub credits: Option<RawCredits>,
+    #[serde(default)]
+    pub episode_run_time: Vec<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -548,6 +553,7 @@ impl From<RawTvDetails> for TvShow {
                 })
                 .collect(),
             cast: top_cast(raw.credits),
+            episode_runtime_minutes: raw.episode_run_time.first().copied(),
         }
     }
 }

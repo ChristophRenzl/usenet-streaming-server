@@ -53,6 +53,12 @@ struct ProviderSlot {
 
 struct PoolInner {
     slots: Mutex<Arc<Vec<Arc<ProviderSlot>>>>,
+    /// Rolling article-transfer log for throughput estimation:
+    /// (arrival, bytes), pruned to the last 30 s.
+    transfers: Mutex<std::collections::VecDeque<(std::time::Instant, usize)>>,
+    /// Best sustained throughput observed since boot (bits/s). Grows only:
+    /// it answers "what has this connection proven it can do".
+    best_bps: std::sync::atomic::AtomicU64,
     options: PoolOptions,
 }
 
@@ -96,6 +102,8 @@ impl NntpPool {
     pub fn with_options(providers: Vec<Provider>, options: PoolOptions) -> Self {
         let inner = Arc::new(PoolInner {
             slots: Mutex::new(build_slots(providers)),
+            transfers: Mutex::new(std::collections::VecDeque::new()),
+            best_bps: std::sync::atomic::AtomicU64::new(0),
             options,
         });
         spawn_reaper(&inner);
@@ -144,6 +152,45 @@ impl NntpPool {
         }
     }
 
+    /// Record a completed article transfer and refresh the throughput
+    /// estimate over the trailing 30 s window. Only windows carrying at
+    /// least 8 MB count — idle trickle must not look like a speed limit.
+    fn record_transfer(&self, bytes: usize) {
+        const WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+        let now = std::time::Instant::now();
+        let mut log = self.inner.transfers.lock().expect("transfer lock");
+        log.push_back((now, bytes));
+        while log.front().is_some_and(|(t, _)| now.duration_since(*t) > WINDOW) {
+            log.pop_front();
+        }
+        let total: usize = log.iter().map(|(_, b)| b).sum();
+        if total < 8 * 1024 * 1024 {
+            return;
+        }
+        let elapsed = log
+            .front()
+            .map(|(t, _)| now.duration_since(*t).as_secs_f64())
+            .unwrap_or(0.0)
+            .max(1.0);
+        let bps = (total as f64 * 8.0 / elapsed) as u64;
+        self.inner
+            .best_bps
+            .fetch_max(bps, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Best sustained NNTP throughput observed since boot (bits/s); `None`
+    /// until enough traffic has flowed to measure one.
+    pub fn observed_bps(&self) -> Option<u64> {
+        match self
+            .inner
+            .best_bps
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            0 => None,
+            bps => Some(bps),
+        }
+    }
+
     /// `BODY` with provider fallback. Returns `ArticleNotFound` only after
     /// every reachable provider reported the article missing.
     pub async fn fetch_body(&self, message_id: &str) -> Result<Bytes, NntpError> {
@@ -152,7 +199,10 @@ impl NntpPool {
         let mut last_err = None;
         for slot in slots.iter() {
             match run_on_slot(slot, &self.inner.options, Command::Body(message_id)).await {
-                Ok(CommandOutput::Body(body)) => return Ok(body),
+                Ok(CommandOutput::Body(body)) => {
+                    self.record_transfer(body.len());
+                    return Ok(body);
+                }
                 Ok(_) => {}
                 Err(NntpError::ArticleNotFound) => not_found = true,
                 Err(e) => last_err = Some(e),

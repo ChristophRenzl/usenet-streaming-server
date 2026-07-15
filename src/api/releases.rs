@@ -81,6 +81,7 @@ pub async fn resolve_candidates(
             (
                 vec![query],
                 ItemInfo {
+                    runtime_secs: movie.runtime_minutes.map(|m| m as f64 * 60.0),
                     title: movie.title,
                     year: movie.year,
                     tvdb_id: None,
@@ -104,6 +105,7 @@ pub async fn resolve_candidates(
             (
                 queries,
                 ItemInfo {
+                    runtime_secs: show.episode_runtime_minutes.map(|m| m as f64 * 60.0),
                     title: show.title,
                     year: show.year,
                     tvdb_id: show.tvdb_id,
@@ -126,11 +128,21 @@ pub async fn resolve_candidates(
     if ignore_blocked_terms {
         prefs.blocked_terms.clear();
     }
+    // Releases whose average bitrate exceeds what the connection has proven
+    // it can sustain would stall no matter the buffer; reject them up front.
+    let gate = match (item.runtime_secs, state.nntp_pool.observed_bps()) {
+        (Some(runtime_secs), Some(available_bps)) => Some(crate::release::rank::StreamGate {
+            runtime_secs,
+            available_bps,
+        }),
+        _ => None,
+    };
     let mut ranked = rank(
         raw,
         &prefs,
         max_resolution,
         item.original_language.as_deref(),
+        gate,
     );
 
     // Reject candidates that contradict the requested title (wrong show,
@@ -188,6 +200,8 @@ struct ItemInfo {
     imdb_id: Option<String>,
     original_language: Option<String>,
     absolute_episode: Option<u32>,
+    /// Nominal runtime, for bitrate estimation in the bandwidth gate.
+    runtime_secs: Option<f64>,
 }
 
 /// Build the set of indexer search strategies for one TV episode. Their
@@ -407,6 +421,7 @@ mod tests {
 
     fn show(title: &str, original_language: &str, seasons: Vec<SeasonSummary>) -> TvShow {
         TvShow {
+            episode_runtime_minutes: None,
             tmdb_id: 1,
             media_type: MediaType::Tv,
             imdb_id: None,
