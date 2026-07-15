@@ -263,6 +263,14 @@ fn score(
         }
     }
 
+    // Dolby Vision releases are compatibility land mines (profile roulette,
+    // device-dependent decode) — prefer a plain HDR/SDR encode of the same
+    // tier when one exists. Small enough that a clearly better DV release
+    // still wins.
+    if parsed.dolby_vision {
+        score -= 150;
+    }
+
     // Mild size sanity: implausibly small files are usually spam or samples.
     if let Some(size) = raw.size_bytes {
         if size < 100 * 1024 * 1024 {
