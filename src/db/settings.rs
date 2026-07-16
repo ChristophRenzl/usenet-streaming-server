@@ -39,6 +39,14 @@ pub const OPENSUBTITLES_PASSWORD: &str = "opensubtitles_password";
 /// file / environment (the latter stays valid as a recovery path).
 pub const API_KEY_OVERRIDE: &str = "api_key_override";
 
+/// "false" disables the persistent stream cache (auto-caching of everything
+/// streamed from NNTP). Absent or anything else = enabled.
+pub const STREAM_CACHE_ENABLED: &str = "stream_cache_enabled";
+
+/// Maximum stream-cache size in GB (decimal, 10^9 bytes). Absent = the
+/// default in [`crate::stream_cache::DEFAULT_MAX_GB`] (5000 GB = 5 TB).
+pub const STREAM_CACHE_MAX_GB: &str = "stream_cache_max_gb";
+
 /// Trakt API app credentials (the user's own Trakt application) and the OAuth
 /// token pair from the device-code link. All optional: Trakt sync is a
 /// best-effort side feature.

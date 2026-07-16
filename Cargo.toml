@@ -45,6 +45,8 @@ futures = "0.3"
 async-trait = "0.1"
 dashmap = "6.2"
 tempfile = "3.27"
+# statvfs for the stream cache's free-disk floor (unix only).
+libc = "0.2"
 clap = { version = "4.6", features = ["derive"] }
 rand = "0.9"
 form_urlencoded = "1.2.2"

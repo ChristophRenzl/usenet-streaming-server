@@ -286,6 +286,12 @@ pub struct AppSettings {
     /// Whether a rotated API key (database override) is active. The bootstrap
     /// config key stays valid alongside it as a recovery path.
     pub api_key_override_active: bool,
+    /// Whether the persistent stream cache is enabled (everything streamed
+    /// from Usenet is also written to the cache directory for instant
+    /// replays). Default on.
+    pub stream_cache_enabled: bool,
+    /// Stream-cache size cap in GB (decimal). Default 5000 (5 TB).
+    pub stream_cache_max_gb: u64,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -312,6 +318,10 @@ pub struct AppSettingsInput {
     /// New server API key (at least 16 characters). Stored as an override;
     /// the bootstrap key from the config file / environment remains valid.
     pub api_key: Option<String>,
+    /// Enable/disable the persistent stream cache. Omit to leave unchanged.
+    pub stream_cache_enabled: Option<bool>,
+    /// New stream-cache size cap in GB (min. 1). Omit to leave unchanged.
+    pub stream_cache_max_gb: Option<u64>,
 }
 
 fn mask_secret(secret: &str) -> String {
@@ -372,6 +382,9 @@ async fn current_app_settings(state: &AppState) -> AppResult<AppSettings> {
         .filter(|k| !k.is_empty());
     let api_key_override_active = override_key.is_some();
     let active_key = override_key.unwrap_or_else(|| state.config.auth.api_key.clone());
+    let stream_cache_enabled = crate::stream_cache::enabled(&state.db).await;
+    let stream_cache_max_gb =
+        crate::stream_cache::max_cache_bytes(&state.db).await / crate::stream_cache::GB;
     Ok(AppSettings {
         tmdb_api_key: tmdb_key.map(|k| mask_secret(&k)),
         opensubtitles_configured: !matches!(
@@ -388,6 +401,8 @@ async fn current_app_settings(state: &AppState) -> AppResult<AppSettings> {
         opensubtitles_password_set,
         api_key: mask_secret(&active_key),
         api_key_override_active,
+        stream_cache_enabled,
+        stream_cache_max_gb,
     })
 }
 
@@ -480,6 +495,27 @@ pub async fn put_app_settings(
     if opensubtitles_changed {
         // A cached login token may belong to the old key/credentials.
         state.opensubtitles_token.set(None).await;
+    }
+    if let Some(enabled) = input.stream_cache_enabled {
+        db::settings::set(
+            &state.db,
+            db::settings::STREAM_CACHE_ENABLED,
+            if enabled { "true" } else { "false" },
+        )
+        .await?;
+    }
+    if let Some(max_gb) = input.stream_cache_max_gb {
+        if max_gb < 1 {
+            return Err(AppError::BadRequest(
+                "stream_cache_max_gb must be at least 1".into(),
+            ));
+        }
+        db::settings::set(
+            &state.db,
+            db::settings::STREAM_CACHE_MAX_GB,
+            &max_gb.to_string(),
+        )
+        .await?;
     }
     Ok(Json(current_app_settings(&state).await?))
 }

@@ -118,6 +118,7 @@ pub async fn create_download(
                         episode: target.episode,
                         release_title: &candidate.raw.title,
                         nzb_url: &candidate.raw.nzb_url,
+                        origin: "user",
                     },
                 )
                 .await?;

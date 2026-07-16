@@ -44,6 +44,25 @@ pub struct StorageConfig {
     pub download_dir: String,
     /// Directory for per-session HLS output (defaults to the OS temp dir).
     pub session_dir: Option<String>,
+    /// Directory for the persistent stream cache (may live on a different
+    /// disk). Defaults to a `cache` directory next to `download_dir`
+    /// (`<download_dir>/../cache`; `/data/cache` with the Docker defaults).
+    #[serde(default)]
+    pub cache_dir: Option<String>,
+}
+
+impl StorageConfig {
+    /// The effective stream-cache directory: the configured `cache_dir`, or
+    /// the `cache` sibling of `download_dir`.
+    pub fn cache_path(&self) -> std::path::PathBuf {
+        match &self.cache_dir {
+            Some(dir) => std::path::PathBuf::from(dir),
+            None => match std::path::Path::new(&self.download_dir).parent() {
+                Some(parent) => parent.join("cache"),
+                None => std::path::PathBuf::from("cache"),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,6 +127,7 @@ impl Default for AppConfig {
             storage: StorageConfig {
                 download_dir: "data/downloads".into(),
                 session_dir: None,
+                cache_dir: None,
             },
             cache: CacheConfig {
                 memory_bytes: 512 * 1024 * 1024,
@@ -153,6 +173,28 @@ mod tests {
         let c = AppConfig::default();
         assert_eq!(c.server.port, 8080);
         assert_eq!(c.streaming.session_idle_timeout_secs, 120);
+    }
+
+    #[test]
+    fn cache_dir_defaults_to_sibling_of_download_dir() {
+        let mut c = AppConfig::default();
+        assert_eq!(
+            c.storage.cache_path(),
+            std::path::PathBuf::from("data/cache"),
+            "default derives from download_dir's parent"
+        );
+        c.storage.download_dir = "/data/downloads".into();
+        assert_eq!(
+            c.storage.cache_path(),
+            std::path::PathBuf::from("/data/cache"),
+            "docker layout lands on /data/cache"
+        );
+        c.storage.cache_dir = Some("/mnt/bigdisk/cache".into());
+        assert_eq!(
+            c.storage.cache_path(),
+            std::path::PathBuf::from("/mnt/bigdisk/cache"),
+            "explicit cache_dir wins"
+        );
     }
 
     #[test]

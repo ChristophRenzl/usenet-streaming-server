@@ -203,6 +203,7 @@ const routes = {
   preferences: renderPreferences,
   users: renderUsers,
   downloads: renderDownloads,
+  cache: renderCache,
   security: renderSecurity,
 };
 
@@ -1193,6 +1194,108 @@ async function renderDownloads(main) {
   await refresh(true);
   const timer = setInterval(() => refresh(false), 4000);
   pageCleanup = () => clearInterval(timer);
+}
+
+// ---- Cache ---------------------------------------------------------------------------
+
+function formatGb(bytes) {
+  return (bytes / GB).toFixed(bytes >= 100 * GB ? 0 : 1).replace(/\.0$/, "");
+}
+
+async function renderCache(main) {
+  const [stats, app] = await Promise.all([api("/cache"), api("/settings/app")]);
+
+  const usedPct = stats.max_bytes > 0
+    ? Math.min(100, Math.round((stats.used_bytes / stats.max_bytes) * 100))
+    : 0;
+  const freeLine = stats.free_disk_bytes == null
+    ? ""
+    : `<div><span class="k">Free on cache volume</span><span>${formatGb(stats.free_disk_bytes)} GB
+         <span class="hint">(eviction keeps at least 100 GB free)</span></span></div>`;
+
+  main.innerHTML = `
+    ${pageHead(
+      "Cache",
+      "Everything streamed from Usenet is also saved here, so replays start instantly from disk. Oldest (least recently played) entries are evicted automatically when space runs out."
+    )}
+    <div class="card" style="max-width:640px">
+      <h2>Usage</h2>
+      <div class="kv" style="margin-bottom:12px">
+        <div><span class="k">Entries</span><span>${stats.entry_count}</span></div>
+        <div><span class="k">Used</span>
+             <span>${formatGb(stats.used_bytes)} GB of ${formatGb(stats.max_bytes)} GB (${usedPct}%)</span></div>
+        ${freeLine}
+        <div><span class="k">Directory</span><span><code>${esc(stats.cache_dir)}</code></span></div>
+      </div>
+      <div class="progress"><div style="width:${usedPct}%"></div></div>
+      <div class="form-actions" style="margin-top:14px">
+        <button type="button" class="btn danger" id="cache-clear">Clear cache</button>
+      </div>
+    </div>
+
+    <div class="card" style="max-width:640px;margin-top:16px">
+      <h2>Settings</h2>
+      <label class="field" style="display:flex;align-items:center;gap:10px;cursor:pointer">
+        <input type="checkbox" id="cache-enabled" style="width:auto" ${app.stream_cache_enabled ? "checked" : ""}>
+        <span>Cache everything that is streamed</span>
+      </label>
+      <form id="cache-form" style="margin-top:8px">
+        <div class="field">
+          <label>Maximum size (GB)</label>
+          <input name="max_gb" type="number" min="1" step="1" required value="${app.stream_cache_max_gb}">
+          <span class="hint">Default 5000 GB (5 TB). The cache directory can live on its own disk via
+            <code>storage.cache_dir</code> in <code>config.toml</code>.</span>
+        </div>
+        <div class="form-actions">
+          <button type="submit" class="btn primary">Save</button>
+        </div>
+      </form>
+    </div>`;
+
+  $("#cache-enabled").addEventListener("change", async (e) => {
+    try {
+      await api("/settings/app", {
+        method: "PUT",
+        body: JSON.stringify({ stream_cache_enabled: e.target.checked }),
+      });
+      toast(e.target.checked ? "Stream cache enabled." : "Stream cache disabled.", "success");
+    } catch (err) {
+      e.target.checked = !e.target.checked;
+      toast("Saving failed: " + err.message);
+    }
+  });
+
+  $("#cache-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const maxGb = Number(e.target.max_gb.value);
+    if (!Number.isFinite(maxGb) || maxGb < 1) {
+      toast("Enter a size of at least 1 GB.");
+      return;
+    }
+    try {
+      await api("/settings/app", {
+        method: "PUT",
+        body: JSON.stringify({ stream_cache_max_gb: Math.round(maxGb) }),
+      });
+      toast("Cache size saved.", "success");
+      navigate();
+    } catch (err) {
+      toast(err.message);
+    }
+  });
+
+  $("#cache-clear").addEventListener("click", async () => {
+    if (!window.confirm("Delete all cached files? Entries currently being played are kept. Streams will be re-cached the next time they are played.")) {
+      return;
+    }
+    try {
+      const result = await api("/cache", { method: "DELETE" });
+      toast(`Cache cleared (${result.removed} entries removed).`, "success");
+      navigate();
+    } catch (err) {
+      toast(err.message);
+    }
+  });
 }
 
 // ---- Security -------------------------------------------------------------------------

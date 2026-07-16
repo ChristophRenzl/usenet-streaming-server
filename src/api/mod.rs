@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod cache;
 pub mod downloads;
 pub mod history;
 pub mod internal;
@@ -62,6 +63,7 @@ impl Modify for SecurityAddon {
         (name = "streaming", description = "Playback sessions, HLS delivery and raw byte-range access"),
         (name = "subtitles", description = "OpenSubtitles search and HLS subtitle delivery"),
         (name = "downloads", description = "Server-side download jobs and disk playback"),
+        (name = "cache", description = "Persistent stream cache: usage stats and clearing"),
         (name = "history", description = "Watch history and resume positions"),
         (name = "settings", description = "Preferences, indexers, providers, app settings"),
     )
@@ -79,6 +81,7 @@ pub fn router(state: AppState) -> Router {
         .merge(stream::router())
         .merge(subtitles::router())
         .merge(downloads::router())
+        .merge(cache::router())
         .merge(history::router())
         .merge(settings::router())
         .merge(trakt::router())

@@ -40,6 +40,10 @@ pub struct DownloadJob {
     /// to reconstruct the media (data + par2), run par2 repair, then produce
     /// the media. When false, the plain path streams the main content to disk.
     pub repair: bool,
+    /// When true, this is a stream-cache job: the file lands in the cache
+    /// directory instead of the download directory, and cache eviction makes
+    /// room before writing starts.
+    pub cache: bool,
 }
 
 impl DownloadJob {
@@ -49,6 +53,7 @@ impl DownloadJob {
             nzb,
             main,
             repair: false,
+            cache: false,
         }
     }
 
@@ -58,6 +63,19 @@ impl DownloadJob {
             nzb,
             main,
             repair: true,
+            cache: false,
+        }
+    }
+
+    /// A stream-cache job: a plain streaming copy into the cache directory.
+    /// Only ever created for a release that already proved streamable, so no
+    /// repair path is needed.
+    pub fn cache(nzb: Nzb, main: MainContent) -> Self {
+        Self {
+            nzb,
+            main,
+            repair: false,
+            cache: true,
         }
     }
 }
@@ -225,7 +243,15 @@ async fn execute(
     let total = source.file.len();
     db::downloads::mark_downloading(&state.db, &id_text, total as i64).await?;
 
-    let dir = PathBuf::from(&state.config.storage.download_dir);
+    let dir = if job.cache {
+        // Make room under the cache budget (size cap + free-disk floor)
+        // before the first byte lands. Failure aborts only this cache job;
+        // the playback session it rode along with is unaffected.
+        crate::stream_cache::ensure_capacity(state, total).await?;
+        state.config.storage.cache_path()
+    } else {
+        PathBuf::from(&state.config.storage.download_dir)
+    };
     let (final_path, mut file) = name::allocate_destination(&dir, &source.inner_file_name).await?;
     let partial = name::partial_path(&final_path);
     *partial_slot.lock().expect("partial slot lock") = Some(partial.clone());

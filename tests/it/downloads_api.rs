@@ -27,6 +27,13 @@ fn base_config(download_dir: &Path, session_dir: &Path) -> AppConfig {
     config.auth.api_key = API_KEY.into();
     config.storage.download_dir = download_dir.to_str().expect("utf-8 dir").to_string();
     config.storage.session_dir = Some(session_dir.to_str().expect("utf-8 dir").to_string());
+    config.storage.cache_dir = Some(
+        download_dir
+            .join("stream-cache")
+            .to_str()
+            .expect("utf-8 dir")
+            .to_string(),
+    );
     config
 }
 

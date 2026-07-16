@@ -62,6 +62,15 @@ impl AppState {
                 "marked interrupted downloads as failed"
             );
         }
+        // Failed/cancelled cache entries are worthless (the next stream
+        // re-creates them); drop the rows and any leftover partial files.
+        let purged = db::downloads::purge_terminal_cache_rows(&db)
+            .await
+            .context("purging terminal cache entries")?;
+        if purged > 0 {
+            tracing::info!(count = purged, "purged unusable stream-cache entries");
+        }
+        crate::stream_cache::sweep_stale_partials(&config.storage.cache_path()).await;
 
         let providers = db::providers::list(&db)
             .await

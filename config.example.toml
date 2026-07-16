@@ -21,6 +21,13 @@ path = "data/usenet-streamer.db"
 download_dir = "data/downloads"
 # Per-session HLS segments (defaults to OS temp dir).
 # session_dir = "/tmp/usenet-streamer-sessions"
+# Persistent stream cache: everything streamed is also written here so
+# replays start instantly from disk. May live on a different disk. Defaults
+# to the `cache` sibling of download_dir (e.g. /data/cache in Docker).
+# Enable/disable and the size cap (default 5 TB) are runtime settings in the
+# admin UI ("Cache"); eviction is LRU and always keeps 100 GB free on the
+# cache volume.
+# cache_dir = "data/cache"
 
 [cache]
 # In-memory decoded segment cache bound (bytes). Default 512 MiB.

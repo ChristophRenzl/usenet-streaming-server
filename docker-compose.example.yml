@@ -7,6 +7,8 @@ services:
     volumes:
       - ./config:/config
       - ./data:/data
+      # Optional: keep the stream cache (default /data/cache) on its own disk.
+      # - /mnt/bigdisk/stream-cache:/data/cache
     environment:
       # Alternatively put api_key in config/config.toml
       - APP_AUTH__API_KEY=change-me

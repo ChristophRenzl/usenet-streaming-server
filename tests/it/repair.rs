@@ -115,6 +115,13 @@ fn base_config(download_dir: &Path, session_dir: &Path) -> AppConfig {
     config.auth.api_key = API_KEY.into();
     config.storage.download_dir = download_dir.to_str().expect("utf-8 dir").to_string();
     config.storage.session_dir = Some(session_dir.to_str().expect("utf-8 dir").to_string());
+    config.storage.cache_dir = Some(
+        download_dir
+            .join("stream-cache")
+            .to_str()
+            .expect("utf-8 dir")
+            .to_string(),
+    );
     config
 }
 
@@ -190,7 +197,12 @@ async fn repair_stack(nntp: MockNntp, nzb_xml: String) -> RepairStack {
     let client = reqwest::Client::new();
 
     for (p, body) in [
-        ("settings/app", json!({ "tmdb_api_key": "tmdb-key" })),
+        // The stream cache is off so streamable sessions in these tests do
+        // not spawn background cache jobs against the mock server.
+        (
+            "settings/app",
+            json!({ "tmdb_api_key": "tmdb-key", "stream_cache_enabled": false }),
+        ),
         (
             "settings/indexers",
             json!({ "name": "mock", "base_url": indexer.uri(), "api_key": "indexer-key" }),

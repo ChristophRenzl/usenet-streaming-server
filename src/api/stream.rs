@@ -213,7 +213,9 @@ pub struct CreateSessionResponse {
     pub candidates: Vec<RankedRelease>,
     /// Stored watch position to offer "resume from here", when any.
     pub resume_position_secs: Option<f64>,
-    /// Where the media bytes come from: `disk` (finished download) or `nntp`.
+    /// Where the media bytes come from: `disk` (finished download), `cache`
+    /// (a stream-cache entry playing from disk — clients show "Preparing
+    /// cached data" instead of "Selecting best release") or `nntp`.
     pub source: String,
     /// External subtitle tracks attached at session start (empty when none
     /// were requested, none were found, or no OpenSubtitles key is set).
@@ -343,9 +345,11 @@ pub async fn create_session(
     }
     .validated()?;
 
-    // A completed download of this exact item plays from disk — no indexer
-    // or NNTP provider needed.
-    if !request.force_nntp {
+    // A completed download or cache entry of this exact item plays from disk
+    // — no indexer or NNTP provider needed. A pinned release_guid skips the
+    // shortcut: the user asked for one specific release, and only a live
+    // indexer search can tell which one the guid names.
+    if !request.force_nntp && request.release_guid.is_none() {
         for download in db::downloads::completed_for_item(
             &state.db,
             target.tmdb_id,
@@ -359,8 +363,13 @@ pub async fn create_session(
                 continue;
             };
             // A completed download of a release later marked as bad must not
-            // short-circuit back to the same file.
+            // short-circuit back to the same file. A *cache* entry of a bad
+            // release is deleted outright — the next stream re-caches a
+            // better one.
             if db::release_blacklist::contains(&state.db, &download.release_title).await? {
+                if download.origin == "cache" {
+                    delete_blacklisted_cache_entry(&state, &download).await;
+                }
                 continue;
             }
             if tokio::fs::try_exists(path).await.unwrap_or(false) {
@@ -450,8 +459,8 @@ pub async fn create_session(
                     user_id,
                     &target,
                     &candidate,
-                    nzb,
-                    main,
+                    &nzb,
+                    &main,
                     capabilities,
                     &subtitle_languages,
                     &mut timer,
@@ -459,6 +468,32 @@ pub async fn create_session(
                 .await
                 {
                     Ok(session) => {
+                        // Everything streamed is cached: persist this release
+                        // to the stream cache in a detached task (best-effort;
+                        // never delays or fails the session response).
+                        {
+                            let state = state.clone();
+                            let candidate = candidate.clone();
+                            let (tmdb_id, media_type, season, episode) = (
+                                target.tmdb_id,
+                                target.media_type,
+                                target.season,
+                                target.episode,
+                            );
+                            tokio::spawn(async move {
+                                crate::stream_cache::cache_streamed_release(
+                                    &state,
+                                    tmdb_id,
+                                    media_type.as_str(),
+                                    season,
+                                    episode,
+                                    &candidate,
+                                    nzb,
+                                    main,
+                                )
+                                .await;
+                            });
+                        }
                         return Ok(SessionOrRepair::Session(Box::new(session_response(
                             &session, candidate, candidates, "nntp", &timer,
                         ))));
@@ -527,6 +562,7 @@ async fn start_repair_job(
             episode: target.episode,
             release_title: &candidate.raw.title,
             nzb_url: &candidate.raw.nzb_url,
+            origin: "user",
         },
     )
     .await?;
@@ -537,6 +573,36 @@ async fn start_repair_job(
     );
     tracing::info!(download = %id, release = %candidate.raw.title, "repair job queued from session start");
     Ok(id)
+}
+
+/// Delete a cache entry whose release was blacklisted after it was cached:
+/// the file and the row go away (best-effort) so the item is re-resolved and
+/// re-cached from a better release — unless a live session still plays it.
+async fn delete_blacklisted_cache_entry(state: &AppState, entry: &db::downloads::Download) {
+    let playing = state
+        .sessions
+        .snapshot()
+        .iter()
+        .any(|s| s.release_title == entry.release_title);
+    if playing {
+        return;
+    }
+    if let Some(path) = entry.file_path.as_deref() {
+        if let Err(error) = tokio::fs::remove_file(path).await {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(%path, %error, "failed to delete blacklisted cached file");
+            }
+        }
+    }
+    if let Err(error) = db::downloads::delete(&state.db, &entry.id).await {
+        tracing::warn!(entry = %entry.id, %error, "failed to delete blacklisted cache row");
+    } else {
+        tracing::info!(
+            entry = %entry.id,
+            release = %entry.release_title,
+            "deleted blacklisted cache entry"
+        );
+    }
 }
 
 fn session_response(
@@ -1183,15 +1249,15 @@ async fn start_streamable_session(
     user_id: i64,
     target: &ReleaseTarget,
     candidate: &RankedRelease,
-    nzb: Nzb,
-    main: MainContent,
+    nzb: &Nzb,
+    main: &MainContent,
     capabilities: ClientCapabilities,
     subtitle_languages: &[String],
     timer: &mut StageTimer,
 ) -> AppResult<Arc<Session>> {
     let source = open_media_source(
-        &nzb,
-        &main,
+        nzb,
+        main,
         &state.nntp_pool,
         &state.segment_cache,
         state.config.streaming.readahead_segments,
@@ -1442,11 +1508,22 @@ async fn start_disk_session(
     // Best-effort Trakt scrobble; a Trakt problem never affects playback.
     super::trakt::spawn_scrobble(state, &session, crate::trakt::ScrobbleAction::Start);
 
+    // Cache hits are distinguishable from user downloads (clients show
+    // "Preparing cached data") and refresh the LRU clock.
+    let source = if download.origin == "cache" {
+        if let Err(error) = db::downloads::touch_last_played(&state.db, &download.id).await {
+            tracing::warn!(entry = %download.id, %error, "failed to record cache hit");
+        }
+        "cache"
+    } else {
+        "disk"
+    };
+
     Ok(session_response(
         &session,
         synthesized_release(download),
         Vec::new(),
-        "disk",
+        source,
         &timer,
     ))
 }

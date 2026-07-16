@@ -29,6 +29,15 @@ fn test_config(session_dir: &Path) -> AppConfig {
     let mut config = AppConfig::default();
     config.auth.api_key = API_KEY.into();
     config.storage.session_dir = Some(session_dir.to_str().expect("utf-8 dir").to_string());
+    // Keep the derived cache default (download_dir/../cache) from escaping
+    // into the working directory during tests.
+    config.storage.cache_dir = Some(
+        session_dir
+            .join("stream-cache")
+            .to_str()
+            .expect("utf-8 dir")
+            .to_string(),
+    );
     config
 }
 
@@ -559,11 +568,14 @@ async fn hls_stack(media: &[u8], part_size: usize, tweak: impl FnOnce(&mut AppCo
     let client = reqwest::Client::new();
 
     // Configure TMDB key, indexer and NNTP provider through the API; the
-    // provider POST must reload the pool live (it started empty).
+    // provider POST must reload the pool live (it started empty). The stream
+    // cache is disabled so the background cache job does not race the tests
+    // that manipulate mock articles mid-stream; the dedicated auto-cache test
+    // re-enables it.
     let response = client
         .put(format!("{base}/api/v1/settings/app"))
         .header("x-api-key", API_KEY)
-        .json(&json!({ "tmdb_api_key": "tmdb-key" }))
+        .json(&json!({ "tmdb_api_key": "tmdb-key", "stream_cache_enabled": false }))
         .send()
         .await
         .expect("PUT app settings");
@@ -878,6 +890,117 @@ async fn hls_full_stack_remuxes_mock_usenet_release() {
     assert_eq!(response.status(), 404);
     assert!(!session_dir.exists(), "session dir must be removed");
     assert!(stack.state.sessions.is_empty());
+}
+
+// ---- Auto-caching -------------------------------------------------------------------
+
+#[tokio::test]
+async fn streamed_releases_are_cached_and_replayed_from_the_cache() {
+    if !ffmpeg_available() {
+        eprintln!("skipping streamed_releases_are_cached_and_replayed_from_the_cache: ffmpeg/ffprobe not found");
+        return;
+    }
+    let media_dir = tempfile::tempdir().expect("media dir");
+    let media_path = generate_media(media_dir.path(), 8, 24, &["-c:a", "ac3", "-b:a", "96k"])
+        .expect("generate ac3 test media");
+    let media = std::fs::read(&media_path).expect("read media");
+
+    let stack = hls_stack(&media, 64 * 1024, |_| {}).await;
+    // The harness disables the cache for the other tests; this one is about it.
+    let response = stack
+        .client
+        .put(format!("{}/api/v1/settings/app", stack.base))
+        .header("x-api-key", API_KEY)
+        .json(&json!({ "stream_cache_enabled": true }))
+        .send()
+        .await
+        .expect("PUT app settings");
+    assert_eq!(response.status(), 200);
+
+    // First playback streams from NNTP and auto-persists to the cache.
+    let created = stack.create_session().await;
+    assert_eq!(created["source"], "nntp");
+    let id = created["session_id"].as_str().expect("id").to_string();
+    stack
+        .wait_for_state(&id, &["ready", "ended"], Duration::from_secs(30))
+        .await;
+
+    // The detached cache job completes with byte-identical content inside
+    // the cache directory.
+    let cache_dir = stack.state.config.storage.cache_path();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let entry = loop {
+        let entries = usenet_streaming_server::db::downloads::cache_entries(&stack.state.db)
+            .await
+            .expect("cache entries");
+        if let Some(done) = entries.iter().find(|e| e.status == "complete") {
+            break done.clone();
+        }
+        if let Some(failed) = entries.iter().find(|e| e.status == "failed") {
+            panic!("cache job failed: {:?}", failed.error);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "cache entry did not complete in time (entries: {entries:?})"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert_eq!(entry.origin, "cache");
+    assert_eq!(entry.release_title, "Inception.2010.1080p.BluRay.x264-TEST");
+    let cached_path = entry.file_path.as_deref().expect("cached file path");
+    assert!(
+        Path::new(cached_path).starts_with(&cache_dir),
+        "{cached_path} must live in {}",
+        cache_dir.display()
+    );
+    assert_eq!(
+        std::fs::read(cached_path).expect("read cached file"),
+        media,
+        "cached bytes must match the source release"
+    );
+
+    // Cache entries stay out of the user-facing downloads list but show in
+    // the cache stats.
+    let response = stack.get("/api/v1/downloads").await;
+    let downloads: Value = response.json().await.expect("downloads json");
+    assert_eq!(downloads.as_array().map(Vec::len), Some(0));
+    let response = stack.get("/api/v1/cache").await;
+    let stats: Value = response.json().await.expect("stats json");
+    assert_eq!(stats["entry_count"], 1);
+    assert_eq!(stats["used_bytes"].as_u64(), Some(media.len() as u64));
+
+    // End the NNTP session, then replay: the same request now serves from
+    // the cache (no fresh release selection).
+    let response = stack
+        .client
+        .delete(format!("{}/api/v1/stream/{id}", stack.base))
+        .header("x-api-key", API_KEY)
+        .send()
+        .await
+        .expect("DELETE session");
+    assert_eq!(response.status(), 204);
+
+    let replay = stack.create_session().await;
+    assert_eq!(replay["source"], "cache", "replay must be a cache hit");
+    assert_eq!(
+        replay["chosen_release"]["raw"]["title"],
+        "Inception.2010.1080p.BluRay.x264-TEST"
+    );
+    // A second session of the same release must not enqueue a second cache
+    // entry (deduped by release title).
+    let entries = usenet_streaming_server::db::downloads::cache_entries(&stack.state.db)
+        .await
+        .expect("cache entries");
+    assert_eq!(entries.len(), 1, "no duplicate cache entries");
+    let replay_id = replay["session_id"].as_str().expect("id");
+    let response = stack
+        .client
+        .delete(format!("{}/api/v1/stream/{replay_id}", stack.base))
+        .header("x-api-key", API_KEY)
+        .send()
+        .await
+        .expect("DELETE replay session");
+    assert_eq!(response.status(), 204);
 }
 
 // ---- Audio transcoding -------------------------------------------------------------

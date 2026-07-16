@@ -3,6 +3,7 @@
 
 mod support;
 
+mod cache_api;
 mod downloads_api;
 mod history_api;
 mod nntp_client;
